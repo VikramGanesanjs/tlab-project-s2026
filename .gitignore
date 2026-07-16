@@ -1,2 +1,8 @@
 data/*
 opt/*
+*.out
+*.err
+
+src/__pycache__/*
+
+src/duke/__pycache__/*
