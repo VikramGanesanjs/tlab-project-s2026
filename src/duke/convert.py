@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
+import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,15 +55,33 @@ _DEFAULT_RAW_ROOT = Path(
     "/common/ganesanv/tlab/data/tcia/duke_breast_cancer_mri"
 )
 _DEFAULT_OUT_ROOT = Path(
-    "/common/ganesanv/tlab/data/tcia/duke_breast_cancer_mri_nifti"
+    "/common/ganesanv/tlab/data/tcia/duke_breast_cancer_processed"
 )
 _DEFAULT_MAPPING_XLSX = _DEFAULT_RAW_ROOT / "Breast-Cancer-MRI-filepath_filename-mapping.xlsx"
 _DEFAULT_CLINICAL_XLSX = _DEFAULT_RAW_ROOT / "Clinical_and_Other_Features.xlsx"
+_DEFAULT_BREASTDIVIDER_CSV = _DEFAULT_RAW_ROOT / "breastdivider_id_mapping.csv"
+_DEFAULT_BREASTDIVIDER_BATCHES: Tuple[Path, ...] = (
+    _DEFAULT_RAW_ROOT / "labelsTr_batch1",
+    _DEFAULT_RAW_ROOT / "labelsTr_batch2",
+)
+_BREAST_DIVIDER_MASK_NAME = "breast_divider.nii.gz"
+_LEFT_BREAST_VOLUME_NAME = "left.nii"
+_RIGHT_BREAST_VOLUME_NAME = "right.nii"
+_BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP: Dict[Tuple[int, int, int, int, int, int], int] = {
+    # Positive row/column direction cosines: rotate fixed-orientation masks 90° CCW.
+    (1, 0, 0, 0, 1, 0): 1,
+    # Negative row/column direction cosines: rotate fixed-orientation masks 90° CW.
+    (-1, 0, 0, 0, -1, 0): -1,
+    # Rare Duke case (Breast_MRI_127): negative row direction, positive column direction.
+    (-1, 0, 0, 0, 1, 0): 1,
+}
 
 _ORIGINAL_PATH_RE = re.compile(
     r"DICOM_Images/(Breast_MRI_\d+)/([^/]+)/([^/]+)$"
 )
 _SLICE_IDX_RE = re.compile(r"_(\d+)\.dcm$", re.IGNORECASE)
+_DUKE_BREASTDIVIDER_ID_RE = re.compile(r"^Duke_Breast_MRI_(\d+)_(.+)$")
+_DESC_SERIES_RE = re.compile(r"/(\d+\.\d{6}-.*)/[^/]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -166,24 +186,35 @@ def build_series_directory_map(
     return series_dirs
 
 
-def mapping_slices_for_series(
+def build_mapping_slices_index(
     mapping_df: pd.DataFrame,
-    patient_id: str,
-    scan_type: str,
-) -> List[MappingSlice]:
-    """Return mapping rows for one series, sorted by axial slice index."""
-    slices: List[MappingSlice] = []
+    *,
+    scan_types: Optional[Sequence[str]] = None,
+    patient_ids: Optional[Sequence[str]] = None,
+) -> Dict[Tuple[str, str], List[MappingSlice]]:
+    """One-pass index of mapping rows keyed by ``(patient_id, scan_type)``.
+
+    Avoids the O(n_series × n_rows) cost of calling
+    :func:`mapping_slices_for_series` repeatedly.
+    """
+    scan_filter = set(scan_types) if scan_types is not None else None
+    patient_filter = set(patient_ids) if patient_ids is not None else None
+    by_key: Dict[Tuple[str, str], List[MappingSlice]] = {}
+
     for row in mapping_df.itertuples(index=False):
         parsed = _parse_original_path(getattr(row, "original_path_and_filename"))
         if parsed is None:
             continue
         pid, scan, fname = parsed
-        if pid != patient_id or scan != scan_type:
+        if scan_filter is not None and scan not in scan_filter:
+            continue
+        if patient_filter is not None and pid not in patient_filter:
             continue
         series_sort = getattr(row, "series_sort", None)
         if pd.isna(series_sort):
             series_sort = None
-        slices.append(
+        key = (pid, scan)
+        by_key.setdefault(key, []).append(
             MappingSlice(
                 patient_id=pid,
                 scan_type=scan,
@@ -193,9 +224,42 @@ def mapping_slices_for_series(
                 slice_index=_slice_index_from_name(fname, series_sort),
             )
         )
-    slices.sort(key=lambda s: (s.slice_index if s.slice_index >= 0 else 10**9, s.sop_instance_uid))
-    return slices
 
+    for slices in by_key.values():
+        slices.sort(
+            key=lambda s: (s.slice_index if s.slice_index >= 0 else 10**9, s.sop_instance_uid)
+        )
+    return by_key
+
+
+def mapping_slices_for_series(
+    mapping_df: pd.DataFrame,
+    patient_id: str,
+    scan_type: str,
+) -> List[MappingSlice]:
+    """Return mapping rows for one series, sorted by axial slice index."""
+    return build_mapping_slices_index(
+        mapping_df,
+        scan_types=[scan_type],
+        patient_ids=[patient_id],
+    ).get((patient_id, scan_type), [])
+
+
+def mapping_slices_as_dicts(
+    slices: Sequence[MappingSlice],
+) -> List[Dict[str, Any]]:
+    """Serialize :class:`MappingSlice` objects for process-pool worker args."""
+    return [
+        {
+            "patient_id": m.patient_id,
+            "scan_type": m.scan_type,
+            "sop_instance_uid": m.sop_instance_uid,
+            "classic_path": m.classic_path,
+            "series_sort": m.series_sort,
+            "slice_index": m.slice_index,
+        }
+        for m in slices
+    ]
 
 # ---------------------------------------------------------------------------
 # DICOM sorting / reading
@@ -354,6 +418,235 @@ def _load_pixel_array(path: Path) -> np.ndarray:
     return arr * slope + intercept
 
 
+def _bbox_from_mask(mask: np.ndarray, margin: int = 0) -> Tuple[Tuple[int, int], ...]:
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        raise ValueError("Cannot crop an empty breast mask")
+    lo = coords.min(axis=0)
+    hi = coords.max(axis=0) + 1
+    if margin > 0:
+        lo = np.maximum(lo - margin, 0)
+        hi = np.minimum(hi + margin, np.array(mask.shape))
+    return tuple((int(a), int(b)) for a, b in zip(lo, hi))
+
+
+def _crop_affine(affine: np.ndarray, bbox: Tuple[Tuple[int, int], ...]) -> np.ndarray:
+    crop_affine = np.array(affine, dtype=np.float64, copy=True)
+    start = np.array([bbox[0][0], bbox[1][0], bbox[2][0], 1.0], dtype=np.float64)
+    crop_affine[:3, 3] = (np.asarray(affine, dtype=np.float64) @ start)[:3]
+    return crop_affine
+
+
+def _breast_label_sides(
+    mask_data: np.ndarray,
+    affine: np.ndarray,
+) -> Dict[str, float]:
+    labels = sorted(float(v) for v in np.unique(mask_data) if v > 0)
+    if len(labels) != 2:
+        raise ValueError(f"Expected exactly 2 positive breast mask labels; found {labels}")
+
+    centers: List[Tuple[float, float, float]] = []
+    for label in labels:
+        coords = np.argwhere(mask_data == label)
+        if coords.size == 0:
+            continue
+        center_ijk = coords.mean(axis=0)
+        world = np.asarray(affine, dtype=np.float64) @ np.array(
+            [center_ijk[0], center_ijk[1], center_ijk[2], 1.0],
+            dtype=np.float64,
+        )
+        # DICOM patient coordinates use increasing X toward patient left.
+        centers.append((float(label), float(world[0]), float(center_ijk[0])))
+
+    if len(centers) != 2:
+        raise ValueError("Expected two non-empty breast masks")
+    centers.sort(key=lambda item: (item[1], item[2]))
+    return {"right": centers[0][0], "left": centers[1][0]}
+
+
+def _read_series_orientation(
+    series_dir: Union[str, Path],
+) -> Tuple[Optional[Tuple[float, ...]], Optional[str]]:
+    """Read ``ImageOrientationPatient`` and ``PatientPosition`` from a DICOM series."""
+    series_dir = Path(series_dir)
+    dicoms = sorted(series_dir.glob("*.dcm"))
+    if not dicoms:
+        return None, None
+    ds = pydicom.dcmread(
+        str(dicoms[0]),
+        stop_before_pixels=True,
+        specific_tags=["ImageOrientationPatient", "PatientPosition"],
+    )
+    iop = getattr(ds, "ImageOrientationPatient", None)
+    pos = getattr(ds, "PatientPosition", None)
+    iop_t = tuple(float(x) for x in iop) if iop is not None else None
+    pos_s = str(pos) if pos is not None else None
+    return iop_t, pos_s
+
+
+def breast_divider_rot90_k(
+    image_orientation_patient: Optional[Sequence[float]],
+    patient_position: Optional[str] = None,
+) -> int:
+    """Choose in-plane ``np.rot90`` k for a BreastDivider mask.
+
+    BreastDivider masks are authored in a fixed array orientation. After affine
+    resampling onto a DICOM volume, an additional in-plane rotation is required
+    so the two breast labels land on the breasts in voxel space.
+
+    Uses DICOM ``ImageOrientationPatient`` rounded to nearest integer. In this
+    Duke dataset the mask-bearing series use exactly three rounded orientation
+    vectors:
+
+      * ``(1, 0, 0, 0, 1, 0)`` → ``k=1``  (90° counter-clockwise)
+      * ``(-1, 0, 0, 0, -1, 0)`` → ``k=-1`` (90° clockwise)
+      * ``(-1, 0, 0, 0, 1, 0)`` → ``k=1``  (90° counter-clockwise; rare mixed case)
+
+    Returns ``k`` for ``np.rot90(..., k=k, axes=(0, 1))`` (also ``0`` / ``2``
+    reserved if a future rule needs no-op / 180°).
+    """
+    if image_orientation_patient is None or len(image_orientation_patient) < 6:
+        return 1
+    rounded_iop = tuple(int(round(float(x))) for x in image_orientation_patient[:6])
+    if rounded_iop in _BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP:
+        return _BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP[rounded_iop]
+
+    _ = (patient_position or "").upper()  # recorded by callers in meta
+    raise ValueError(
+        "Unsupported rounded ImageOrientationPatient for BreastDivider rotation: "
+        f"{rounded_iop}. Add it to _BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP."
+    )
+
+
+def _rot90_k_name(k: int) -> str:
+    return {0: "none", 1: "rot90_ccw", -1: "rot90_cw", 2: "rot180", 3: "rot90_cw"}.get(
+        int(k), f"rot90_k={k}"
+    )
+
+def _resample_mask_to_volume(
+    mask_path: Union[str, Path],
+    volume_shape: Tuple[int, ...],
+    affine: np.ndarray,
+) -> np.ndarray:
+    """Resample a BreastDivider mask onto the volume voxel grid.
+
+    The BreastDivider ``.nii.gz`` masks carry their own affine that differs from
+    the DICOM-derived volume affine (a Z-axis flip plus translation offsets).
+    Resampling through both affines (nearest-neighbor, to preserve integer
+    labels) aligns the mask voxel-for-voxel with ``volume.nii`` so bounding-box
+    crops index the same underlying image data.
+    """
+    import nibabel as nib
+    from nibabel.processing import resample_from_to
+
+    mask_img = nib.load(str(mask_path))
+    resampled = resample_from_to(
+        mask_img,
+        (tuple(int(s) for s in volume_shape), np.asarray(affine, dtype=np.float64)),
+        order=0,
+    )
+    return np.ascontiguousarray(
+        np.rint(np.asarray(resampled.get_fdata(dtype=np.float32))).astype(np.float32)
+    )
+
+
+def write_breast_side_crops(
+    volume: np.ndarray,
+    affine: np.ndarray,
+    out_dir: Union[str, Path],
+    mask_path: Union[str, Path],
+    *,
+    margin: int = 0,
+    series_dir: Optional[Union[str, Path]] = None,
+    image_orientation_patient: Optional[Sequence[float]] = None,
+    patient_position: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Write ``left.nii`` and ``right.nii`` crops using a BreastDivider mask."""
+    import nibabel as nib
+
+    out_dir = Path(out_dir)
+    mask_path = Path(mask_path)
+    if series_dir is None:
+        series_dir = mask_path.parent
+    if image_orientation_patient is None or patient_position is None:
+        iop_read, pos_read = _read_series_orientation(series_dir)
+        if image_orientation_patient is None:
+            image_orientation_patient = iop_read
+        if patient_position is None:
+            patient_position = pos_read
+
+    rot_k = breast_divider_rot90_k(image_orientation_patient, patient_position)
+    mask_data = _resample_mask_to_volume(mask_path, volume.shape, affine)
+    if rot_k % 4 != 0:
+        mask_data = np.ascontiguousarray(np.rot90(mask_data, k=rot_k, axes=(0, 1)))
+    if tuple(mask_data.shape) != tuple(volume.shape):
+        raise ValueError(
+            f"Aligned mask shape {mask_data.shape} does not match volume shape "
+            f"{volume.shape} for {mask_path}"
+        )
+
+    label_sides = _breast_label_sides(mask_data, affine)
+    crops: Dict[str, Any] = {}
+    for side, label in label_sides.items():
+        bbox = _bbox_from_mask(mask_data == label, margin=margin)
+        crop = volume[
+            bbox[0][0] : bbox[0][1],
+            bbox[1][0] : bbox[1][1],
+            bbox[2][0] : bbox[2][1],
+        ]
+        filename = _LEFT_BREAST_VOLUME_NAME if side == "left" else _RIGHT_BREAST_VOLUME_NAME
+        crop_affine = _crop_affine(affine, bbox)
+        nib.Nifti1Image(crop.astype(np.float32), crop_affine).to_filename(
+            str(out_dir / filename)
+        )
+        crops[side] = {
+            "path": filename,
+            "label": label,
+            "bbox_ijk": [[a, b] for a, b in bbox],
+            "shape": list(crop.shape),
+        }
+    return {
+        "mask_path": str(mask_path),
+        "margin": int(margin),
+        "mask_alignment": f"resample_from_to(order=0)+{_rot90_k_name(rot_k)}",
+        "mask_rot90_k": int(rot_k),
+        "mask_rot90_name": _rot90_k_name(rot_k),
+        "image_orientation_patient": (
+            list(image_orientation_patient) if image_orientation_patient is not None else None
+        ),
+        "rounded_image_orientation_patient": (
+            [int(round(float(x))) for x in image_orientation_patient[:6]]
+            if image_orientation_patient is not None
+            else None
+        ),
+        "patient_position": patient_position,
+        "crops": crops,
+    }
+
+
+def write_breast_side_crops_from_files(
+    volume_path: Union[str, Path],
+    out_dir: Union[str, Path],
+    mask_path: Union[str, Path],
+    *,
+    margin: int = 0,
+    series_dir: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """Write side crops from an existing ``volume.nii`` and mask file."""
+    import nibabel as nib
+
+    img = nib.load(str(volume_path))
+    volume = np.asarray(img.get_fdata(dtype=np.float32))
+    return write_breast_side_crops(
+        volume,
+        img.affine,
+        out_dir,
+        mask_path,
+        margin=margin,
+        series_dir=series_dir if series_dir is not None else Path(mask_path).parent,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Conversion
 # ---------------------------------------------------------------------------
@@ -368,6 +661,8 @@ def convert_series_to_nifti(
     mapping_slices: Optional[Sequence[MappingSlice]] = None,
     lower_bound: Optional[float] = None,
     upper_bound: Optional[float] = None,
+    split_breasts: bool = False,
+    breast_crop_margin: int = 0,
 ) -> Dict[str, Any]:
     """Convert one DICOM series to uncompressed ``volume.nii`` + ``meta.json``."""
     import nibabel as nib
@@ -389,6 +684,25 @@ def convert_series_to_nifti(
     nii_path = out_dir / "volume.nii"
     nib.Nifti1Image(volume.astype(np.float32), affine).to_filename(str(nii_path))
 
+    breast_crops = None
+    breast_mask_path = series_dir / _BREAST_DIVIDER_MASK_NAME
+    if split_breasts:
+        if not breast_mask_path.is_file():
+            raise FileNotFoundError(f"Missing BreastDivider mask: {breast_mask_path}")
+        # PatientPosition is not always in the header cache; read from series DICOM.
+        _iop, patient_position = _read_series_orientation(series_dir)
+        iop = headers[0].image_orientation or _iop
+        breast_crops = write_breast_side_crops(
+            volume,
+            affine,
+            out_dir,
+            breast_mask_path,
+            margin=breast_crop_margin,
+            series_dir=series_dir,
+            image_orientation_patient=iop,
+            patient_position=patient_position,
+        )
+
     meta = {
         "patient_id": patient_id,
         "scan_type": scan_type,
@@ -404,6 +718,8 @@ def convert_series_to_nifti(
         "affine": affine.tolist(),
         "volume_path": "volume.nii",
     }
+    if breast_crops is not None:
+        meta["breast_divider"] = breast_crops
     with open(out_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
     return meta
@@ -418,6 +734,8 @@ def _convert_one_job(args: Tuple) -> Tuple[str, str, Optional[Dict[str, Any]], O
         mapping_rows,
         lower_bound,
         upper_bound,
+        split_breasts,
+        breast_crop_margin,
     ) = args
     try:
         mapping_slices = [
@@ -431,6 +749,8 @@ def _convert_one_job(args: Tuple) -> Tuple[str, str, Optional[Dict[str, Any]], O
             mapping_slices=mapping_slices or None,
             lower_bound=lower_bound,
             upper_bound=upper_bound,
+            split_breasts=split_breasts,
+            breast_crop_margin=breast_crop_margin,
         )
         return patient_id, scan_type, meta, None
     except Exception as exc:  # noqa: BLE001 — collect per-series errors
@@ -448,6 +768,8 @@ def convert_duke_dataset(
     upper_bound: Optional[float] = None,
     workers: int = 4,
     skip_existing: bool = True,
+    split_breasts: bool = False,
+    breast_crop_margin: int = 0,
 ) -> Dict[str, Any]:
     """Convert selected patients/scans to NIfTI and write index + phenotypes."""
     raw_root = Path(raw_root)
@@ -471,27 +793,25 @@ def convert_duke_dataset(
         wanted = set(patient_ids)
         all_patients = [p for p in all_patients if p in wanted]
 
-    # Pre-group mapping slices for fast worker args (dict-serializable)
-    mapping_by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for (pid, scan), _dir in series_dirs.items():
-        if scan not in scan_types:
-            continue
-        if patient_ids is not None and pid not in set(patient_ids):
-            continue
-        ms = mapping_slices_for_series(mapping_df, pid, scan)
-        mapping_by_key[(pid, scan)] = [
-            {
-                "patient_id": m.patient_id,
-                "scan_type": m.scan_type,
-                "sop_instance_uid": m.sop_instance_uid,
-                "classic_path": m.classic_path,
-                "series_sort": m.series_sort,
-                "slice_index": m.slice_index,
-            }
-            for m in ms
-        ]
+    # Pre-group mapping slices for fast worker args (dict-serializable).
+    # One pass over the spreadsheet (~seconds) instead of per-series scans (~hours).
+    logger.info(
+        "Indexing mapping slices for %d scan type(s)%s",
+        len(scan_types),
+        f" and {len(patient_ids)} patient(s)" if patient_ids is not None else "",
+    )
+    slices_index = build_mapping_slices_index(
+        mapping_df,
+        scan_types=scan_types,
+        patient_ids=patient_ids,
+    )
+    mapping_by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {
+        key: mapping_slices_as_dicts(slices) for key, slices in slices_index.items()
+    }
+    logger.info("Indexed mapping slices for %d series", len(mapping_by_key))
 
     jobs = []
+    errors: List[Dict[str, str]] = []
     for pid in all_patients:
         for scan in scan_types:
             key = (pid, scan)
@@ -502,8 +822,52 @@ def convert_duke_dataset(
                 logger.warning("Missing series dir %s", series_dir)
                 continue
             out_dir = out_root / pid / scan
-            if skip_existing and (out_dir / "volume.nii").is_file() and (out_dir / "meta.json").is_file():
+            volume_path = out_dir / "volume.nii"
+            meta_path = out_dir / "meta.json"
+            crops_exist = (out_dir / _LEFT_BREAST_VOLUME_NAME).is_file() and (
+                out_dir / _RIGHT_BREAST_VOLUME_NAME
+            ).is_file()
+            if (
+                skip_existing
+                and volume_path.is_file()
+                and meta_path.is_file()
+                and (not split_breasts or crops_exist)
+            ):
                 continue
+            if skip_existing and split_breasts and volume_path.is_file() and meta_path.is_file():
+                mask_path = series_dir / _BREAST_DIVIDER_MASK_NAME
+                if not mask_path.is_file():
+                    errors.append(
+                        {
+                            "patient_id": pid,
+                            "scan_type": scan,
+                            "error": f"Missing BreastDivider mask: {mask_path}",
+                        }
+                    )
+                    continue
+                try:
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    meta["breast_divider"] = write_breast_side_crops_from_files(
+                        volume_path,
+                        out_dir,
+                        mask_path,
+                        margin=breast_crop_margin,
+                        series_dir=series_dir,
+                    )
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f, indent=2)
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(
+                        {
+                            "patient_id": pid,
+                            "scan_type": scan,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    logger.error("Failed breast crops %s/%s: %s", pid, scan, exc)
+                    continue
             jobs.append(
                 (
                     pid,
@@ -513,12 +877,13 @@ def convert_duke_dataset(
                     mapping_by_key.get(key, []),
                     lower_bound,
                     upper_bound,
+                    split_breasts,
+                    breast_crop_margin,
                 )
             )
 
     logger.info("Converting %d series with %d workers", len(jobs), workers)
     results: List[Dict[str, Any]] = []
-    errors: List[Dict[str, str]] = []
 
     # Also load already-converted series into the index
     for pid in all_patients:
@@ -569,6 +934,14 @@ def convert_duke_dataset(
                 "n_slices": r["n_slices"],
                 "volume_path": f"{r['patient_id']}/{r['scan_type']}/volume.nii",
                 "meta_path": f"{r['patient_id']}/{r['scan_type']}/meta.json",
+                **(
+                    {
+                        "left_path": f"{r['patient_id']}/{r['scan_type']}/{_LEFT_BREAST_VOLUME_NAME}",
+                        "right_path": f"{r['patient_id']}/{r['scan_type']}/{_RIGHT_BREAST_VOLUME_NAME}",
+                    }
+                    if "breast_divider" in r
+                    else {}
+                ),
             }
             for r in sorted(results, key=lambda x: (x["patient_id"], x["scan_type"]))
         ],
@@ -585,6 +958,8 @@ def convert_duke_dataset(
         "scan_types": scan_types,
         "lower_bound": lower_bound,
         "upper_bound": upper_bound,
+        "split_breasts": split_breasts,
+        "breast_crop_margin": breast_crop_margin,
         "n_series": len(series_index["series"]),
         "n_errors": len(errors),
     }
@@ -722,6 +1097,222 @@ def build_phenotype_json(
 
 
 # ---------------------------------------------------------------------------
+# BreastDivider mask organization
+# ---------------------------------------------------------------------------
+
+
+def _normalize_breastdivider_series_key(series: str) -> str:
+    """Normalize descriptive series folder names to BreastDivider id keys."""
+    s = series.replace("/", "").replace("+", "").replace(" ", "-")
+    return s.replace("Duke_Breast", "Breast")
+
+
+def _extract_descriptive_series(descriptive_path: str) -> Optional[str]:
+    """Extract the series folder from a TCIA descriptive_path (may contain '/')."""
+    m = _DESC_SERIES_RE.search(str(descriptive_path).replace("\\", "/"))
+    return m.group(1) if m else None
+
+
+def build_breastdivider_duke_scan_map(
+    mapping_xlsx: Union[str, Path] = _DEFAULT_MAPPING_XLSX,
+    id_mapping_csv: Union[str, Path] = _DEFAULT_BREASTDIVIDER_CSV,
+) -> pd.DataFrame:
+    """Map BreastDivider mask ids to Duke ``(patient_id, scan_type)``.
+
+    Uses ``breastdivider_id_mapping.csv`` (Duke_* rows) plus the TCIA filepath
+    mapping spreadsheet (``original_path_and_filename`` → scan type,
+    ``descriptive_path`` → series folder matched to the BreastDivider id).
+    """
+    id_df = pd.read_csv(id_mapping_csv)
+    duke = id_df[id_df["id"].astype(str).str.startswith("Duke_Breast_MRI", na=False)].copy()
+    if duke.empty:
+        raise ValueError(f"No Duke_Breast_MRI rows in {id_mapping_csv}")
+
+    parsed = duke["id"].astype(str).str.extract(_DUKE_BREASTDIVIDER_ID_RE)
+    if parsed[0].isna().any():
+        bad = duke.loc[parsed[0].isna(), "id"].head(5).tolist()
+        raise ValueError(f"Unparseable Duke BreastDivider ids (sample): {bad}")
+    duke["patient_id"] = parsed[0].astype(int).map(lambda n: f"Breast_MRI_{n:03d}")
+    duke["series_key"] = parsed[1].map(_normalize_breastdivider_series_key)
+
+    mapping_df = load_mapping_table(mapping_xlsx)
+    rows: List[Dict[str, str]] = []
+    seen: set = set()
+    for row in mapping_df.itertuples(index=False):
+        parsed_orig = _parse_original_path(getattr(row, "original_path_and_filename"))
+        if parsed_orig is None:
+            continue
+        patient_id, scan_type, _fname = parsed_orig
+        series_raw = _extract_descriptive_series(str(getattr(row, "descriptive_path", "")))
+        if series_raw is None:
+            continue
+        series_key = _normalize_breastdivider_series_key(series_raw)
+        key = (patient_id, series_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "patient_id": patient_id,
+                "scan_type": scan_type,
+                "series_key": series_key,
+            }
+        )
+    series_map = pd.DataFrame(rows)
+
+    merged = duke.merge(series_map, on=["patient_id", "series_key"], how="left")
+    missing = merged["scan_type"].isna().sum()
+    if missing:
+        sample = merged.loc[merged["scan_type"].isna(), "id"].head(5).tolist()
+        raise ValueError(
+            f"Failed to resolve scan_type for {missing}/{len(merged)} Duke masks "
+            f"(sample ids: {sample})"
+        )
+    return merged[
+        ["BreastDivider_id", "id", "patient_id", "scan_type", "series_key"]
+    ].reset_index(drop=True)
+
+
+def _find_breastdivider_mask(
+    breast_divider_id: str,
+    batch_dirs: Sequence[Path],
+) -> Optional[Path]:
+    name = f"{breast_divider_id}.nii.gz"
+    for batch in batch_dirs:
+        candidate = Path(batch) / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _place_mask(src: Path, dest: Path, *, overwrite: bool) -> str:
+    """Move ``src`` to ``dest``. Returns action: 'moved' | 'skipped' | 'replaced'."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        if not overwrite:
+            return "skipped"
+        dest.unlink()
+        action = "replaced"
+    else:
+        action = "moved"
+    try:
+        os.link(src, dest)
+        os.unlink(src)
+    except OSError:
+        shutil.move(str(src), str(dest))
+    return action
+
+
+def organize_breast_divider_masks(
+    raw_root: Union[str, Path] = _DEFAULT_RAW_ROOT,
+    mapping_xlsx: Union[str, Path] = _DEFAULT_MAPPING_XLSX,
+    id_mapping_csv: Union[str, Path] = _DEFAULT_BREASTDIVIDER_CSV,
+    batch_dirs: Optional[Sequence[Union[str, Path]]] = None,
+    nifti_root: Optional[Union[str, Path]] = None,
+    *,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> pd.DataFrame:
+    """Place Duke BreastDivider masks next to their matching DICOM series.
+
+    For each Duke entry in ``breastdivider_id_mapping.csv``, resolves the
+    canonical scan type (``pre``, ``post_1``, …, ``T1``) via the TCIA filepath
+    mapping spreadsheet, finds the on-disk ``MR_*`` series directory under
+    ``raw_root``, and writes ``breast_divider.nii.gz`` inside that folder.
+
+    Mask sources (first hit wins):
+      1. ``labelsTr_batch*`` BreastDivider ``.nii.gz`` files
+      2. Optional ``nifti_root/{patient}/{scan}/breast_divider.nii.gz``
+         (e.g. after a prior misplaced organization)
+
+    Non-Duke BreastDivider masks are left untouched in the batch folders.
+
+    Returns a manifest DataFrame of actions taken.
+    """
+    raw_root = Path(raw_root)
+    batches = [
+        Path(p)
+        for p in (
+            batch_dirs
+            if batch_dirs is not None
+            else _DEFAULT_BREASTDIVIDER_BATCHES
+        )
+    ]
+    nifti_root_path = Path(nifti_root) if nifti_root is not None else None
+
+    scan_map = build_breastdivider_duke_scan_map(mapping_xlsx, id_mapping_csv)
+    mapping_df = load_mapping_table(mapping_xlsx)
+    series_dirs = build_series_directory_map(mapping_df, raw_root)
+
+    records: List[Dict[str, Any]] = []
+    for row in scan_map.itertuples(index=False):
+        key = (row.patient_id, row.scan_type)
+        series_dir = series_dirs.get(key)
+        dest = (
+            (series_dir / _BREAST_DIVIDER_MASK_NAME)
+            if series_dir is not None
+            else None
+        )
+
+        src = _find_breastdivider_mask(row.BreastDivider_id, batches)
+        src_kind = "batch"
+        if src is None and nifti_root_path is not None:
+            alt = (
+                nifti_root_path
+                / row.patient_id
+                / row.scan_type
+                / _BREAST_DIVIDER_MASK_NAME
+            )
+            if alt.is_file():
+                src = alt
+                src_kind = "nifti"
+
+        record: Dict[str, Any] = {
+            "BreastDivider_id": row.BreastDivider_id,
+            "source_id": row.id,
+            "patient_id": row.patient_id,
+            "scan_type": row.scan_type,
+            "series_dir": str(series_dir) if series_dir else None,
+            "dest": str(dest) if dest else None,
+            "src": str(src) if src else None,
+            "src_kind": src_kind if src else None,
+            "action": None,
+        }
+
+        if series_dir is None or not series_dir.is_dir():
+            record["action"] = "missing_series_dir"
+            logger.warning(
+                "No MR series dir for %s/%s (BreastDivider %s)",
+                row.patient_id,
+                row.scan_type,
+                row.BreastDivider_id,
+            )
+        elif src is None:
+            record["action"] = "missing_mask"
+            logger.warning(
+                "Mask not found for %s (%s/%s)",
+                row.BreastDivider_id,
+                row.patient_id,
+                row.scan_type,
+            )
+        elif dry_run:
+            record["action"] = "would_move"
+        else:
+            record["action"] = _place_mask(src, dest, overwrite=overwrite)
+
+        records.append(record)
+
+    manifest = pd.DataFrame(records)
+    counts = manifest["action"].value_counts().to_dict()
+    logger.info(
+        "organize_breast_divider_masks: %d Duke masks; actions=%s",
+        len(manifest),
+        counts,
+    )
+    return manifest
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -751,10 +1342,55 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     c.add_argument("--upper-bound", type=float, default=None)
     c.add_argument("--workers", type=int, default=4)
     c.add_argument("--no-skip-existing", action="store_true")
+    c.add_argument(
+        "--split-breasts",
+        action="store_true",
+        help="Use breast_divider.nii.gz masks to write left.nii and right.nii crops",
+    )
+    c.add_argument(
+        "--breast-crop-margin",
+        type=int,
+        default=0,
+        help="Voxel margin to add around each breast bounding box",
+    )
 
     ph = sub.add_parser("phenotypes", help="Rebuild phenotype JSON only")
     ph.add_argument("--clinical-xlsx", type=Path, default=_DEFAULT_CLINICAL_XLSX)
     ph.add_argument("--labels-dir", type=Path, default=_DEFAULT_OUT_ROOT / "labels")
+
+    bd = sub.add_parser(
+        "organize-breast-dividers",
+        help="Place Duke BreastDivider masks into raw MR series folders",
+    )
+    bd.add_argument("--raw-root", type=Path, default=_DEFAULT_RAW_ROOT)
+    bd.add_argument("--mapping-xlsx", type=Path, default=_DEFAULT_MAPPING_XLSX)
+    bd.add_argument("--id-mapping-csv", type=Path, default=_DEFAULT_BREASTDIVIDER_CSV)
+    bd.add_argument(
+        "--batch-dirs",
+        type=Path,
+        nargs="*",
+        default=None,
+        help="BreastDivider label batch dirs (default: labelsTr_batch1/2 under raw-root)",
+    )
+    bd.add_argument(
+        "--nifti-root",
+        type=Path,
+        default=_DEFAULT_OUT_ROOT,
+        help="Also look here for previously misplaced breast_divider.nii.gz files",
+    )
+    bd.add_argument(
+        "--no-nifti-fallback",
+        action="store_true",
+        help="Do not search nifti-root for masks",
+    )
+    bd.add_argument("--overwrite", action="store_true")
+    bd.add_argument("--dry-run", action="store_true")
+    bd.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Optional path to write the action manifest CSV",
+    )
 
     return p.parse_args(argv)
 
@@ -774,9 +1410,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             upper_bound=args.upper_bound,
             workers=args.workers,
             skip_existing=not args.no_skip_existing,
+            split_breasts=args.split_breasts,
+            breast_crop_margin=args.breast_crop_margin,
         )
     elif args.cmd == "phenotypes":
         build_phenotype_json(args.clinical_xlsx, args.labels_dir)
+    elif args.cmd == "organize-breast-dividers":
+        manifest = organize_breast_divider_masks(
+            raw_root=args.raw_root,
+            mapping_xlsx=args.mapping_xlsx,
+            id_mapping_csv=args.id_mapping_csv,
+            batch_dirs=args.batch_dirs,
+            nifti_root=None if args.no_nifti_fallback else args.nifti_root,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+        if args.manifest is not None:
+            args.manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.to_csv(args.manifest, index=False)
+            logger.info("Wrote manifest to %s", args.manifest)
     else:
         raise SystemExit(f"Unknown command {args.cmd}")
 

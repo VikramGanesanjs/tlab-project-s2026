@@ -90,21 +90,46 @@ def _split_breast_scaffold(
     )
 
 
+def _z_index_range(n_z: int, z_min: float, z_max: float) -> Tuple[int, int]:
+    """Map fractional z thresholds in ``[0, 1]`` to a half-open index range.
+
+    ``z_min`` / ``z_max`` are fractions of volume depth (0 = first slice, 1 =
+    past the last). Middle 50% of slices → ``z_min=0.25``, ``z_max=0.75``.
+    """
+    if n_z <= 0:
+        return 0, 0
+    if not (0.0 <= z_min <= z_max <= 1.0):
+        raise ValueError(
+            f"Require 0 <= z_min <= z_max <= 1; got z_min={z_min}, z_max={z_max}"
+        )
+    start = int(np.floor(n_z * z_min))
+    end = int(np.ceil(n_z * z_max))
+    start = max(0, min(start, n_z))
+    end = max(start, min(end, n_z))
+    return start, end
+
+
 class DukeBreastMRIDataset(VisionDataset):
     """DINOv3-shaped Duke Breast MRI dataset.
 
     Each index is a primary axial slice from the selected scan. By default
     ``__getitem__`` also returns a second slice within ``max_distance``.
+
+    ``z_min`` / ``z_max`` restrict which axial indices are indexed, as fractions
+    of each volume's depth in ``[0, 1]`` (inclusive lower, exclusive upper after
+    rounding). Use ``z_min=0.25``, ``z_max=0.75`` for the middle 50% of slices.
     """
 
     def __init__(
         self,
         root: Union[str, Path] = _DEFAULT_OUT_ROOT,
         *,
-        scan: Union[str, int] = "post_1",
+        scan: Union[str, int] = "pre",
         max_distance: int = 3,
         return_pair: bool = True,
         split_breasts: bool = False,
+        z_min: float = 0.0,
+        z_max: float = 1.0,
         phenotype_columns: Optional[Sequence[str]] = None,
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
@@ -124,6 +149,8 @@ class DukeBreastMRIDataset(VisionDataset):
         self.max_distance = int(max_distance)
         self.return_pair = bool(return_pair)
         self.split_breasts = bool(split_breasts)
+        self.z_min = float(z_min)
+        self.z_max = float(z_max)
         self.phenotype_columns = list(phenotype_columns or DEFAULT_PHENOTYPE_COLUMNS)
         self._seed = seed
         self._volume_cache = _VolumeCache(maxsize=volume_cache_size)
@@ -156,20 +183,25 @@ class DukeBreastMRIDataset(VisionDataset):
             pid = series["patient_id"]
             n_z = int(series["n_slices"])
             vol_rel = series["volume_path"]
-            for z in range(n_z):
+            z_start, z_end = _z_index_range(n_z, self.z_min, self.z_max)
+            for z in range(z_start, z_end):
                 self._entries.append((pid, vol_rel, n_z, z))
 
         if not self._entries:
             raise RuntimeError(
-                f"No slices found for scan={self.scan_type!r} under {root}"
+                f"No slices found for scan={self.scan_type!r} under {root} "
+                f"with z_min={self.z_min}, z_max={self.z_max}"
             )
 
         logger.info(
-            "DukeBreastMRIDataset scan=%s entries=%d return_pair=%s max_distance=%d",
+            "DukeBreastMRIDataset scan=%s entries=%d return_pair=%s "
+            "max_distance=%d z=[%.3f, %.3f)",
             self.scan_type,
             len(self._entries),
             self.return_pair,
             self.max_distance,
+            self.z_min,
+            self.z_max,
         )
 
     def __len__(self) -> int:
