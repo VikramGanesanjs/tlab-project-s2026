@@ -9,18 +9,22 @@ __all__ = [
     "DEFAULT_PHENOTYPE_COLUMNS",
     "PHENOTYPE_SENTINEL",
     "DukeBreastMRIDataset",
+    "DukeClassificationDataset",
     "PairToDinoGlobalCrops",
     "build_breastdivider_duke_scan_map",
     "build_mapping_slices_index",
     "build_phenotype_json",
-    "breast_divider_rot90_k",
     "convert_duke_dataset",
     "convert_series_to_nifti",
     "organize_breast_divider_masks",
     "resolve_scan",
 ]
 
-_DATASET_ATTRS = {"DukeBreastMRIDataset", "PairToDinoGlobalCrops"}
+_DATASET_ATTRS = {
+    "DukeBreastMRIDataset",
+    "DukeClassificationDataset",
+    "PairToDinoGlobalCrops",
+}
 _CONVERT_ATTRS = {
     "CANONICAL_SCAN_TYPES",
     "DEFAULT_PHENOTYPE_COLUMNS",
@@ -28,7 +32,6 @@ _CONVERT_ATTRS = {
     "build_breastdivider_duke_scan_map",
     "build_mapping_slices_index",
     "build_phenotype_json",
-    "breast_divider_rot90_k",
     "convert_duke_dataset",
     "convert_series_to_nifti",
     "organize_breast_divider_masks",

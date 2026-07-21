@@ -20,8 +20,12 @@ cd /common/ganesanv/tlab/src
 
 python dinov3_baseline.py \
   --data-root /common/ganesanv/tlab/data/tcia/duke_breast_cancer_processed \
-  --scan pre \
+  --scan T1 \
   --z-min 0.25 \
+  --hidden-dim 256 \
   --z-max 0.75 \
   --epochs 10 \
-  --batch-size 32
+  --batch-size 32 \
+  --encoder dinov3 \
+  --features patch \
+  --run-name dinov3_baseline_fixed

@@ -67,13 +67,15 @@ _DEFAULT_BREASTDIVIDER_BATCHES: Tuple[Path, ...] = (
 _BREAST_DIVIDER_MASK_NAME = "breast_divider.nii.gz"
 _LEFT_BREAST_VOLUME_NAME = "left.nii"
 _RIGHT_BREAST_VOLUME_NAME = "right.nii"
+# Extra voxels around each breast bbox when writing left/right crops (clipped to volume).
+_DEFAULT_BREAST_CROP_MARGIN = 15
+# In-plane ``np.rot90`` count from rounded DICOM ImageOrientationPatient (6-vector).
+# Matches the empirical notebook alignment: rot90 repeated N times, then flip axes 1 & 2.
 _BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP: Dict[Tuple[int, int, int, int, int, int], int] = {
-    # Positive row/column direction cosines: rotate fixed-orientation masks 90° CCW.
+    # (1, 0, 0, 0, 1, 0) → one 90° CCW
     (1, 0, 0, 0, 1, 0): 1,
-    # Negative row/column direction cosines: rotate fixed-orientation masks 90° CW.
-    (-1, 0, 0, 0, -1, 0): -1,
-    # Rare Duke case (Breast_MRI_127): negative row direction, positive column direction.
-    (-1, 0, 0, 0, 1, 0): 1,
+    # (-1, 0, 0, 0, -1, 0) → three 90° CCW (≡ one 90° CW)
+    (-1, 0, 0, 0, -1, 0): 3,
 }
 
 _ORIGINAL_PATH_RE = re.compile(
@@ -419,6 +421,7 @@ def _load_pixel_array(path: Path) -> np.ndarray:
 
 
 def _bbox_from_mask(mask: np.ndarray, margin: int = 0) -> Tuple[Tuple[int, int], ...]:
+    """Axis-aligned bbox of ``mask``, expanded by ``margin`` voxels when possible."""
     coords = np.argwhere(mask)
     if coords.size == 0:
         raise ValueError("Cannot crop an empty breast mask")
@@ -437,31 +440,18 @@ def _crop_affine(affine: np.ndarray, bbox: Tuple[Tuple[int, int], ...]) -> np.nd
     return crop_affine
 
 
-def _breast_label_sides(
-    mask_data: np.ndarray,
-    affine: np.ndarray,
-) -> Dict[str, float]:
+def _breast_label_sides(mask_data: np.ndarray) -> Dict[str, float]:
+    """Map BreastDivider labels to sides: 1 = left, 2 = right."""
     labels = sorted(float(v) for v in np.unique(mask_data) if v > 0)
-    if len(labels) != 2:
-        raise ValueError(f"Expected exactly 2 positive breast mask labels; found {labels}")
-
-    centers: List[Tuple[float, float, float]] = []
-    for label in labels:
-        coords = np.argwhere(mask_data == label)
-        if coords.size == 0:
-            continue
-        center_ijk = coords.mean(axis=0)
-        world = np.asarray(affine, dtype=np.float64) @ np.array(
-            [center_ijk[0], center_ijk[1], center_ijk[2], 1.0],
-            dtype=np.float64,
+    expected = {1.0, 2.0}
+    if set(labels) != expected:
+        raise ValueError(
+            f"Expected BreastDivider labels {{1, 2}}; found {labels}"
         )
-        # DICOM patient coordinates use increasing X toward patient left.
-        centers.append((float(label), float(world[0]), float(center_ijk[0])))
-
-    if len(centers) != 2:
-        raise ValueError("Expected two non-empty breast masks")
-    centers.sort(key=lambda item: (item[1], item[2]))
-    return {"right": centers[0][0], "left": centers[1][0]}
+    for label in (1.0, 2.0):
+        if not np.any(mask_data == label):
+            raise ValueError(f"BreastDivider label {int(label)} is empty")
+    return {"left": 1.0, "right": 2.0}
 
 
 def _read_series_orientation(
@@ -486,68 +476,77 @@ def _read_series_orientation(
 
 def breast_divider_rot90_k(
     image_orientation_patient: Optional[Sequence[float]],
-    patient_position: Optional[str] = None,
 ) -> int:
-    """Choose in-plane ``np.rot90`` k for a BreastDivider mask.
+    """Choose how many ``np.rot90`` steps to apply from rounded IOP.
 
-    BreastDivider masks are authored in a fixed array orientation. After affine
-    resampling onto a DICOM volume, an additional in-plane rotation is required
-    so the two breast labels land on the breasts in voxel space.
-
-    Uses DICOM ``ImageOrientationPatient`` rounded to nearest integer. In this
-    Duke dataset the mask-bearing series use exactly three rounded orientation
-    vectors:
-
-      * ``(1, 0, 0, 0, 1, 0)`` → ``k=1``  (90° counter-clockwise)
-      * ``(-1, 0, 0, 0, -1, 0)`` → ``k=-1`` (90° clockwise)
-      * ``(-1, 0, 0, 0, 1, 0)`` → ``k=1``  (90° counter-clockwise; rare mixed case)
-
-    Returns ``k`` for ``np.rot90(..., k=k, axes=(0, 1))`` (also ``0`` / ``2``
-    reserved if a future rule needs no-op / 180°).
+    * ``(1, 0, 0, 0, 1, 0)`` → ``1`` (one 90° CCW)
+    * ``(-1, 0, 0, 0, -1, 0)`` → ``3`` (three 90° CCW)
     """
     if image_orientation_patient is None or len(image_orientation_patient) < 6:
-        return 1
+        raise ValueError(
+            "ImageOrientationPatient is required to choose BreastDivider in-plane rotation"
+        )
     rounded_iop = tuple(int(round(float(x))) for x in image_orientation_patient[:6])
     if rounded_iop in _BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP:
         return _BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP[rounded_iop]
-
-    _ = (patient_position or "").upper()  # recorded by callers in meta
     raise ValueError(
         "Unsupported rounded ImageOrientationPatient for BreastDivider rotation: "
-        f"{rounded_iop}. Add it to _BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP."
+        f"{rounded_iop}. Expected one of {sorted(_BREAST_DIVIDER_ROTATION_BY_ROUNDED_IOP)}"
     )
 
 
 def _rot90_k_name(k: int) -> str:
-    return {0: "none", 1: "rot90_ccw", -1: "rot90_cw", 2: "rot180", 3: "rot90_cw"}.get(
+    return {0: "none", 1: "rot90_x1", 2: "rot90_x2", 3: "rot90_x3", -1: "rot90_cw"}.get(
         int(k), f"rot90_k={k}"
     )
 
-def _resample_mask_to_volume(
+
+def _load_mask_for_volume(
     mask_path: Union[str, Path],
     volume_shape: Tuple[int, ...],
-    affine: np.ndarray,
+    volume_affine: np.ndarray,
 ) -> np.ndarray:
-    """Resample a BreastDivider mask onto the volume voxel grid.
-
-    The BreastDivider ``.nii.gz`` masks carry their own affine that differs from
-    the DICOM-derived volume affine (a Z-axis flip plus translation offsets).
-    Resampling through both affines (nearest-neighbor, to preserve integer
-    labels) aligns the mask voxel-for-voxel with ``volume.nii`` so bounding-box
-    crops index the same underlying image data.
-    """
+    """Load BreastDivider mask data, resampling onto the volume grid if needed."""
     import nibabel as nib
     from nibabel.processing import resample_from_to
 
     mask_img = nib.load(str(mask_path))
+    mask_data = np.asanyarray(mask_img.dataobj)
+    if tuple(int(s) for s in mask_data.shape) == tuple(int(s) for s in volume_shape):
+        return np.ascontiguousarray(mask_data)
+
     resampled = resample_from_to(
         mask_img,
-        (tuple(int(s) for s in volume_shape), np.asarray(affine, dtype=np.float64)),
+        (tuple(int(s) for s in volume_shape), np.asarray(volume_affine, dtype=np.float64)),
         order=0,
     )
     return np.ascontiguousarray(
-        np.rint(np.asarray(resampled.get_fdata(dtype=np.float32))).astype(np.float32)
+        np.rint(np.asarray(resampled.get_fdata(dtype=np.float32))).astype(mask_data.dtype)
     )
+
+
+
+def _align_mask_to_volume_empirical(
+    mask_data: np.ndarray,
+    image_orientation_patient: Sequence[float],
+    *,
+    patient_id: Optional[str] = None,
+) -> Tuple[np.ndarray, int, bool]:
+    """Align mask to the native volume array via rot90 + flips (notebook recipe).
+
+    ``for _ in range(k): mask = rot90(mask)``, then ``flip(axis=1)`` and
+    ``flip(axis=2)``. ``k`` is 1 or 3 from ``ImageOrientationPatient``.
+    """
+    _ = patient_id  # reserved for patient-specific overrides
+    rot_k = breast_divider_rot90_k(image_orientation_patient)
+    flip_horizontal = True
+
+    aligned = mask_data
+    for _ in range(int(rot_k) % 4):
+        aligned = np.rot90(aligned)
+    aligned = np.flip(aligned, axis=1)
+    aligned = np.flip(aligned, axis=2)
+    return np.ascontiguousarray(aligned), int(rot_k), flip_horizontal
 
 
 def write_breast_side_crops(
@@ -556,36 +555,43 @@ def write_breast_side_crops(
     out_dir: Union[str, Path],
     mask_path: Union[str, Path],
     *,
-    margin: int = 0,
+    margin: int = _DEFAULT_BREAST_CROP_MARGIN,
     series_dir: Optional[Union[str, Path]] = None,
     image_orientation_patient: Optional[Sequence[float]] = None,
-    patient_position: Optional[str] = None,
+    patient_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Write ``left.nii`` and ``right.nii`` crops using a BreastDivider mask."""
+    """Write ``left.nii`` and ``right.nii`` crops using a BreastDivider mask.
+
+    Label ``1`` is left and label ``2`` is right. The mask is aligned with
+    ``rot90`` × ``k`` (IOP-dependent), a horizontal flip, and a Z flip.
+    ``margin`` expands each breast bounding box (clipped to the volume bounds).
+    """
     import nibabel as nib
 
     out_dir = Path(out_dir)
     mask_path = Path(mask_path)
-    if series_dir is None:
-        series_dir = mask_path.parent
-    if image_orientation_patient is None or patient_position is None:
-        iop_read, pos_read = _read_series_orientation(series_dir)
-        if image_orientation_patient is None:
-            image_orientation_patient = iop_read
-        if patient_position is None:
-            patient_position = pos_read
+    if image_orientation_patient is None:
+        if series_dir is None:
+            series_dir = mask_path.parent
+        image_orientation_patient, _ = _read_series_orientation(series_dir)
 
-    rot_k = breast_divider_rot90_k(image_orientation_patient, patient_position)
-    mask_data = _resample_mask_to_volume(mask_path, volume.shape, affine)
-    if rot_k % 4 != 0:
-        mask_data = np.ascontiguousarray(np.rot90(mask_data, k=rot_k, axes=(0, 1)))
+    mask_on_volume = _load_mask_for_volume(mask_path, volume.shape, affine)
+    label_sides = _breast_label_sides(mask_on_volume)
+    # BreastDivider's left/right labels are inverted relative to patient anatomy.
+    label_sides = {"left": label_sides["right"], "right": label_sides["left"]}
+
+    mask_data, rot_k, flip_horizontal = _align_mask_to_volume_empirical(
+        mask_on_volume,
+        image_orientation_patient,
+        patient_id=patient_id,
+    )
+
     if tuple(mask_data.shape) != tuple(volume.shape):
         raise ValueError(
             f"Aligned mask shape {mask_data.shape} does not match volume shape "
             f"{volume.shape} for {mask_path}"
         )
 
-    label_sides = _breast_label_sides(mask_data, affine)
     crops: Dict[str, Any] = {}
     for side, label in label_sides.items():
         bbox = _bbox_from_mask(mask_data == label, margin=margin)
@@ -605,12 +611,18 @@ def write_breast_side_crops(
             "bbox_ijk": [[a, b] for a, b in bbox],
             "shape": list(crop.shape),
         }
+    alignment = f"rot90_x{rot_k}"
+    if flip_horizontal:
+        alignment += "+flip_axis1"
+    alignment += "+flip_axis2"
     return {
         "mask_path": str(mask_path),
         "margin": int(margin),
-        "mask_alignment": f"resample_from_to(order=0)+{_rot90_k_name(rot_k)}",
+        "mask_alignment": alignment,
         "mask_rot90_k": int(rot_k),
         "mask_rot90_name": _rot90_k_name(rot_k),
+        "mask_flip_horizontal": bool(flip_horizontal),
+        "label_sides": {side: label for side, label in label_sides.items()},
         "image_orientation_patient": (
             list(image_orientation_patient) if image_orientation_patient is not None else None
         ),
@@ -619,7 +631,6 @@ def write_breast_side_crops(
             if image_orientation_patient is not None
             else None
         ),
-        "patient_position": patient_position,
         "crops": crops,
     }
 
@@ -629,8 +640,10 @@ def write_breast_side_crops_from_files(
     out_dir: Union[str, Path],
     mask_path: Union[str, Path],
     *,
-    margin: int = 0,
+    margin: int = _DEFAULT_BREAST_CROP_MARGIN,
     series_dir: Optional[Union[str, Path]] = None,
+    image_orientation_patient: Optional[Sequence[float]] = None,
+    patient_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Write side crops from an existing ``volume.nii`` and mask file."""
     import nibabel as nib
@@ -644,6 +657,8 @@ def write_breast_side_crops_from_files(
         mask_path,
         margin=margin,
         series_dir=series_dir if series_dir is not None else Path(mask_path).parent,
+        image_orientation_patient=image_orientation_patient,
+        patient_id=patient_id,
     )
 
 
@@ -662,7 +677,7 @@ def convert_series_to_nifti(
     lower_bound: Optional[float] = None,
     upper_bound: Optional[float] = None,
     split_breasts: bool = False,
-    breast_crop_margin: int = 0,
+    breast_crop_margin: int = _DEFAULT_BREAST_CROP_MARGIN,
 ) -> Dict[str, Any]:
     """Convert one DICOM series to uncompressed ``volume.nii`` + ``meta.json``."""
     import nibabel as nib
@@ -689,9 +704,6 @@ def convert_series_to_nifti(
     if split_breasts:
         if not breast_mask_path.is_file():
             raise FileNotFoundError(f"Missing BreastDivider mask: {breast_mask_path}")
-        # PatientPosition is not always in the header cache; read from series DICOM.
-        _iop, patient_position = _read_series_orientation(series_dir)
-        iop = headers[0].image_orientation or _iop
         breast_crops = write_breast_side_crops(
             volume,
             affine,
@@ -699,8 +711,8 @@ def convert_series_to_nifti(
             breast_mask_path,
             margin=breast_crop_margin,
             series_dir=series_dir,
-            image_orientation_patient=iop,
-            patient_position=patient_position,
+            image_orientation_patient=headers[0].image_orientation,
+            patient_id=patient_id,
         )
 
     meta = {
@@ -769,7 +781,7 @@ def convert_duke_dataset(
     workers: int = 4,
     skip_existing: bool = True,
     split_breasts: bool = False,
-    breast_crop_margin: int = 0,
+    breast_crop_margin: int = _DEFAULT_BREAST_CROP_MARGIN,
 ) -> Dict[str, Any]:
     """Convert selected patients/scans to NIfTI and write index + phenotypes."""
     raw_root = Path(raw_root)
@@ -854,6 +866,7 @@ def convert_duke_dataset(
                         mask_path,
                         margin=breast_crop_margin,
                         series_dir=series_dir,
+                        patient_id=pid,
                     )
                     with open(meta_path, "w") as f:
                         json.dump(meta, f, indent=2)
@@ -1350,8 +1363,11 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     c.add_argument(
         "--breast-crop-margin",
         type=int,
-        default=0,
-        help="Voxel margin to add around each breast bounding box",
+        default=_DEFAULT_BREAST_CROP_MARGIN,
+        help=(
+            "Voxel padding around each breast bounding box in every direction "
+            f"(clipped to volume bounds; default: {_DEFAULT_BREAST_CROP_MARGIN})"
+        ),
     )
 
     ph = sub.add_parser("phenotypes", help="Rebuild phenotype JSON only")

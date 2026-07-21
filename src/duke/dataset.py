@@ -260,6 +260,232 @@ class DukeBreastMRIDataset(VisionDataset):
         return image, target
 
 
+def _normalize_laterality(value: Any) -> Optional[str]:
+    """Map clinical tumor-location field to ``\"L\"`` / ``\"R\"``, else ``None``."""
+    if value is None:
+        return None
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        v = float(value)
+        if v == PHENOTYPE_SENTINEL:
+            return None
+        if v == 0.0:
+            return "L"
+        if v == 1.0:
+            return "R"
+        return None
+    s = str(value).strip().upper()
+    if s in {"", "NA", "NC", "NP", "NAN", "NONE", "UNKNOWN"}:
+        return None
+    if s in {"L", "LEFT"}:
+        return "L"
+    if s in {"R", "RIGHT"}:
+        return "R"
+    return None
+
+
+def _is_bilateral(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return False
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value) == 1.0
+    s = str(value).strip().upper()
+    return s in {"1", "YES", "TRUE", "BILATERAL"}
+
+
+def _breast_cancer_label(side: str, tumor_location: Any, bilateral: Any) -> Optional[int]:
+    """Binary cancer label for a breast side, or ``None`` if laterality is unknown."""
+    loc = _normalize_laterality(tumor_location)
+    if loc is None:
+        return None
+    if _is_bilateral(bilateral):
+        return 1
+    if side == "left":
+        return 1 if loc == "L" else 0
+    if side == "right":
+        return 1 if loc == "R" else 0
+    raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+
+class DukeClassificationDataset(VisionDataset):
+    """Per-breast axial slice classification from left/right Duke MRI crops.
+
+    Each index is one axial slice from a left or right breast crop volume.
+    The target is a binary cancer label derived from clinical laterality
+    (``tumor_location``) and the bilateral flag:
+
+    * unknown laterality → patient excluded
+    * bilateral → both breasts labeled cancerous (1)
+    * unilateral L/R → only the matching side is cancerous (1); the other is 0
+
+    ``z_min`` / ``z_max`` restrict axial indices as fractions of each crop's
+    depth in ``[0, 1]`` (same semantics as :class:`DukeBreastMRIDataset`).
+    """
+
+    def __init__(
+        self,
+        root: Union[str, Path] = _DEFAULT_OUT_ROOT,
+        *,
+        scan: Union[str, int] = "pre",
+        z_min: float = 0.0,
+        z_max: float = 1.0,
+        transforms: Optional[Callable] = None,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        volume_cache_size: int = 8,
+    ) -> None:
+        root = Path(root)
+        super().__init__(
+            str(root),
+            transforms=transforms,
+            transform=transform,
+            target_transform=target_transform,
+        )
+        self.root_path = root
+        self.scan_type = resolve_scan(scan)
+        self.z_min = float(z_min)
+        self.z_max = float(z_max)
+        self._volume_cache = _VolumeCache(maxsize=volume_cache_size)
+
+        index_path = root / "index" / "series_index.json"
+        if not index_path.is_file():
+            raise FileNotFoundError(
+                f"Missing {index_path}. Run convert_duke_dataset() first."
+            )
+        with open(index_path) as f:
+            series_index = json.load(f)
+
+        pheno_path = root / "labels" / "phenotypes.json"
+        if not pheno_path.is_file():
+            raise FileNotFoundError(f"Missing {pheno_path}")
+        with open(pheno_path) as f:
+            self._phenotypes = json.load(f)
+
+        # Flat entries: (patient_id, side, vol_rel, n_slices, z, label)
+        self._entries: List[Tuple[str, str, str, int, int, int]] = []
+        n_skipped_laterality = 0
+        n_skipped_missing_crops = 0
+
+        for series in series_index.get("series", []):
+            if series["scan_type"] != self.scan_type:
+                continue
+            pid = series["patient_id"]
+            raw = self._phenotypes.get(pid, {}).get("raw", {})
+            left_label = _breast_cancer_label("left", raw.get("tumor_location"), raw.get("bilateral"))
+            if left_label is None:
+                n_skipped_laterality += 1
+                continue
+            right_label = _breast_cancer_label(
+                "right", raw.get("tumor_location"), raw.get("bilateral")
+            )
+            assert right_label is not None
+
+            side_paths = self._resolve_breast_paths(series)
+            if side_paths is None:
+                n_skipped_missing_crops += 1
+                continue
+
+            for side, vol_rel, n_z, label in (
+                ("left", side_paths["left"], side_paths["left_n_slices"], left_label),
+                ("right", side_paths["right"], side_paths["right_n_slices"], right_label),
+            ):
+                z_start, z_end = _z_index_range(n_z, self.z_min, self.z_max)
+                for z in range(z_start, z_end):
+                    self._entries.append((pid, side, vol_rel, n_z, z, int(label)))
+
+        if not self._entries:
+            raise RuntimeError(
+                f"No classification slices for scan={self.scan_type!r} under {root} "
+                f"with z_min={self.z_min}, z_max={self.z_max} "
+                f"(skipped_laterality={n_skipped_laterality}, "
+                f"skipped_missing_crops={n_skipped_missing_crops})"
+            )
+
+        logger.info(
+            "DukeClassificationDataset scan=%s entries=%d z=[%.3f, %.3f) "
+            "skipped_laterality=%d skipped_missing_crops=%d",
+            self.scan_type,
+            len(self._entries),
+            self.z_min,
+            self.z_max,
+            n_skipped_laterality,
+            n_skipped_missing_crops,
+        )
+
+    def _resolve_breast_paths(
+        self, series: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Return left/right relative paths and slice counts, or ``None`` if missing."""
+        pid = series["patient_id"]
+        scan = series["scan_type"]
+        left_rel = series.get("left_path") or f"{pid}/{scan}/left.nii"
+        right_rel = series.get("right_path") or f"{pid}/{scan}/right.nii"
+        left_path = self.root_path / left_rel
+        right_path = self.root_path / right_rel
+        if not left_path.is_file() or not right_path.is_file():
+            return None
+
+        left_n: Optional[int] = None
+        right_n: Optional[int] = None
+        meta_path = self.root_path / series.get("meta_path", f"{pid}/{scan}/meta.json")
+        if meta_path.is_file():
+            with open(meta_path) as f:
+                meta = json.load(f)
+            crops = (meta.get("breast_divider") or {}).get("crops") or {}
+            if "left" in crops and "shape" in crops["left"]:
+                left_n = int(crops["left"]["shape"][-1])
+            if "right" in crops and "shape" in crops["right"]:
+                right_n = int(crops["right"]["shape"][-1])
+
+        if left_n is None or right_n is None:
+            import nibabel as nib
+
+            if left_n is None:
+                left_n = int(nib.load(str(left_path)).shape[-1])
+            if right_n is None:
+                right_n = int(nib.load(str(right_path)).shape[-1])
+
+        return {
+            "left": left_rel,
+            "right": right_rel,
+            "left_n_slices": left_n,
+            "right_n_slices": right_n,
+        }
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get_target(self, index: int) -> int:
+        return int(self._entries[index][5])
+
+    def get_side(self, index: int) -> str:
+        return self._entries[index][1]
+
+    def get_phenotype_raw(self, index: int) -> Dict[str, Any]:
+        pid = self._entries[index][0]
+        entry = self._phenotypes.get(pid, {})
+        return dict(entry.get("raw", {"patient_id": pid}))
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        _patient_id, _side, vol_rel, _n_z, z, label = self._entries[index]
+        volume = self._volume_cache.get(self.root_path / vol_rel)
+        image: Any = _slice_to_pil(volume, z)
+        target: Any = int(label)
+
+        if self.transforms is not None:
+            image, target = self.transforms(image, target)
+        else:
+            if self.transform is not None:
+                image = self.transform(image)
+            if self.target_transform is not None:
+                target = self.target_transform(target)
+
+        return image, target
+
+
 # ---------------------------------------------------------------------------
 # DINOv3 pair adapter
 # ---------------------------------------------------------------------------

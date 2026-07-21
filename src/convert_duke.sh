@@ -22,4 +22,4 @@ OUT_ROOT=/common/ganesanv/tlab/data/tcia/duke_breast_cancer_processed
 CLINICAL_XLSX=/common/ganesanv/tlab/data/tcia/duke_breast_cancer_mri/Clinical_and_Other_Features.xlsx
 MAPPING_XLSX=/common/ganesanv/tlab/data/tcia/duke_breast_cancer_mri/Breast-Cancer-MRI-filepath_filename-mapping.xlsx
 SCAN_TYPES="pre T1"
-python duke/convert.py convert --raw-root $RAW_ROOT --out-root $OUT_ROOT --clinical-xlsx $CLINICAL_XLSX --mapping-xlsx $MAPPING_XLSX --scan-types $SCAN_TYPES
+python duke/convert.py convert --raw-root $RAW_ROOT --out-root $OUT_ROOT --clinical-xlsx $CLINICAL_XLSX --mapping-xlsx $MAPPING_XLSX --scan-types $SCAN_TYPES --split-breasts --workers 8
