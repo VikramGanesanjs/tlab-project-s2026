@@ -30,7 +30,7 @@ _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from duke import DukeClassificationDataset  # noqa: E402
+from datasets.duke import DukeClassificationDataset, build_duke_transform  # noqa: E402
 
 DINOV3_REPO = REPO_ROOT / "opt" / "dinov3"
 # Full 922-patient conversion (pre / T1). The older nifti tree only has ~20 post_1 vols.
@@ -160,13 +160,24 @@ class DinoV3CancerModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def build_transform(image_size: int = 224) -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
+def build_transform(
+    image_size: int = 224,
+    *,
+    augment: bool = True,
+    crop_scale_min: float = 0.8,
+    jitter: float = 0.2,
+    rotation_degrees: float = 15.0,
+    horizontal_flip_prob: float = 0.5,
+    vertical_flip_prob: float = 0.5,
+) -> transforms.Compose:
+    return build_duke_transform(
+        image_size,
+        augment=augment,
+        crop_scale_min=crop_scale_min,
+        jitter=jitter,
+        rotation_degrees=rotation_degrees,
+        horizontal_flip_prob=horizontal_flip_prob,
+        vertical_flip_prob=vertical_flip_prob,
     )
 
 
@@ -603,6 +614,13 @@ def train(
     repo_dir: Path,
     model_name: str,
     image_size: int,
+    augment: bool,
+    crop_scale_min: float,
+    jitter: float,
+    rotation_degrees: float,
+    horizontal_flip_prob: float,
+    vertical_flip_prob: float,
+    include_bilateral: bool,
     checkpoint_dir: Path,
 ) -> None:
     torch.manual_seed(seed)
@@ -612,7 +630,16 @@ def train(
         scan=scan,
         z_min=z_min,
         z_max=z_max,
-        transform=build_transform(image_size),
+        include_bilateral=include_bilateral,
+        transform=build_transform(
+            image_size,
+            augment=augment,
+            crop_scale_min=crop_scale_min,
+            jitter=jitter,
+            rotation_degrees=rotation_degrees,
+            horizontal_flip_prob=horizontal_flip_prob,
+            vertical_flip_prob=vertical_flip_prob,
+        ),
     )
     all_labels = collect_slice_labels(full_ds)
     summarize_class_counts(all_labels, name="full dataset (slice)")
@@ -822,6 +849,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument(
+        "--include-bilateral",
+        action="store_true",
+        help="Include bilateral cases (excluded by default)",
+    )
+    augmentation = p.add_mutually_exclusive_group()
+    augmentation.add_argument(
+        "--augment",
+        dest="augment",
+        action="store_true",
+        default=True,
+        help="Enable random crop, jitter, rotation, and flips (default)",
+    )
+    augmentation.add_argument(
+        "--no-augment",
+        dest="augment",
+        action="store_false",
+        help="Use deterministic resize preprocessing",
+    )
+    p.add_argument("--crop-scale-min", type=float, default=0.8)
+    p.add_argument("--jitter", type=float, default=0.2)
+    p.add_argument("--rotation-degrees", type=float, default=15.0)
+    p.add_argument("--horizontal-flip-prob", type=float, default=0.5)
+    p.add_argument("--vertical-flip-prob", type=float, default=0.5)
+    p.add_argument(
         "--encoder",
         type=str,
         choices=list(ENCODER_CHOICES),
@@ -926,6 +977,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         repo_dir=args.dinov3_repo,
         model_name=args.model_name,
         image_size=args.image_size,
+        augment=args.augment,
+        crop_scale_min=args.crop_scale_min,
+        jitter=args.jitter,
+        rotation_degrees=args.rotation_degrees,
+        horizontal_flip_prob=args.horizontal_flip_prob,
+        vertical_flip_prob=args.vertical_flip_prob,
+        include_bilateral=args.include_bilateral,
         checkpoint_dir=checkpoint_dir,
     )
 

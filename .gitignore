@@ -5,6 +5,6 @@ opt/*
 
 src/__pycache__/*
 
-src/duke/__pycache__/*
+src/datasets/**/__pycache__/*
 
 runs/*

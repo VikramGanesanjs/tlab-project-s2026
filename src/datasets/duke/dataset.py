@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import torch
 from PIL import Image
+from torchvision import transforms as tv_transforms
 from torchvision.datasets.vision import VisionDataset
 
 from .convert import (
@@ -20,6 +22,9 @@ from .convert import (
 )
 
 logger = logging.getLogger(__name__)
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -109,6 +114,61 @@ def _z_index_range(n_z: int, z_min: float, z_max: float) -> Tuple[int, int]:
     return start, end
 
 
+def build_duke_transform(
+    image_size: int = 224,
+    *,
+    augment: bool = True,
+    crop_scale_min: float = 0.8,
+    jitter: float = 0.2,
+    rotation_degrees: float = 15.0,
+    horizontal_flip_prob: float = 0.5,
+    vertical_flip_prob: float = 0.5,
+) -> tv_transforms.Compose:
+    """Build the default Duke preprocessing and augmentation pipeline."""
+    if image_size <= 0:
+        raise ValueError(f"image_size must be positive, got {image_size}")
+    if not 0.0 < crop_scale_min <= 1.0:
+        raise ValueError(f"crop_scale_min must be in (0, 1], got {crop_scale_min}")
+    if jitter < 0.0 or rotation_degrees < 0.0:
+        raise ValueError("jitter and rotation_degrees must be non-negative")
+    for name, probability in (
+        ("horizontal_flip_prob", horizontal_flip_prob),
+        ("vertical_flip_prob", vertical_flip_prob),
+    ):
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1], got {probability}")
+
+    operations: List[Callable] = []
+    if augment:
+        operations.extend(
+            [
+                tv_transforms.RandomResizedCrop(
+                    image_size,
+                    scale=(crop_scale_min, 1.0),
+                    ratio=(0.9, 1.1),
+                ),
+                tv_transforms.ColorJitter(
+                    brightness=jitter,
+                    contrast=jitter,
+                    saturation=jitter,
+                    hue=min(jitter / 2.0, 0.5),
+                ),
+                tv_transforms.RandomRotation(rotation_degrees),
+                tv_transforms.RandomHorizontalFlip(horizontal_flip_prob),
+                tv_transforms.RandomVerticalFlip(vertical_flip_prob),
+            ]
+        )
+    else:
+        operations.append(tv_transforms.Resize((image_size, image_size)))
+    operations.extend(
+        [
+            tv_transforms.ToTensor(),
+            tv_transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+    return tv_transforms.Compose(operations)
+
+
 class DukeBreastMRIDataset(VisionDataset):
     """DINOv3-shaped Duke Breast MRI dataset.
 
@@ -136,8 +196,12 @@ class DukeBreastMRIDataset(VisionDataset):
         target_transform: Optional[Callable] = None,
         volume_cache_size: int = 8,
         seed: Optional[int] = None,
+        augment: bool = True,
+        image_size: int = 224,
     ) -> None:
         root = Path(root)
+        if transforms is None and transform is None:
+            transform = build_duke_transform(image_size, augment=augment)
         super().__init__(
             str(root),
             transforms=transforms,
@@ -246,16 +310,17 @@ class DukeBreastMRIDataset(VisionDataset):
 
         target: Any = self.get_target(index)
 
-        if self.transforms is not None:
-            image, target = self.transforms(image, target)
-        else:
-            if self.transform is not None:
-                if self.return_pair:
-                    image = (self.transform(image[0]), self.transform(image[1]))
-                else:
-                    image = self.transform(image)
+        if self.transform is not None:
+            if self.return_pair:
+                image = (self.transform(image[0]), self.transform(image[1]))
+            else:
+                image = self.transform(image)
             if self.target_transform is not None:
                 target = self.target_transform(target)
+        elif self.transforms is not None:
+            image, target = self.transforms(image, target)
+        elif self.target_transform is not None:
+            target = self.target_transform(target)
 
         return image, target
 
@@ -318,7 +383,7 @@ class DukeClassificationDataset(VisionDataset):
     (``tumor_location``) and the bilateral flag:
 
     * unknown laterality → patient excluded
-    * bilateral → both breasts labeled cancerous (1)
+    * bilateral → patient excluded by default (opt in with ``include_bilateral``)
     * unilateral L/R → only the matching side is cancerous (1); the other is 0
 
     ``z_min`` / ``z_max`` restrict axial indices as fractions of each crop's
@@ -336,8 +401,13 @@ class DukeClassificationDataset(VisionDataset):
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         volume_cache_size: int = 8,
+        augment: bool = True,
+        image_size: int = 224,
+        include_bilateral: bool = False,
     ) -> None:
         root = Path(root)
+        if transforms is None and transform is None:
+            transform = build_duke_transform(image_size, augment=augment)
         super().__init__(
             str(root),
             transforms=transforms,
@@ -348,6 +418,7 @@ class DukeClassificationDataset(VisionDataset):
         self.scan_type = resolve_scan(scan)
         self.z_min = float(z_min)
         self.z_max = float(z_max)
+        self.include_bilateral = bool(include_bilateral)
         self._volume_cache = _VolumeCache(maxsize=volume_cache_size)
 
         index_path = root / "index" / "series_index.json"
@@ -367,6 +438,7 @@ class DukeClassificationDataset(VisionDataset):
         # Flat entries: (patient_id, side, vol_rel, n_slices, z, label)
         self._entries: List[Tuple[str, str, str, int, int, int]] = []
         n_skipped_laterality = 0
+        n_skipped_bilateral = 0
         n_skipped_missing_crops = 0
 
         for series in series_index.get("series", []):
@@ -374,6 +446,9 @@ class DukeClassificationDataset(VisionDataset):
                 continue
             pid = series["patient_id"]
             raw = self._phenotypes.get(pid, {}).get("raw", {})
+            if not self.include_bilateral and _is_bilateral(raw.get("bilateral")):
+                n_skipped_bilateral += 1
+                continue
             left_label = _breast_cancer_label("left", raw.get("tumor_location"), raw.get("bilateral"))
             if left_label is None:
                 n_skipped_laterality += 1
@@ -401,17 +476,21 @@ class DukeClassificationDataset(VisionDataset):
                 f"No classification slices for scan={self.scan_type!r} under {root} "
                 f"with z_min={self.z_min}, z_max={self.z_max} "
                 f"(skipped_laterality={n_skipped_laterality}, "
+                f"skipped_bilateral={n_skipped_bilateral}, "
                 f"skipped_missing_crops={n_skipped_missing_crops})"
             )
 
         logger.info(
             "DukeClassificationDataset scan=%s entries=%d z=[%.3f, %.3f) "
-            "skipped_laterality=%d skipped_missing_crops=%d",
+            "include_bilateral=%s skipped_laterality=%d "
+            "skipped_bilateral=%d skipped_missing_crops=%d",
             self.scan_type,
             len(self._entries),
             self.z_min,
             self.z_max,
+            self.include_bilateral,
             n_skipped_laterality,
+            n_skipped_bilateral,
             n_skipped_missing_crops,
         )
 
@@ -484,6 +563,170 @@ class DukeClassificationDataset(VisionDataset):
                 target = self.target_transform(target)
 
         return image, target
+
+
+class DukeMultiSliceDataset(DukeClassificationDataset):
+    """Per-breast classification using randomly sampled axial slices.
+
+    Each item represents one left or right breast volume from one patient and
+    returns ``n_slices`` z-ordered images from the selected fractional z-range.
+    Sampled indices are separated by at least ``minimum_z_index_distance``.
+    When that distance is ``None``, it defaults per volume to
+    ``floor(eligible_slices / n_slices) - 1``. Tensor-valued transforms are
+    stacked as ``[n_slices, C, H, W]``.
+    """
+
+    def __init__(
+        self,
+        root: Union[str, Path] = _DEFAULT_OUT_ROOT,
+        *,
+        n_slices: int = 8,
+        scan: Union[str, int] = "pre",
+        z_min: float = 0.0,
+        z_max: float = 1.0,
+        transforms: Optional[Callable] = None,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        volume_cache_size: int = 8,
+        augment: bool = True,
+        image_size: int = 224,
+        minimum_z_index_distance: Optional[int] = None,
+        include_bilateral: bool = False,
+    ) -> None:
+        if n_slices <= 0:
+            raise ValueError(f"n_slices must be positive, got {n_slices}")
+        if minimum_z_index_distance is not None and minimum_z_index_distance < 0:
+            raise ValueError(
+                "minimum_z_index_distance must be non-negative or None, "
+                f"got {minimum_z_index_distance}"
+            )
+        self.n_slices = int(n_slices)
+        self.minimum_z_index_distance = minimum_z_index_distance
+        super().__init__(
+            root=root,
+            scan=scan,
+            z_min=z_min,
+            z_max=z_max,
+            transforms=transforms,
+            transform=transform,
+            target_transform=target_transform,
+            volume_cache_size=volume_cache_size,
+            augment=augment,
+            image_size=image_size,
+            include_bilateral=include_bilateral,
+        )
+
+        # Collapse the parent's slice-level index to one entry per breast:
+        # (patient_id, side, volume_path, volume_depth, label).
+        volume_entries: List[Tuple[str, str, str, int, int]] = []
+        seen = set()
+        for pid, side, vol_rel, n_z, _z, label in self._entries:
+            key = (pid, side, vol_rel)
+            if key not in seen:
+                seen.add(key)
+                volume_entries.append((pid, side, vol_rel, n_z, label))
+        self._entries = volume_entries  # type: ignore[assignment]
+        logger.info(
+            "DukeMultiSliceDataset scan=%s breasts=%d n_slices=%d "
+            "minimum_z_index_distance=%s z=[%.3f, %.3f)",
+            self.scan_type,
+            len(self._entries),
+            self.n_slices,
+            self.minimum_z_index_distance,
+            self.z_min,
+            self.z_max,
+        )
+
+    def get_target(self, index: int) -> int:
+        return int(self._entries[index][4])
+
+    def get_side(self, index: int) -> str:
+        return self._entries[index][1]
+
+    def get_patient_id(self, index: int) -> str:
+        return self._entries[index][0]
+
+    def get_slice_indices(
+        self,
+        index: int,
+        *,
+        volume_depth: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        if volume_depth is None:
+            vol_rel = self._entries[index][2]
+            volume = self._volume_cache.get(self.root_path / vol_rel)
+            volume_depth = int(volume.shape[-1])
+        n_z = int(volume_depth)
+        start, end = _z_index_range(n_z, self.z_min, self.z_max)
+        eligible_slices = end - start
+        if eligible_slices <= 0:
+            raise RuntimeError(
+                f"Empty z-range for patient={self.get_patient_id(index)!r}, "
+                f"side={self.get_side(index)!r}"
+            )
+        distance = self.minimum_z_index_distance
+        if distance is None:
+            distance = max(eligible_slices // self.n_slices - 1, 0)
+
+        # Distinct indices inherently have distance >= 1. A configured value
+        # of zero therefore means no additional spacing beyond uniqueness.
+        effective_distance = max(int(distance), 1)
+        required_span = 1 + (self.n_slices - 1) * effective_distance
+        if required_span > eligible_slices:
+            raise ValueError(
+                f"Cannot sample {self.n_slices} slices with minimum z-index "
+                f"distance {distance} from {eligible_slices} eligible slices "
+                f"for patient={self.get_patient_id(index)!r}, "
+                f"side={self.get_side(index)!r}"
+            )
+
+        # Choose sorted coordinates in a compressed range, then expand the
+        # gaps. This samples valid combinations without rejection loops.
+        compressed_size = eligible_slices - (
+            effective_distance - 1
+        ) * (self.n_slices - 1)
+        compressed = torch.randperm(compressed_size)[: self.n_slices]
+        compressed, _ = torch.sort(compressed)
+        offsets = torch.arange(self.n_slices) * (effective_distance - 1)
+        indices = compressed + offsets + start
+        return tuple(int(z) for z in indices.tolist())
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        _pid, _side, vol_rel, _n_z, label = self._entries[index]
+        volume = self._volume_cache.get(self.root_path / vol_rel)
+        volume_depth = int(volume.shape[-1])
+        # Sample on every item access, immediately before loading pixels. This
+        # intentionally allows the same breast to yield new slices each epoch.
+        slice_indices = self.get_slice_indices(index, volume_depth=volume_depth)
+        images: List[Any] = [
+            _slice_to_pil(volume, z)
+            for z in slice_indices
+        ]
+        target: Any = int(label)
+
+        # Handle separate transforms explicitly so target_transform runs once.
+        if self.transform is not None:
+            # Reuse one random augmentation realization across the stack so
+            # geometry and appearance remain aligned between ordered slices.
+            initial_rng_state = torch.get_rng_state()
+            images[0] = self.transform(images[0])
+            advanced_rng_state = torch.get_rng_state()
+            for image_index in range(1, len(images)):
+                torch.set_rng_state(initial_rng_state)
+                images[image_index] = self.transform(images[image_index])
+            torch.set_rng_state(advanced_rng_state)
+            if self.target_transform is not None:
+                target = self.target_transform(target)
+        elif self.transforms is not None:
+            transformed = [self.transforms(image, target) for image in images]
+            images = [pair[0] for pair in transformed]
+            target = transformed[0][1]
+        elif self.target_transform is not None:
+            target = self.target_transform(target)
+
+        if images and all(torch.is_tensor(image) for image in images):
+            return torch.stack(images, dim=0), target
+        return images, target
 
 
 # ---------------------------------------------------------------------------

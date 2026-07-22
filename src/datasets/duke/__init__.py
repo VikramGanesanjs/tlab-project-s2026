@@ -10,7 +10,9 @@ __all__ = [
     "PHENOTYPE_SENTINEL",
     "DukeBreastMRIDataset",
     "DukeClassificationDataset",
+    "DukeMultiSliceDataset",
     "PairToDinoGlobalCrops",
+    "build_duke_transform",
     "build_breastdivider_duke_scan_map",
     "build_mapping_slices_index",
     "build_phenotype_json",
@@ -23,7 +25,9 @@ __all__ = [
 _DATASET_ATTRS = {
     "DukeBreastMRIDataset",
     "DukeClassificationDataset",
+    "DukeMultiSliceDataset",
     "PairToDinoGlobalCrops",
+    "build_duke_transform",
 }
 _CONVERT_ATTRS = {
     "CANONICAL_SCAN_TYPES",
