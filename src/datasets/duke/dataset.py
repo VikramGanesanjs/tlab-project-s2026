@@ -114,6 +114,29 @@ def _z_index_range(n_z: int, z_min: float, z_max: float) -> Tuple[int, int]:
     return start, end
 
 
+SLICE_SAMPLING_CHOICES = ("random", "even")
+
+
+def _evenly_spaced_slice_indices(start: int, end: int, n_slices: int) -> Tuple[int, ...]:
+    """Return ``n_slices`` deterministic indices spanning ``[start, end)``."""
+    eligible_slices = end - start
+    if eligible_slices <= 0:
+        raise ValueError(f"Empty z-range [{start}, {end})")
+    if n_slices <= 0:
+        raise ValueError(f"n_slices must be positive, got {n_slices}")
+    if n_slices > eligible_slices:
+        raise ValueError(
+            f"Cannot place {n_slices} evenly spaced slices in "
+            f"{eligible_slices} eligible slices"
+        )
+    if n_slices == 1:
+        return (start + eligible_slices // 2,)
+    span = eligible_slices - 1
+    return tuple(
+        start + int(round(index * span / (n_slices - 1))) for index in range(n_slices)
+    )
+
+
 def build_duke_transform(
     image_size: int = 224,
     *,
@@ -566,14 +589,15 @@ class DukeClassificationDataset(VisionDataset):
 
 
 class DukeMultiSliceDataset(DukeClassificationDataset):
-    """Per-breast classification using randomly sampled axial slices.
+    """Per-breast classification using sampled axial slices.
 
     Each item represents one left or right breast volume from one patient and
     returns ``n_slices`` z-ordered images from the selected fractional z-range.
-    Sampled indices are separated by at least ``minimum_z_index_distance``.
-    When that distance is ``None``, it defaults per volume to
-    ``floor(eligible_slices / n_slices) - 1``. Tensor-valued transforms are
-    stacked as ``[n_slices, C, H, W]``.
+    With ``slice_sampling="random"``, indices are separated by at least
+    ``minimum_z_index_distance`` (defaulting per volume to
+    ``floor(eligible_slices / n_slices) - 1``). With ``slice_sampling="even"``,
+    indices are deterministic and evenly spaced across the eligible range.
+    Tensor-valued transforms are stacked as ``[n_slices, C, H, W]``.
     """
 
     def __init__(
@@ -592,6 +616,7 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
         image_size: int = 224,
         minimum_z_index_distance: Optional[int] = None,
         include_bilateral: bool = False,
+        slice_sampling: str = "random",
     ) -> None:
         if n_slices <= 0:
             raise ValueError(f"n_slices must be positive, got {n_slices}")
@@ -600,8 +625,14 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
                 "minimum_z_index_distance must be non-negative or None, "
                 f"got {minimum_z_index_distance}"
             )
+        if slice_sampling not in SLICE_SAMPLING_CHOICES:
+            raise ValueError(
+                f"slice_sampling must be one of {SLICE_SAMPLING_CHOICES}, "
+                f"got {slice_sampling!r}"
+            )
         self.n_slices = int(n_slices)
         self.minimum_z_index_distance = minimum_z_index_distance
+        self.slice_sampling = slice_sampling
         super().__init__(
             root=root,
             scan=scan,
@@ -628,10 +659,11 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
         self._entries = volume_entries  # type: ignore[assignment]
         logger.info(
             "DukeMultiSliceDataset scan=%s breasts=%d n_slices=%d "
-            "minimum_z_index_distance=%s z=[%.3f, %.3f)",
+            "slice_sampling=%s minimum_z_index_distance=%s z=[%.3f, %.3f)",
             self.scan_type,
             len(self._entries),
             self.n_slices,
+            self.slice_sampling,
             self.minimum_z_index_distance,
             self.z_min,
             self.z_max,
@@ -664,6 +696,15 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
                 f"Empty z-range for patient={self.get_patient_id(index)!r}, "
                 f"side={self.get_side(index)!r}"
             )
+        if self.slice_sampling == "even":
+            try:
+                return _evenly_spaced_slice_indices(start, end, self.n_slices)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{exc} for patient={self.get_patient_id(index)!r}, "
+                    f"side={self.get_side(index)!r}"
+                ) from exc
+
         distance = self.minimum_z_index_distance
         if distance is None:
             distance = max(eligible_slices // self.n_slices - 1, 0)
@@ -695,8 +736,7 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
         _pid, _side, vol_rel, _n_z, label = self._entries[index]
         volume = self._volume_cache.get(self.root_path / vol_rel)
         volume_depth = int(volume.shape[-1])
-        # Sample on every item access, immediately before loading pixels. This
-        # intentionally allows the same breast to yield new slices each epoch.
+        # Random sampling redraws on every access; even sampling is fixed.
         slice_indices = self.get_slice_indices(index, volume_depth=volume_depth)
         images: List[Any] = [
             _slice_to_pil(volume, z)

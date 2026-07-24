@@ -8,6 +8,9 @@ __all__ = [
     "ADNIClassificationDataset",
     "ADNIMultiSliceDataset",
     "ADNIPairedSliceDataset",
+    "ADNITaskSpec",
+    "ADNI_TASK_CHOICES",
+    "DEFAULT_ADNI_TASK",
     "DEFAULT_CSV_NAME",
     "DEFAULT_PHENOTYPE_COLUMNS",
     "DEFAULT_ROOT",
@@ -15,6 +18,7 @@ __all__ = [
     "LABEL_TO_DIAGNOSIS",
     "PHENOTYPE_SENTINEL",
     "build_adni_transform",
+    "resolve_adni_task",
 ]
 
 

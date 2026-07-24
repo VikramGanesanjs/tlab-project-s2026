@@ -11,7 +11,7 @@ import csv
 import logging
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -31,6 +31,70 @@ DIAGNOSIS_TO_LABEL = {"CN": 0, "MCI": 1, "AD": 2}
 LABEL_TO_DIAGNOSIS = {label: diagnosis for diagnosis, label in DIAGNOSIS_TO_LABEL.items()}
 DEFAULT_PHENOTYPE_COLUMNS = ("Group", "Sex", "Age")
 PHENOTYPE_SENTINEL = -1.0
+
+# Multi-slice / classification task configurations.
+# Binary tasks use Duke-style labels (0/1) with the second diagnosis positive.
+ADNI_TASK_CHOICES = ("cn_mci_ad", "cn_ad", "cn_mci", "mci_ad")
+DEFAULT_ADNI_TASK = "cn_mci_ad"
+
+
+@dataclass(frozen=True)
+class ADNITaskSpec:
+    """Resolved ADNI classification task: diagnoses kept and label remapping."""
+
+    name: str
+    diagnoses: Tuple[str, ...]
+    label_map: Dict[str, int]
+    class_names: Tuple[str, ...]
+    binary: bool
+
+    @property
+    def num_logits(self) -> int:
+        """Classifier output width: 1 for BCE binary, else the class count."""
+        return 1 if self.binary else len(self.class_names)
+
+
+_ADNI_TASK_SPECS: Dict[str, ADNITaskSpec] = {
+    "cn_mci_ad": ADNITaskSpec(
+        name="cn_mci_ad",
+        diagnoses=("CN", "MCI", "AD"),
+        label_map={"CN": 0, "MCI": 1, "AD": 2},
+        class_names=("CN", "MCI", "AD"),
+        binary=False,
+    ),
+    "cn_ad": ADNITaskSpec(
+        name="cn_ad",
+        diagnoses=("CN", "AD"),
+        label_map={"CN": 0, "AD": 1},
+        class_names=("CN", "AD"),
+        binary=True,
+    ),
+    "cn_mci": ADNITaskSpec(
+        name="cn_mci",
+        diagnoses=("CN", "MCI"),
+        label_map={"CN": 0, "MCI": 1},
+        class_names=("CN", "MCI"),
+        binary=True,
+    ),
+    "mci_ad": ADNITaskSpec(
+        name="mci_ad",
+        diagnoses=("MCI", "AD"),
+        label_map={"MCI": 0, "AD": 1},
+        class_names=("MCI", "AD"),
+        binary=True,
+    ),
+}
+
+
+def resolve_adni_task(task: str) -> ADNITaskSpec:
+    """Return the task spec for an ADNI classification configuration."""
+    normalized = str(task).strip().lower().replace("-", "_")
+    spec = _ADNI_TASK_SPECS.get(normalized)
+    if spec is None:
+        raise ValueError(
+            f"Unknown ADNI task={task!r}; choose from {ADNI_TASK_CHOICES}"
+        )
+    return spec
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -215,6 +279,29 @@ def _z_index_range(n_z: int, z_min: float, z_max: float) -> Tuple[int, int]:
     return start, end
 
 
+SLICE_SAMPLING_CHOICES = ("random", "even")
+
+
+def _evenly_spaced_slice_indices(start: int, end: int, n_slices: int) -> Tuple[int, ...]:
+    """Return ``n_slices`` deterministic indices spanning ``[start, end)``."""
+    eligible_slices = end - start
+    if eligible_slices <= 0:
+        raise ValueError(f"Empty z-range [{start}, {end})")
+    if n_slices <= 0:
+        raise ValueError(f"n_slices must be positive, got {n_slices}")
+    if n_slices > eligible_slices:
+        raise ValueError(
+            f"Cannot place {n_slices} evenly spaced slices in "
+            f"{eligible_slices} eligible slices"
+        )
+    if n_slices == 1:
+        return (start + eligible_slices // 2,)
+    span = eligible_slices - 1
+    return tuple(
+        start + int(round(index * span / (n_slices - 1))) for index in range(n_slices)
+    )
+
+
 def _slice_to_pil(
     volume: np.ndarray,
     z: int,
@@ -298,6 +385,7 @@ class _ADNIBaseDataset(VisionDataset):
         root: Union[str, Path] = DEFAULT_ROOT,
         *,
         csv_path: Optional[Union[str, Path]] = None,
+        task: str = DEFAULT_ADNI_TASK,
         z_min: float = 0.0,
         z_max: float = 1.0,
         transforms: Optional[Callable] = None,
@@ -323,11 +411,35 @@ class _ADNIBaseDataset(VisionDataset):
         )
         self.root_path = root_path
         self.csv_path = metadata_path
+        self.task_spec = resolve_adni_task(task)
+        self.task = self.task_spec.name
+        self.class_names = self.task_spec.class_names
         self.z_min = float(z_min)
         self.z_max = float(z_max)
         _z_index_range(1, self.z_min, self.z_max)
         self._volume_cache = _VolumeCache(volume_cache_size)
-        self._records, self.phenotype_columns = _build_scan_index(root_path, metadata_path)
+        records, self.phenotype_columns = _build_scan_index(root_path, metadata_path)
+        allowed = set(self.task_spec.diagnoses)
+        self._records = [
+            replace(record, label=self.task_spec.label_map[record.phenotype["Group"]])
+            for record in records
+            if record.phenotype["Group"] in allowed
+        ]
+        if not self._records:
+            raise RuntimeError(
+                f"No ADNI scans for task={self.task!r} under {self.root_path} "
+                f"(kept diagnoses={list(self.task_spec.diagnoses)})"
+            )
+        logger.info(
+            "ADNI task=%s binary=%s scans=%d labels=%s",
+            self.task,
+            self.task_spec.binary,
+            len(self._records),
+            {
+                name: sum(record.label == index for record in self._records)
+                for index, name in enumerate(self.class_names)
+            },
+        )
 
     @staticmethod
     def _record_metadata(record: _ScanRecord) -> Dict[str, str]:
@@ -335,13 +447,21 @@ class _ADNIBaseDataset(VisionDataset):
 
 
 class ADNIClassificationDataset(_ADNIBaseDataset):
-    """Whole-brain axial-slice classification with CN/MCI/AD targets."""
+    """Whole-brain axial-slice classification.
+
+    ``task`` selects the label space:
+
+    * ``cn_mci_ad`` — three-class CN/MCI/AD (default)
+    * ``cn_ad`` / ``cn_mci`` / ``mci_ad`` — binary Duke-style 0/1 labels
+      (second diagnosis is the positive class)
+    """
 
     def __init__(
         self,
         root: Union[str, Path] = DEFAULT_ROOT,
         *,
         csv_path: Optional[Union[str, Path]] = None,
+        task: str = DEFAULT_ADNI_TASK,
         z_min: float = 0.0,
         z_max: float = 1.0,
         transforms: Optional[Callable] = None,
@@ -354,6 +474,7 @@ class ADNIClassificationDataset(_ADNIBaseDataset):
         super().__init__(
             root=root,
             csv_path=csv_path,
+            task=task,
             z_min=z_min,
             z_max=z_max,
             transforms=transforms,
@@ -405,7 +526,11 @@ class ADNIClassificationDataset(_ADNIBaseDataset):
 
 
 class ADNIMultiSliceDataset(_ADNIBaseDataset):
-    """Scan-level classification using an ordered stack of axial slices."""
+    """Scan-level classification using an ordered stack of axial slices.
+
+    ``task`` selects the label space (see :class:`ADNIClassificationDataset`).
+    Binary tasks mirror Duke: labels are ``0``/``1`` with a single-logit BCE head.
+    """
 
     def __init__(
         self,
@@ -413,6 +538,7 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
         *,
         n_slices: int = 8,
         csv_path: Optional[Union[str, Path]] = None,
+        task: str = DEFAULT_ADNI_TASK,
         z_min: float = 0.0,
         z_max: float = 1.0,
         transforms: Optional[Callable] = None,
@@ -422,6 +548,7 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
         augment: bool = True,
         image_size: int = 224,
         minimum_z_index_distance: Optional[int] = None,
+        slice_sampling: str = "random",
     ) -> None:
         if n_slices <= 0:
             raise ValueError(f"n_slices must be positive, got {n_slices}")
@@ -430,11 +557,18 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
                 "minimum_z_index_distance must be non-negative or None, "
                 f"got {minimum_z_index_distance}"
             )
+        if slice_sampling not in SLICE_SAMPLING_CHOICES:
+            raise ValueError(
+                f"slice_sampling must be one of {SLICE_SAMPLING_CHOICES}, "
+                f"got {slice_sampling!r}"
+            )
         self.n_slices = int(n_slices)
         self.minimum_z_index_distance = minimum_z_index_distance
+        self.slice_sampling = slice_sampling
         super().__init__(
             root=root,
             csv_path=csv_path,
+            task=task,
             z_min=z_min,
             z_max=z_max,
             transforms=transforms,
@@ -474,6 +608,13 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
     def _validate_slice_capacity(self, record: _ScanRecord) -> None:
         start, end, distance = self._sampling_parameters(record)
         eligible_slices = end - start
+        if self.slice_sampling == "even":
+            if self.n_slices > eligible_slices:
+                raise ValueError(
+                    f"Cannot place {self.n_slices} evenly spaced slices in "
+                    f"{eligible_slices} eligible slices for image ID {record.image_id}"
+                )
+            return
         effective_distance = max(distance, 1)
         required_span = 1 + (self.n_slices - 1) * effective_distance
         if required_span > eligible_slices:
@@ -486,6 +627,12 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
     def get_slice_indices(self, index: int) -> Tuple[int, ...]:
         record = self._entries[index]
         start, end, distance = self._sampling_parameters(record)
+        if self.slice_sampling == "even":
+            try:
+                return _evenly_spaced_slice_indices(start, end, self.n_slices)
+            except ValueError as exc:
+                raise ValueError(f"{exc} for image ID {record.image_id}") from exc
+
         eligible_slices = end - start
         effective_distance = max(distance, 1)
         compressed_size = eligible_slices - (
@@ -624,6 +771,9 @@ __all__ = [
     "ADNIClassificationDataset",
     "ADNIMultiSliceDataset",
     "ADNIPairedSliceDataset",
+    "ADNITaskSpec",
+    "ADNI_TASK_CHOICES",
+    "DEFAULT_ADNI_TASK",
     "DEFAULT_CSV_NAME",
     "DEFAULT_PHENOTYPE_COLUMNS",
     "DEFAULT_ROOT",
@@ -631,4 +781,5 @@ __all__ = [
     "LABEL_TO_DIAGNOSIS",
     "PHENOTYPE_SENTINEL",
     "build_adni_transform",
+    "resolve_adni_task",
 ]

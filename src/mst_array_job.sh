@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-gpu=2
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --array=1-3    
+#SBATCH --array=5-7    
 #SBATCH --error=dino_mst_%a.err  ## error log file
 #SBATCH --output=dino_mst_%a.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
