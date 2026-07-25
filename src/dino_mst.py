@@ -1,9 +1,11 @@
-"""Frozen DINOv3 encoder + multi-slice transformer classification."""
+"""Frozen DINOv3 encoder + multi-slice transformer (or mean-pool) classification."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -17,9 +19,14 @@ import torch.nn.functional as F
 import yaml
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
+    accuracy_score,
+    auc,
     confusion_matrix,
     f1_score,
+    precision_score,
+    recall_score,
     roc_auc_score,
+    roc_curve,
 )
 from torch.utils.data import DataLoader, Dataset, Subset
 
@@ -52,11 +59,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
 DATASET_CHOICES = ("duke", "adni")
+AGGREGATOR_CHOICES = ("transformer", "mean")
 MultiSliceDataset = Union[DukeMultiSliceDataset, ADNIMultiSliceDataset]
 
 
 class AttentionPooling(nn.Module):
-    """Pool patch tokens using two-layer learned attention scores."""
+    """Pool a token sequence using two-layer learned attention scores."""
 
     def __init__(self, input_dim: int, hidden_dim: int) -> None:
         super().__init__()
@@ -73,7 +81,7 @@ class AttentionPooling(nn.Module):
 
 
 class MultiSliceDinoModel(nn.Module):
-    """Frozen per-slice encoder followed by a trainable volume transformer."""
+    """Frozen per-slice encoder followed by a trainable volume aggregator."""
 
     def __init__(
         self,
@@ -81,6 +89,7 @@ class MultiSliceDinoModel(nn.Module):
         *,
         n_slices: int,
         features: str = "cls",
+        aggregator: str = "transformer",
         d_model: int = 768,
         depth: int = 2,
         n_heads: int = 12,
@@ -92,18 +101,26 @@ class MultiSliceDinoModel(nn.Module):
         super().__init__()
         if features not in FEATURE_CHOICES:
             raise ValueError(f"Unknown features={features!r}; choose from {FEATURE_CHOICES}")
+        if aggregator not in AGGREGATOR_CHOICES:
+            raise ValueError(
+                f"Unknown aggregator={aggregator!r}; choose from {AGGREGATOR_CHOICES}"
+            )
         if n_slices <= 0:
             raise ValueError("n_slices must be positive")
-        if d_model <= 0 or d_model % n_heads:
-            raise ValueError("d_model must be positive and divisible by n_heads")
-        if depth <= 0:
-            raise ValueError("depth must be positive")
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
+        if aggregator == "transformer":
+            if d_model % n_heads:
+                raise ValueError("d_model must be divisible by positive n_heads")
+            if depth <= 0:
+                raise ValueError("depth must be positive")
         if num_classes <= 0:
             raise ValueError(f"num_classes must be positive, got {num_classes}")
 
         self.encoder = encoder
         self.n_slices = int(n_slices)
         self.features = features
+        self.aggregator = aggregator
         self.d_model = int(d_model)
         self.num_classes = int(num_classes)
         for parameter in self.encoder.parameters():
@@ -116,23 +133,27 @@ class MultiSliceDinoModel(nn.Module):
             if features != "cls"
             else None
         )
-        slice_dim = 2 * embed_dim if features == "both" else embed_dim
         self.slice_projection = (
-            nn.Identity() if slice_dim == d_model else nn.Linear(slice_dim, d_model)
+            nn.Identity() if embed_dim == d_model else nn.Linear(embed_dim, d_model)
         )
-        self.global_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.position_embedding = nn.Parameter(
-            torch.zeros(1, self.n_slices + 1, d_model)
-        )
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=ffn_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=depth)
+        if aggregator == "transformer":
+            self.global_token = nn.Parameter(torch.zeros(1, 1, d_model))
+            self.position_embedding = nn.Parameter(
+                torch.zeros(1, self.n_slices + 1, d_model)
+            )
+            layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=ffn_dim,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(layer, num_layers=depth)
+        else:
+            self.global_token = None
+            self.position_embedding = None
+            self.transformer = None
         self.output_norm = nn.LayerNorm(d_model)
         classifier_hidden = hidden_dim or d_model
         self.classifier = nn.Sequential(
@@ -142,8 +163,10 @@ class MultiSliceDinoModel(nn.Module):
             nn.GELU(),
             nn.Linear(classifier_hidden, self.num_classes),
         )
-        nn.init.trunc_normal_(self.global_token, std=0.02)
-        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+        if self.global_token is not None:
+            nn.init.trunc_normal_(self.global_token, std=0.02)
+        if self.position_embedding is not None:
+            nn.init.trunc_normal_(self.position_embedding, std=0.02)
 
     def encode_slices(self, images: torch.Tensor) -> torch.Tensor:
         """Encode ``[B, S, C, H, W]`` into ``[B, S, feature_dim]``."""
@@ -161,17 +184,25 @@ class MultiSliceDinoModel(nn.Module):
         else:
             assert self.patch_pool is not None
             patches = F.normalize(output["x_norm_patchtokens"].float(), p=2, dim=-1)
-            pooled = self.patch_pool(patches)
-            token = pooled if self.features == "patch" else torch.cat([cls, pooled], dim=-1)
+            if self.features == "both":
+                # Attend over CLS + patch tokens together → single embed_dim vector.
+                tokens = torch.cat([cls.unsqueeze(1), patches], dim=1)
+            else:
+                tokens = patches
+            token = self.patch_pool(tokens)
         return token.reshape(batch, n_slices, -1)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         slices = self.slice_projection(self.encode_slices(images))
-        global_token = self.global_token.expand(slices.shape[0], -1, -1)
-        sequence = torch.cat([global_token, slices], dim=1)
-        sequence = sequence + self.position_embedding
-        encoded = self.transformer(sequence)
-        logits = self.classifier(self.output_norm(encoded[:, 0]))
+        if self.aggregator == "mean":
+            volume = slices.mean(dim=1)
+        else:
+            assert self.global_token is not None and self.transformer is not None
+            global_token = self.global_token.expand(slices.shape[0], -1, -1)
+            sequence = torch.cat([global_token, slices], dim=1)
+            sequence = sequence + self.position_embedding
+            volume = self.transformer(sequence)[:, 0]
+        logits = self.classifier(self.output_norm(volume))
         if self.num_classes == 1:
             return logits.squeeze(-1)
         return logits
@@ -282,6 +313,7 @@ def save_confusion_matrix(
     out_path: Path,
     *,
     class_names: Sequence[str],
+    title: str = "Confusion matrix",
 ) -> np.ndarray:
     labels = list(range(len(class_names)))
     matrix = confusion_matrix(y_true, y_pred, labels=labels)
@@ -291,7 +323,7 @@ def save_confusion_matrix(
         display_labels=list(class_names),
     )
     display.plot(ax=ax, cmap="Blues", colorbar=True, xticks_rotation=45)
-    ax.set_title("Validation confusion matrix")
+    ax.set_title(title)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
@@ -321,6 +353,175 @@ def classification_f1(
             zero_division=0,
         )
     )
+
+
+def compute_classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_probability: np.ndarray,
+    *,
+    num_classes: int,
+) -> Dict[str, float]:
+    """Compute scalar classification metrics for a held-out split."""
+    if len(y_true) == 0:
+        return {
+            "f1": float("nan"),
+            "auroc": float("nan"),
+            "accuracy": float("nan"),
+            "precision": float("nan"),
+            "recall": float("nan"),
+        }
+    labels = list(range(num_classes if not is_binary_task(num_classes) else 2))
+    if is_binary_task(num_classes):
+        precision = float(
+            precision_score(
+                y_true, y_pred, average="binary", pos_label=1, zero_division=0
+            )
+        )
+        recall = float(
+            recall_score(
+                y_true, y_pred, average="binary", pos_label=1, zero_division=0
+            )
+        )
+    else:
+        precision = float(
+            precision_score(
+                y_true,
+                y_pred,
+                average="macro",
+                labels=labels,
+                zero_division=0,
+            )
+        )
+        recall = float(
+            recall_score(
+                y_true,
+                y_pred,
+                average="macro",
+                labels=labels,
+                zero_division=0,
+            )
+        )
+    return {
+        "f1": classification_f1(y_true, y_pred, num_classes=num_classes),
+        "auroc": compute_auroc(y_true, y_probability, num_classes=num_classes),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": precision,
+        "recall": recall,
+    }
+
+
+def save_auroc_plot(
+    y_true: np.ndarray,
+    y_probability: np.ndarray,
+    out_path: Path,
+    *,
+    num_classes: int,
+    class_names: Sequence[str],
+    title: str = "ROC curve",
+) -> None:
+    """Save a binary or one-vs-rest multiclass ROC curve plot."""
+    if len(y_true) == 0 or np.unique(y_true).size < 2:
+        logger.warning("Skipping AUROC plot (need ≥2 classes in targets): %s", out_path)
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, label="Chance")
+
+    if is_binary_task(num_classes):
+        false_positive_rate, true_positive_rate, _ = roc_curve(y_true, y_probability)
+        curve_auc = float(auc(false_positive_rate, true_positive_rate))
+        positive_name = class_names[1] if len(class_names) > 1 else "positive"
+        ax.plot(
+            false_positive_rate,
+            true_positive_rate,
+            linewidth=2,
+            label=f"{positive_name} (AUC = {curve_auc:.3f})",
+        )
+    else:
+        # One-vs-rest ROC for each class, plus a macro-average curve.
+        n_classes = int(num_classes)
+        mean_false_positive_rate = np.linspace(0, 1, 101)
+        true_positive_rates: List[np.ndarray] = []
+        for class_index, class_name in enumerate(class_names):
+            binary_true = (y_true == class_index).astype(np.int64)
+            if np.unique(binary_true).size < 2:
+                continue
+            scores = y_probability[:, class_index]
+            false_positive_rate, true_positive_rate, _ = roc_curve(binary_true, scores)
+            curve_auc = float(auc(false_positive_rate, true_positive_rate))
+            ax.plot(
+                false_positive_rate,
+                true_positive_rate,
+                linewidth=1.5,
+                label=f"{class_name} (AUC = {curve_auc:.3f})",
+            )
+            interpolated = np.interp(
+                mean_false_positive_rate, false_positive_rate, true_positive_rate
+            )
+            true_positive_rates.append(interpolated)
+        if true_positive_rates:
+            mean_true_positive_rate = np.mean(np.stack(true_positive_rates, axis=0), axis=0)
+            macro_auc = float(auc(mean_false_positive_rate, mean_true_positive_rate))
+            ax.plot(
+                mean_false_positive_rate,
+                mean_true_positive_rate,
+                color="black",
+                linewidth=2,
+                label=f"macro-average (AUC = {macro_auc:.3f})",
+            )
+
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.set_title(title)
+    ax.legend(loc="lower right", fontsize=8)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    logger.info("Wrote AUROC plot → %s", out_path)
+
+
+def _json_safe(value: object) -> object:
+    """Convert values to JSON-serializable forms (Paths → str, NaN → null)."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        number = float(value)
+        return None if math.isnan(number) or math.isinf(number) else number
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    return value
+
+
+def args_to_dict(args: argparse.Namespace) -> Dict[str, object]:
+    return {key: _json_safe(value) for key, value in vars(args).items()}
+
+
+def save_run_summary(
+    out_path: Path,
+    *,
+    args: argparse.Namespace,
+    metrics_by_split: Dict[str, Dict[str, object]],
+) -> None:
+    """Write run parameters and split metrics to a JSON summary file."""
+    payload = {
+        "parameters": args_to_dict(args),
+        "metrics": _json_safe(metrics_by_split),
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    logger.info("Wrote run summary → %s", out_path)
 
 
 def should_early_stop(
@@ -568,6 +769,7 @@ def _checkpoint_payload(
         "model_name": args.model_name,
         "weights": str(args.weights) if args.weights is not None else None,
         "features": args.features,
+        "slice_aggregator": args.slice_aggregator,
         "n_slices": args.n_slices,
         "minimum_z_index_distance": args.minimum_z_index_distance,
         "include_bilateral": args.include_bilateral,
@@ -768,6 +970,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         encoder,
         n_slices=args.n_slices,
         features=args.features,
+        aggregator=args.slice_aggregator,
         d_model=args.d_model,
         depth=args.mst_depth,
         n_heads=args.mst_heads,
@@ -796,12 +999,13 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     loss_tag = "bce" if binary else "ce"
 
     logger.info(
-        "dataset=%s adni_task=%s encoder=%s features=%s n_slices=%d num_classes=%d "
-        "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
+        "dataset=%s adni_task=%s encoder=%s features=%s aggregator=%s n_slices=%d "
+        "num_classes=%d train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
         args.dataset,
         args.adni_task if args.dataset == "adni" else None,
         args.encoder,
         args.features,
+        args.slice_aggregator,
         args.n_slices,
         num_classes,
         unit_name,
@@ -945,23 +1149,32 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     )
     logger.info("Wrote %s", last_path)
 
+    metrics_by_split: Dict[str, Dict[str, object]] = {}
+
     if val_loader is not None and best_path.is_file():
         best = torch.load(best_path, map_location=device, weights_only=False)
         model.load_trainable_state_dict(best["model"])
         y_true, y_pred, y_probability = collect_predictions(model, val_loader, device)
-        auroc = compute_auroc(y_true, y_probability, num_classes=num_classes)
-        final_f1 = classification_f1(y_true, y_pred, num_classes=num_classes)
+        val_metrics = compute_classification_metrics(
+            y_true, y_pred, y_probability, num_classes=num_classes
+        )
         confusion = save_confusion_matrix(
             y_true,
             y_pred,
             checkpoint_dir / "val_confusion_matrix.png",
             class_names=class_names,
+            title="Validation confusion matrix",
         )
+        metrics_by_split["val"] = {"n": int(len(y_true)), **val_metrics}
         logger.info(
-            "Best-checkpoint val metrics: n=%d f1=%.4f auroc=%.4f",
+            "Best-checkpoint val metrics: n=%d f1=%.4f auroc=%.4f "
+            "acc=%.4f precision=%.4f recall=%.4f",
             len(y_true),
-            final_f1,
-            auroc,
+            val_metrics["f1"],
+            val_metrics["auroc"],
+            val_metrics["accuracy"],
+            val_metrics["precision"],
+            val_metrics["recall"],
         )
         logger.info("Val confusion matrix:\n%s", confusion)
 
@@ -970,21 +1183,42 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             best = torch.load(best_path, map_location=device, weights_only=False)
             model.load_trainable_state_dict(best["model"])
         y_true, y_pred, y_probability = collect_predictions(model, test_loader, device)
-        auroc = compute_auroc(y_true, y_probability, num_classes=num_classes)
-        final_f1 = classification_f1(y_true, y_pred, num_classes=num_classes)
+        test_metrics = compute_classification_metrics(
+            y_true, y_pred, y_probability, num_classes=num_classes
+        )
         confusion = save_confusion_matrix(
             y_true,
             y_pred,
             checkpoint_dir / "test_confusion_matrix.png",
             class_names=class_names,
+            title="Test confusion matrix",
         )
+        save_auroc_plot(
+            y_true,
+            y_probability,
+            checkpoint_dir / "test_auroc.png",
+            num_classes=num_classes,
+            class_names=class_names,
+            title="Test ROC curve",
+        )
+        metrics_by_split["test"] = {"n": int(len(y_true)), **test_metrics}
         logger.info(
-            "Best-checkpoint test metrics: n=%d f1=%.4f auroc=%.4f",
+            "Best-checkpoint test metrics: n=%d f1=%.4f auroc=%.4f "
+            "acc=%.4f precision=%.4f recall=%.4f",
             len(y_true),
-            final_f1,
-            auroc,
+            test_metrics["f1"],
+            test_metrics["auroc"],
+            test_metrics["accuracy"],
+            test_metrics["precision"],
+            test_metrics["recall"],
         )
         logger.info("Test confusion matrix:\n%s", confusion)
+
+    save_run_summary(
+        checkpoint_dir / "run_summary.json",
+        args=args,
+        metrics_by_split=metrics_by_split,
+    )
 
 
 def _yaml_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict[str, object]:
@@ -1155,25 +1389,66 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--slice-aggregator",
+        choices=list(AGGREGATOR_CHOICES),
+        default="transformer",
+        help=(
+            "How per-slice embeddings become a volume embedding: multi-slice "
+            "transformer (default) or mean pooling, which ignores the --mst-* options"
+        ),
+    )
     parser.add_argument("--d-model", type=int, default=768)
     parser.add_argument("--mst-depth", type=int, default=2)
     parser.add_argument("--mst-heads", type=int, default=12)
     parser.add_argument("--mst-ffn-dim", type=int, default=3072)
     parser.add_argument("--mst-dropout", type=float, default=0.1)
     parser.add_argument(
-        "--encoder", choices=list(ENCODER_CHOICES), default="dinov3"
+        "--encoder",
+        choices=list(ENCODER_CHOICES),
+        default="dinov3",
+        help="Frozen backbone: dinov3 | meddinov3 | braindino | custom (wireframe)",
     )
     parser.add_argument(
         "--features",
         choices=list(FEATURE_CHOICES),
         default="cls",
-        help="Per-slice token: CLS, attention-pooled patches, or both",
+        help=(
+            "Per-slice token: cls (CLS only), patch (attention-pooled patches), "
+            "or both (attention pool over CLS + patch tokens together)"
+        ),
     )
     parser.add_argument("--model-name", default="dinov3_vitb16")
-    parser.add_argument("--weights", type=Path, default=None)
-    parser.add_argument("--dinov3-repo", type=Path, default=DINOV3_REPO)
-    parser.add_argument("--run-name", default=None)
-    parser.add_argument("--checkpoint-dir", type=Path, default=None)
+    parser.add_argument(
+        "--weights",
+        type=Path,
+        default=None,
+        help=(
+            "Encoder checkpoint. Defaults: dinov3 → opt/dinov3-weights/...; "
+            "meddinov3 → opt/meddinov3/model.pth; "
+            "braindino → opt/braindino/brain_dino_weights.pth"
+        ),
+    )
+    parser.add_argument(
+        "--dinov3-repo",
+        type=Path,
+        default=DINOV3_REPO,
+        help="Local DINOv3 repo (architecture source for dinov3/meddinov3/braindino)",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "Subfolder under runs/<dataset>/ for checkpoints and plots. "
+            "Defaults to <encoder>_<mst|meanpool>_<dataset>."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Override output directory (default: <repo>/runs/<dataset>/<run-name>)",
+    )
     parser.add_argument("--device", default=None)
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--params-file", "--config", type=Path, default=None)
@@ -1208,10 +1483,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         and args.minimum_z_index_distance < 0
     ):
         parser.error("--minimum-z-index-distance must be non-negative")
-    if args.mst_depth <= 0:
-        parser.error("--mst-depth must be positive")
-    if args.mst_heads <= 0 or args.d_model % args.mst_heads:
-        parser.error("--d-model must be divisible by positive --mst-heads")
+    if args.d_model <= 0:
+        parser.error("--d-model must be positive")
+    if args.slice_aggregator == "transformer":
+        if args.mst_depth <= 0:
+            parser.error("--mst-depth must be positive")
+        if args.mst_heads <= 0 or args.d_model % args.mst_heads:
+            parser.error("--d-model must be divisible by positive --mst-heads")
     if not 0.0 <= args.vertical_flip_prob <= 1.0:
         parser.error("--vertical-flip-prob must be in [0, 1]")
     if not 0.0 <= args.val_frac < 1.0:
@@ -1237,7 +1515,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     checkpoint_dir = (
         args.checkpoint_dir
         if args.checkpoint_dir is not None
-        else REPO_ROOT / "runs" / (args.run_name or f"{args.encoder}_mst_{args.dataset}")
+        else REPO_ROOT
+        / "runs"
+        / args.dataset
+        / (
+            args.run_name
+            or "{}_{}_{}".format(
+                args.encoder,
+                "mst" if args.slice_aggregator == "transformer" else "meanpool",
+                args.dataset,
+            )
+        )
     )
     logger.info("Run output directory: %s", checkpoint_dir)
     train(args, device, Path(checkpoint_dir))

@@ -1,14 +1,14 @@
 #!/bin/bash
 
-#SBATCH --job-name=dinov3_mst
+#SBATCH --job-name=adni_mst_tests
 #SBATCH -p gpu
 #SBATCH --gpus=1
 #SBATCH --cpus-per-gpu=2
-#SBATCH --mem=120G
-#SBATCH --time 48:00:00        
-#SBATCH --array=5-7    
-#SBATCH --error=dino_mst_%a.err  ## error log file
-#SBATCH --output=dino_mst_%a.out ## output log file
+#SBATCH --mem=80G
+#SBATCH --time 72:00:00        
+#SBATCH --array=1-12    
+#SBATCH --error=adni_mst_tests_%a.err  ## error log file
+#SBATCH --output=adni_mst_tests_%a.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
@@ -18,4 +18,8 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python dino_mst.py --params-file ../runs/mst_configs/run${SLURM_ARRAY_TASK_ID}.yaml
+
+files=(../runs/mst_configs/adni/*.yaml)
+file=${files[$SLURM_ARRAY_TASK_ID]}
+
+python dino_mst.py --params-file $file

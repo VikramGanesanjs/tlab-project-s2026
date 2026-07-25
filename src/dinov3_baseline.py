@@ -42,14 +42,18 @@ DEFAULT_DINOV3_WEIGHTS = (
     / "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
 )
 DEFAULT_MEDDINOV3_WEIGHTS = REPO_ROOT / "opt" / "meddinov3" / "model.pth"
+DEFAULT_BRAINDINO_WEIGHTS = (
+    REPO_ROOT / "opt" / "braindino" / "brain_dino_weights.pth"
+)
 # Back-compat alias
 DEFAULT_WEIGHTS = DEFAULT_DINOV3_WEIGHTS
 
-ENCODER_CHOICES = ("dinov3", "meddinov3", "custom")
+ENCODER_CHOICES = ("dinov3", "meddinov3", "braindino", "custom")
 FEATURE_CHOICES = ("both", "cls", "patch")
 DEFAULT_ENCODER_WEIGHTS = {
     "dinov3": DEFAULT_DINOV3_WEIGHTS,
     "meddinov3": DEFAULT_MEDDINOV3_WEIGHTS,
+    "braindino": DEFAULT_BRAINDINO_WEIGHTS,
     "custom": None,
 }
 
@@ -387,17 +391,18 @@ def load_dinov3_encoder(
     return encoder
 
 
-def load_meddinov3_encoder(
+def _load_dinov3_teacher_backbone(
     *,
-    repo_dir: Path = DINOV3_REPO,
-    weights: Path = DEFAULT_MEDDINOV3_WEIGHTS,
+    repo_dir: Path,
+    weights: Path,
     device: torch.device,
+    label: str,
 ) -> nn.Module:
-    """MedDINOv3 (CT-3M domain-adapted ViT-B/16) on the DINOv3 backbone API."""
+    """Load a DINOv3 ViT-B/16 teacher checkpoint (MedDINOv3 / BrainDINO style)."""
     repo_dir = _ensure_dinov3_repo(repo_dir)
     weights = Path(weights)
     if not weights.is_file():
-        raise FileNotFoundError(f"MedDINOv3 weights not found: {weights}")
+        raise FileNotFoundError(f"{label} weights not found: {weights}")
 
     from dinov3.models.vision_transformer import vit_base
 
@@ -411,7 +416,7 @@ def load_meddinov3_encoder(
     ckpt = torch.load(str(weights), map_location="cpu", weights_only=False)
     if "teacher" not in ckpt:
         raise KeyError(
-            f"MedDINOv3 checkpoint missing 'teacher' key; got keys={list(ckpt.keys())}"
+            f"{label} checkpoint missing 'teacher' key; got keys={list(ckpt.keys())}"
         )
     state = {
         k.replace("backbone.", ""): v
@@ -420,8 +425,38 @@ def load_meddinov3_encoder(
     }
     encoder.load_state_dict(state)
     encoder.to(device).eval()
-    logger.info("Loaded MedDINOv3 weights=%s", weights)
+    logger.info("Loaded %s weights=%s", label, weights)
     return encoder
+
+
+def load_meddinov3_encoder(
+    *,
+    repo_dir: Path = DINOV3_REPO,
+    weights: Path = DEFAULT_MEDDINOV3_WEIGHTS,
+    device: torch.device,
+) -> nn.Module:
+    """MedDINOv3 (CT-3M domain-adapted ViT-B/16) on the DINOv3 backbone API."""
+    return _load_dinov3_teacher_backbone(
+        repo_dir=repo_dir,
+        weights=weights,
+        device=device,
+        label="MedDINOv3",
+    )
+
+
+def load_braindino_encoder(
+    *,
+    repo_dir: Path = DINOV3_REPO,
+    weights: Path = DEFAULT_BRAINDINO_WEIGHTS,
+    device: torch.device,
+) -> nn.Module:
+    """BrainDINO (brain MRI foundation ViT-B/16) on the DINOv3 backbone API."""
+    return _load_dinov3_teacher_backbone(
+        repo_dir=repo_dir,
+        weights=weights,
+        device=device,
+        label="BrainDINO",
+    )
 
 
 def load_custom_encoder(
@@ -432,7 +467,7 @@ def load_custom_encoder(
 ) -> nn.Module:
     """Wireframe for a user DINOv3-compatible encoder.
 
-    Expected interface (same as DINOv3 / MedDINOv3):
+    Expected interface (same as DINOv3 / MedDINOv3 / BrainDINO):
 
     * ``encoder.forward_features(images) -> dict`` with
       ``x_norm_clstoken`` ``[B, D]`` and ``x_norm_patchtokens`` ``[B, N, D]``
@@ -441,7 +476,7 @@ def load_custom_encoder(
     raise NotImplementedError(
         "Custom encoder is a wireframe only. Implement load_custom_encoder() "
         f"(repo_dir={repo_dir}, weights={weights}, device={device}) or pass "
-        "--encoder dinov3|meddinov3."
+        "--encoder dinov3|meddinov3|braindino."
     )
 
 
@@ -474,6 +509,14 @@ def load_encoder(
         if resolved is None:
             raise ValueError("--weights is required for encoder=meddinov3")
         return load_meddinov3_encoder(
+            repo_dir=repo_dir,
+            weights=resolved,
+            device=device,
+        )
+    if name == "braindino":
+        if resolved is None:
+            raise ValueError("--weights is required for encoder=braindino")
+        return load_braindino_encoder(
             repo_dir=repo_dir,
             weights=resolved,
             device=device,
@@ -877,7 +920,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=str,
         choices=list(ENCODER_CHOICES),
         default="dinov3",
-        help="Frozen backbone: dinov3 | meddinov3 | custom (wireframe)",
+        help="Frozen backbone: dinov3 | meddinov3 | braindino | custom (wireframe)",
     )
     p.add_argument(
         "--features",
@@ -898,14 +941,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Encoder checkpoint. Defaults: dinov3 → opt/dinov3-weights/...; "
-            "meddinov3 → opt/meddinov3/model.pth"
+            "meddinov3 → opt/meddinov3/model.pth; "
+            "braindino → opt/braindino/brain_dino_weights.pth"
         ),
     )
     p.add_argument(
         "--dinov3-repo",
         type=Path,
         default=DINOV3_REPO,
-        help="Local DINOv3 repo (architecture source for dinov3/meddinov3)",
+        help="Local DINOv3 repo (architecture source for dinov3/meddinov3/braindino)",
     )
     p.add_argument(
         "--run-name",

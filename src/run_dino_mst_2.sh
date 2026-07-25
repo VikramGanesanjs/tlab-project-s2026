@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=run_dino_mst_dinov3_adni.err  ## error log file
-#SBATCH --output=run_dino_mst_dinov3_adni.out ## output log file
+#SBATCH --error=run_dino_mst_dinov3_cls_transformer.err  ## error log file
+#SBATCH --output=run_dino_mst_dinov3_cls_transformer.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
