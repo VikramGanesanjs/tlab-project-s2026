@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-gpu=2
 #SBATCH --mem=80G
 #SBATCH --time 72:00:00        
-#SBATCH --array=1-12    
+#SBATCH --array=0    
 #SBATCH --error=adni_mst_tests_%a.err  ## error log file
 #SBATCH --output=adni_mst_tests_%a.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
