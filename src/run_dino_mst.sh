@@ -1,13 +1,13 @@
 #!/bin/bash
 
-#SBATCH --job-name=dinov3_mst
+#SBATCH --job-name=dinov3_mst_lora
 #SBATCH -p gpu
 #SBATCH --gpus=1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=run_dino_mst_dinov3_adni.err  ## error log file
-#SBATCH --output=run_dino_mst_dinov3_adni.out ## output log file
+#SBATCH --error=run_dino_mst_dinov3_adni_lora.err  ## error log file
+#SBATCH --output=run_dino_mst_dinov3_adni_lora.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
@@ -17,4 +17,4 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python dino_mst.py --params-file /common/ganesanv/tlab/runs/mst_configs/dinov3_meanpool_cls.yaml
+python dino_mst.py --params-file /common/ganesanv/tlab/runs/mst_configs/adni/dinov3_lora.yaml

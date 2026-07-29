@@ -54,13 +54,26 @@ from datasets.adni import (  # noqa: E402
     build_adni_transform,
 )
 from datasets.duke import DukeMultiSliceDataset  # noqa: E402
+from vit_lora import add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
 DATASET_CHOICES = ("duke", "adni")
 AGGREGATOR_CHOICES = ("transformer", "mean")
+ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 MultiSliceDataset = Union[DukeMultiSliceDataset, ADNIMultiSliceDataset]
+LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
+
+
+def is_lora_parameter_name(name: str) -> bool:
+    return any(parameter_name in name for parameter_name in LORA_PARAMETER_NAMES)
+
+
+def set_lora_requires_grad(model: nn.Module, requires_grad: bool) -> None:
+    for name, parameter in model.named_parameters():
+        if is_lora_parameter_name(name):
+            parameter.requires_grad = requires_grad
 
 
 class AttentionPooling(nn.Module):
@@ -97,6 +110,7 @@ class MultiSliceDinoModel(nn.Module):
         dropout: float = 0.1,
         hidden_dim: Optional[int] = None,
         num_classes: int = 1,
+        encoder_training: str = "frozen",
     ) -> None:
         super().__init__()
         if features not in FEATURE_CHOICES:
@@ -116,6 +130,11 @@ class MultiSliceDinoModel(nn.Module):
                 raise ValueError("depth must be positive")
         if num_classes <= 0:
             raise ValueError(f"num_classes must be positive, got {num_classes}")
+        if encoder_training not in ENCODER_TRAINING_CHOICES:
+            raise ValueError(
+                f"Unknown encoder_training={encoder_training!r}; "
+                f"choose from {ENCODER_TRAINING_CHOICES}"
+            )
 
         self.encoder = encoder
         self.n_slices = int(n_slices)
@@ -123,8 +142,10 @@ class MultiSliceDinoModel(nn.Module):
         self.aggregator = aggregator
         self.d_model = int(d_model)
         self.num_classes = int(num_classes)
-        for parameter in self.encoder.parameters():
-            parameter.requires_grad = False
+        self.encoder_training = encoder_training
+        if self.encoder_training == "frozen":
+            for parameter in self.encoder.parameters():
+                parameter.requires_grad = False
 
         embed_dim = int(encoder.embed_dim)
         pooling_hidden_dim = hidden_dim or embed_dim
@@ -176,7 +197,12 @@ class MultiSliceDinoModel(nn.Module):
         if n_slices != self.n_slices:
             raise ValueError(f"Expected {self.n_slices} slices, got {n_slices}")
         flat = images.reshape(batch * n_slices, *images.shape[2:])
-        with torch.no_grad():
+        context = (
+            torch.enable_grad()
+            if self.encoder_training == "lora" and self.training
+            else torch.no_grad()
+        )
+        with context:
             output = self.encoder.forward_features(flat)
         cls = F.normalize(output["x_norm_clstoken"].float(), p=2, dim=-1)
         if self.features == "cls":
@@ -207,19 +233,31 @@ class MultiSliceDinoModel(nn.Module):
             return logits.squeeze(-1)
         return logits
 
+    @staticmethod
+    def _is_lora_state_name(name: str) -> bool:
+        return name.startswith("encoder.") and is_lora_parameter_name(name)
+
+    @staticmethod
+    def _is_trainable_state_name(name: str) -> bool:
+        return not name.startswith("encoder.") or MultiSliceDinoModel._is_lora_state_name(
+            name
+        )
+
     def trainable_state_dict(self) -> Dict[str, torch.Tensor]:
-        """State for all trainable MST components, excluding the frozen encoder."""
+        """State for trainable MST components and optional encoder LoRA adapters."""
         return {
             name: value
             for name, value in self.state_dict().items()
-            if not name.startswith("encoder.")
+            if self._is_trainable_state_name(name)
         }
 
     def load_trainable_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
         result = self.load_state_dict(state, strict=False)
         unexpected = list(result.unexpected_keys)
         non_encoder_missing = [
-            name for name in result.missing_keys if not name.startswith("encoder.")
+            name
+            for name in result.missing_keys
+            if self._is_trainable_state_name(name)
         ]
         if unexpected or non_encoder_missing:
             raise RuntimeError(
@@ -766,6 +804,9 @@ def _checkpoint_payload(
         "dataset": args.dataset,
         "adni_task": args.adni_task if args.dataset == "adni" else None,
         "encoder": args.encoder,
+        "encoder_training": args.encoder_training,
+        "lora_r": args.lora_r if args.encoder_training == "lora" else None,
+        "freeze_epochs": args.freeze_epochs,
         "model_name": args.model_name,
         "weights": str(args.weights) if args.weights is not None else None,
         "features": args.features,
@@ -966,6 +1007,11 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         repo_dir=args.dinov3_repo,
         model_name=args.model_name,
     )
+    if args.encoder_training == "lora":
+        add_lora_to_vit(encoder, r=args.lora_r)
+        freeze_non_lora_parameters(encoder)
+        if args.freeze_epochs > 0:
+            set_lora_requires_grad(encoder, False)
     model = MultiSliceDinoModel(
         encoder,
         n_slices=args.n_slices,
@@ -978,8 +1024,13 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         dropout=args.mst_dropout,
         hidden_dim=args.hidden_dim or args.d_model,
         num_classes=num_classes,
+        encoder_training=args.encoder_training,
     ).to(device)
-    trainable_parameters = [p for p in model.parameters() if p.requires_grad]
+    trainable_parameters = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if MultiSliceDinoModel._is_trainable_state_name(name)
+    ]
     optimizer = torch.optim.AdamW(
         trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
     )
@@ -997,16 +1048,23 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     epochs_trained = 0
     stopped_early = False
     loss_tag = "bce" if binary else "ce"
+    lora_unfrozen = not (
+        args.encoder_training == "lora" and args.freeze_epochs > 0
+    )
 
     logger.info(
         "dataset=%s adni_task=%s encoder=%s features=%s aggregator=%s n_slices=%d "
-        "num_classes=%d train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
+        "encoder_training=%s lora_r=%s freeze_epochs=%d num_classes=%d "
+        "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
         args.dataset,
         args.adni_task if args.dataset == "adni" else None,
         args.encoder,
         args.features,
         args.slice_aggregator,
         args.n_slices,
+        args.encoder_training,
+        args.lora_r if args.encoder_training == "lora" else None,
+        args.freeze_epochs,
         num_classes,
         unit_name,
         len(train_dataset),
@@ -1020,6 +1078,14 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     )
     for epoch in range(1, args.epochs + 1):
         epochs_trained = epoch
+        if (
+            args.encoder_training == "lora"
+            and not lora_unfrozen
+            and epoch > args.freeze_epochs
+        ):
+            set_lora_requires_grad(model.encoder, True)
+            lora_unfrozen = True
+            logger.info("Unfroze LoRA adapters at epoch %d", epoch)
         current_lr = optimizer.param_groups[0]["lr"]
         model.train()
         model.encoder.eval()
@@ -1410,6 +1476,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Frozen backbone: dinov3 | meddinov3 | braindino | custom (wireframe)",
     )
     parser.add_argument(
+        "--encoder-training",
+        choices=list(ENCODER_TRAINING_CHOICES),
+        default="frozen",
+        help=(
+            "Backbone training mode: frozen keeps the encoder fixed; lora freezes "
+            "the base encoder and trains low-rank Q/K/V adapters"
+        ),
+    )
+    parser.add_argument(
+        "--lora-r",
+        type=int,
+        default=16,
+        help="LoRA rank used when --encoder-training=lora",
+    )
+    parser.add_argument(
+        "--freeze-epochs",
+        type=int,
+        default=0,
+        help=(
+            "For --encoder-training=lora, keep LoRA adapters frozen for the first "
+            "N epochs while training only the MST/head"
+        ),
+    )
+    parser.add_argument(
         "--features",
         choices=list(FEATURE_CHOICES),
         default="cls",
@@ -1485,6 +1575,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--minimum-z-index-distance must be non-negative")
     if args.d_model <= 0:
         parser.error("--d-model must be positive")
+    if args.lora_r <= 0:
+        parser.error("--lora-r must be positive")
+    if args.freeze_epochs < 0:
+        parser.error("--freeze-epochs must be non-negative")
+    if args.encoder_training != "lora" and args.freeze_epochs > 0:
+        parser.error("--freeze-epochs is only valid with --encoder-training=lora")
     if args.slice_aggregator == "transformer":
         if args.mst_depth <= 0:
             parser.error("--mst-depth must be positive")

@@ -80,15 +80,15 @@ def add_lora_to_vit(model: nn.Module, r: int = 4) -> nn.Module:
     for blk in model.blocks:
         old_qkv = blk.attn.qkv
         dim = old_qkv.in_features
+        device = old_qkv.weight.device
+        dtype = old_qkv.weight.dtype
 
         w_a_q, w_b_q = _make_lora_pair(dim, r)
         w_a_k, w_b_k = _make_lora_pair(dim, r)
         w_a_v, w_b_v = _make_lora_pair(dim, r)
 
         lora_qkv = LoRA(old_qkv, w_a_q, w_b_q, w_a_k, w_b_k, w_a_v, w_b_v)
-        lora_qkv.qkv.weight.data.copy_(old_qkv.weight.data)
-        if old_qkv.bias is not None:
-            lora_qkv.qkv.bias.data.copy_(old_qkv.bias.data)
+        lora_qkv.to(device=device, dtype=dtype)
 
         blk.attn.qkv = lora_qkv
 
