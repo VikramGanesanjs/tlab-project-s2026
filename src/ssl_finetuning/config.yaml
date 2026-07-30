@@ -1,0 +1,115 @@
+# Volumetric-DINO paired-slice fine-tuning with DINOv3 ViT-B/16.
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+dino:
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
+ibot:
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+  - 0.1
+  - 0.5
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
+train:
+  batch_size_per_gpu: 64
+  dataset: adni
+  data_root: /common/ganesanv/tlab/data/ADNI
+  adni_task: cn_mci_ad
+  duke_scan: pre
+  max_distance: 3
+  n_patients: null
+  output_dir: /common/ganesanv/tlab/runs/ssl_finetuning/adni_vitb16
+  seed: 0
+  num_workers: 10
+  OFFICIAL_EPOCH_LENGTH: 1250
+  cache_dataset: true
+  checkpointing: false
+  compile: true
+  cudagraphs: false
+student:
+  arch: vit_base
+  patch_size: 16
+  drop_path_rate: 0.1
+  layerscale: 1.0e-05
+  pretrained_weights: /common/ganesanv/tlab/opt/dinov3-weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  ffn_layer: mlp
+  resume_from_teacher_chkpt: /common/ganesanv/tlab/opt/dinov3-weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  norm_layer: layernorm
+  n_storage_tokens: 0
+  mask_k_bias: false
+  pos_embed_rope_base: 100.0
+  pos_embed_rope_min_period: null
+  pos_embed_rope_max_period: null
+  pos_embed_rope_normalize_coords: separate  # min, max, separate
+  pos_embed_rope_shift_coords: null
+  pos_embed_rope_jitter_coords: null
+  pos_embed_rope_rescale_coords: null
+  fp8_enabled: False  # Convert Linear layers to operate in fp8 precision
+  fp8_filter: "blocks"  # Regex that must appear in module path; empty means everything
+teacher:
+  momentum_teacher: 0.992
+  final_momentum_teacher: 1
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 30
+optim:
+  epochs: 100
+  weight_decay: 0.04
+  weight_decay_end: 0.4
+  lr: 0.001
+  warmup_epochs: 10
+  min_lr: 1.0e-06
+  clip_grad: 3.0
+  scaling_rule: sqrt_wrt_1024
+  patch_embed_lr_mult: 0.2
+  dino_head_wd_multiplier: 1.0
+  layerwise_decay: 0.9
+  multi_tensor_optim: true
+  freeze_backbone_epochs: 5
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+crops:
+  global_crops_scale:
+  - 0.32
+  - 1.0
+  local_crops_number: 8
+  local_crops_scale:
+  - 0.05
+  - 0.32
+  global_crops_size: 224
+  local_crops_size: 96
+  localcrops_subset_of_globalcrops: false
+  share_color_jitter: false
+  horizontal_flips: true
+evaluation:
+  eval_period_iterations: 12500
+checkpointing:
+  period: 3750
+  max_to_keep: 3
+
+# Volumetric-DINO slice-pair fine-tuning options.
+lambda1: 1.0
+lambda2: 1.0
+lam_cross: 1.0
+gamma: 1.0
+lora:
+  enabled: true
+  rank: 8
+decoder:
+  n_blocks: 2
+  # null uses the encoder embedding dimension.
+  embed_dim: null
+  n_heads: 4
+  mlp_ratio: 4.0
+  rope_base: 100.0
+  # masked = corresponding teacher patches only; full = all teacher patches.
+  context_mode: masked

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -25,6 +26,34 @@ logger = logging.getLogger(__name__)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _apply_shared_pair_transform(transform: Callable, images: Tuple[Any, Any]) -> Tuple[Any, Any]:
+    """Apply identical stochastic augmentation parameters to both images."""
+    torch_initial = torch.get_rng_state()
+    numpy_initial = np.random.get_state()
+    python_initial = random.getstate()
+    cuda_initial = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    first = transform(images[0])
+    torch_advanced = torch.get_rng_state()
+    numpy_advanced = np.random.get_state()
+    python_advanced = random.getstate()
+    cuda_advanced = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    torch.set_rng_state(torch_initial)
+    np.random.set_state(numpy_initial)
+    random.setstate(python_initial)
+    if cuda_initial is not None:
+        torch.cuda.set_rng_state_all(cuda_initial)
+    second = transform(images[1])
+
+    torch.set_rng_state(torch_advanced)
+    np.random.set_state(numpy_advanced)
+    random.setstate(python_advanced)
+    if cuda_advanced is not None:
+        torch.cuda.set_rng_state_all(cuda_advanced)
+    return first, second
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -209,6 +238,7 @@ class DukeBreastMRIDataset(VisionDataset):
         *,
         scan: Union[str, int] = "pre",
         max_distance: int = 3,
+        n_patients: Optional[int] = None,
         return_pair: bool = True,
         split_breasts: bool = False,
         z_min: float = 0.0,
@@ -280,13 +310,29 @@ class DukeBreastMRIDataset(VisionDataset):
                 f"with z_min={self.z_min}, z_max={self.z_max}"
             )
 
+        patient_ids = list(dict.fromkeys(entry[0] for entry in self._entries))
+        if n_patients is None:
+            n_patients = len(patient_ids)
+        if n_patients <= 0:
+            raise ValueError(f"n_patients must be positive, got {n_patients}")
+        if n_patients > len(patient_ids):
+            raise ValueError(
+                f"Requested n_patients={n_patients}, but only {len(patient_ids)} patients are available"
+            )
+        selected_patients = set(patient_ids[:n_patients])
+        self._entries = [
+            entry for entry in self._entries if entry[0] in selected_patients
+        ]
+        self.n_patients = n_patients
+
         logger.info(
             "DukeBreastMRIDataset scan=%s entries=%d return_pair=%s "
-            "max_distance=%d z=[%.3f, %.3f)",
+            "max_distance=%d patients=%d z=[%.3f, %.3f)",
             self.scan_type,
             len(self._entries),
             self.return_pair,
             self.max_distance,
+            self.n_patients,
             self.z_min,
             self.z_max,
         )
@@ -331,13 +377,18 @@ class DukeBreastMRIDataset(VisionDataset):
         else:
             image = img_i
 
+        if self.return_pair:
+            if self.transform is not None:
+                image = _apply_shared_pair_transform(self.transform, image)
+            elif self.transforms is not None:
+                transformed = self.transforms(image, None)
+                image = transformed[0] if isinstance(transformed, tuple) else transformed
+            return image
+
         target: Any = self.get_target(index)
 
         if self.transform is not None:
-            if self.return_pair:
-                image = (self.transform(image[0]), self.transform(image[1]))
-            else:
-                image = self.transform(image)
+            image = self.transform(image)
             if self.target_transform is not None:
                 target = self.target_transform(target)
         elif self.transforms is not None:
@@ -777,9 +828,9 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
 class PairToDinoGlobalCrops:
     """Wrap a single-image DINOv3 geometric/color transform for pair inputs.
 
-    Expects ``image`` to be ``(pil_a, pil_b)``. Applies ``transform`` to each
-    independently and returns a dict with ``global_crops`` (and copies teacher
-    crops). Use with ``return_pair=True``.
+    Expects ``image`` to be ``(pil_a, pil_b)``. Applies the same stochastic
+    augmentation realization to both slices and returns a dict with
+    ``global_crops`` (and copies teacher crops). Use with ``return_pair=True``.
 
     For classic DINOv3 SSL on a single slice, construct the dataset with
     ``return_pair=False`` and use stock ``DataAugmentationDINO`` directly.
@@ -795,8 +846,7 @@ class PairToDinoGlobalCrops:
                 "use return_pair=False with DataAugmentationDINO for single-image mode"
             )
         img_a, img_b = image
-        out_a = self.transform(img_a)
-        out_b = self.transform(img_b)
+        out_a, out_b = _apply_shared_pair_transform(self.transform, (img_a, img_b))
 
         # If the wrapped transform is DataAugmentationDINO, it already returns a dict.
         # Take its first global crop from each slice as the two teacher/student views.
@@ -824,5 +874,3 @@ class PairToDinoGlobalCrops:
         if target is None:
             return output
         return output, target
-
-

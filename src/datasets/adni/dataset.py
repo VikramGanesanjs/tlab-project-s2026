@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import random
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -99,6 +100,34 @@ def resolve_adni_task(task: str) -> ADNITaskSpec:
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 _IMAGE_ID_RE = re.compile(r"^I[0-9]+$")
+
+
+def _apply_shared_pair_transform(transform: Callable, images: Tuple[Any, Any]) -> Tuple[Any, Any]:
+    """Apply identical stochastic augmentation parameters to both images."""
+    torch_initial = torch.get_rng_state()
+    numpy_initial = np.random.get_state()
+    python_initial = random.getstate()
+    cuda_initial = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    first = transform(images[0])
+    torch_advanced = torch.get_rng_state()
+    numpy_advanced = np.random.get_state()
+    python_advanced = random.getstate()
+    cuda_advanced = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    torch.set_rng_state(torch_initial)
+    np.random.set_state(numpy_initial)
+    random.setstate(python_initial)
+    if cuda_initial is not None:
+        torch.cuda.set_rng_state_all(cuda_initial)
+    second = transform(images[1])
+
+    torch.set_rng_state(torch_advanced)
+    np.random.set_state(numpy_advanced)
+    random.setstate(python_advanced)
+    if cuda_advanced is not None:
+        torch.cuda.set_rng_state_all(cuda_advanced)
+    return first, second
 
 
 @dataclass(frozen=True)
@@ -694,12 +723,14 @@ def _encode_phenotypes(
 
 
 class ADNIPairedSliceDataset(ADNIClassificationDataset):
-    """Paired-slice phenotype/SSL wireframe.
+    """Paired slices from the same ADNI volume.
 
-    The default target is ``[diagnosis, sex, age]``. Additional numeric CSV
-    fields can be selected with ``phenotype_columns``; unsupported categorical
-    values use ``PHENOTYPE_SENTINEL``. ``transforms`` remains available for a
-    future pair-aware DINO adapter, while ``transform`` is applied to each view.
+    Each item returns ``(slice_1, slice_2)``. Both slices are sampled from the
+    same volume, and a DataLoader collates them into ``(slices1, slices2)``
+    with each tensor shaped ``[B, 3, H, W]``.
+
+    The phenotype helpers are retained for callers that need metadata, but the
+    paired SSL path does not return a target from ``__getitem__``.
     """
 
     def __init__(
@@ -707,6 +738,7 @@ class ADNIPairedSliceDataset(ADNIClassificationDataset):
         root: Union[str, Path] = DEFAULT_ROOT,
         *,
         max_distance: int = 3,
+        n_patients: Optional[int] = None,
         phenotype_columns: Optional[Sequence[str]] = None,
         seed: Optional[int] = None,
         **kwargs: Any,
@@ -719,6 +751,22 @@ class ADNIPairedSliceDataset(ADNIClassificationDataset):
         )
         self._seed = seed
         super().__init__(root=root, **kwargs)
+        patient_ids = list(dict.fromkeys(record.patient_id for record, _ in self._entries))
+        if n_patients is None:
+            n_patients = len(patient_ids)
+        if n_patients <= 0:
+            raise ValueError(f"n_patients must be positive, got {n_patients}")
+        if n_patients > len(patient_ids):
+            raise ValueError(
+                f"Requested n_patients={n_patients}, but only {len(patient_ids)} patients are available"
+            )
+        selected_patients = set(patient_ids[:n_patients])
+        self._entries = [
+            (record, z)
+            for record, z in self._entries
+            if record.patient_id in selected_patients
+        ]
+        self.n_patients = n_patients
         unknown_columns = set(self.selected_phenotype_columns).difference(
             self.phenotype_columns
         )
@@ -754,17 +802,12 @@ class ADNIPairedSliceDataset(ADNIClassificationDataset):
             _slice_to_pil(volume, z),
             _slice_to_pil(volume, partner_z),
         )
-        target: Any = self.get_target(index)
-
         if self.transform is not None:
-            image = (self.transform(image[0]), self.transform(image[1]))
-            if self.target_transform is not None:
-                target = self.target_transform(target)
+            image = _apply_shared_pair_transform(self.transform, image)
         elif self.transforms is not None:
-            image, target = self.transforms(image, target)
-        elif self.target_transform is not None:
-            target = self.target_transform(target)
-        return image, target
+            transformed = self.transforms(image, None)
+            image = transformed[0] if isinstance(transformed, tuple) else transformed
+        return image
 
 
 __all__ = [

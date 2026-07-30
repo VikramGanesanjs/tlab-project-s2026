@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-RUNS_DIR = Path(__file__).resolve().parent / "runs" / "adni"
-OUTPUT_DIR = Path(__file__).resolve().parent / "runs" / "adni" / "plots"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RUNS_DIR = PROJECT_ROOT / "runs" / "adni"
+OUTPUT_DIR = RUNS_DIR / "plots"
 
 METRICS = ("auroc", "f1")
 MARGINAL_FACTOR_CONFIGS = (
@@ -48,6 +50,44 @@ SLICE_AGGREGATOR_LABELS = {
     "mean": "mean pooling",
     "transformer": "transformer",
 }
+
+FACET_LABELS = {
+    "encoder": "Encoder",
+    "features": "Features",
+    "slice_aggregator": "Slice agg.",
+}
+
+
+def add_shared_legend(fig: plt.Figure, axes: Iterable[plt.Axes], title: str) -> None:
+    """Move subplot legends into one figure-level legend outside the plot grid."""
+    handles: list = []
+    labels: list[str] = []
+
+    for ax in axes:
+        ax_handles, ax_labels = ax.get_legend_handles_labels()
+        for handle, label in zip(ax_handles, ax_labels):
+            if label and label not in labels:
+                handles.append(handle)
+                labels.append(label)
+
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.remove()
+
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            title=title,
+            loc="center left",
+            bbox_to_anchor=(0.88, 0.5),
+            frameon=False,
+        )
+
+
+def format_facet_title(name: str, value: str) -> str:
+    """Format facet labels compactly enough to fit above each subplot."""
+    return f"{FACET_LABELS.get(name, name)}: {value}"
 
 
 def load_run_summaries(runs_dir: Path) -> pd.DataFrame:
@@ -94,10 +134,10 @@ def plot_factor_effect(
     fig, axes = plt.subplots(
         len(METRICS),
         len(col_values),
-        figsize=(4 * len(col_values), 4 * len(METRICS)),
+        figsize=(5.25 * len(col_values), 4.75 * len(METRICS)),
         squeeze=False,
     )
-    fig.suptitle(f"Test Performance by {factor['title']}", y=1.02)
+    fig.suptitle(f"Test Performance by {factor['title']}", y=0.98)
 
     for row_idx, metric in enumerate(METRICS):
         for col_idx, col_value in enumerate(col_values):
@@ -117,19 +157,15 @@ def plot_factor_effect(
             ax.set_ylim(0, 1)
             ax.set_xlabel(factor["title"] if row_idx == len(METRICS) - 1 else "")
             ax.set_ylabel(metric.upper())
-            ax.set_title(f"{factor['col']}={col_value}")
+            ax.set_title(format_facet_title(factor["col"], col_value), pad=12)
             ax.grid(axis="y", linestyle="--", alpha=0.4)
 
-            if col_idx > 0:
-                ax.get_legend().remove()
-            elif row_idx > 0:
-                ax.get_legend().remove()
+            ax.tick_params(axis="x", rotation=15)
 
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper right", bbox_to_anchor=(1.0, 1.0))
+    add_shared_legend(fig, axes.ravel(), factor["hue"].replace("_", " ").title())
 
     output_path = output_dir / f"adni_{factor['name']}_effect.png"
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 0.86, 0.95), pad=1.4, w_pad=2.2, h_pad=2.0)
     fig.savefig(output_path, bbox_inches="tight", dpi=150)
     plt.close(fig)
     print(f"Saved {output_path}")
@@ -179,13 +215,13 @@ def plot_marginal_means(df: pd.DataFrame, output_dir: Path) -> None:
     fig, axes = plt.subplots(
         len(METRICS),
         len(MARGINAL_FACTOR_CONFIGS),
-        figsize=(5 * len(MARGINAL_FACTOR_CONFIGS), 4 * len(METRICS)),
+        figsize=(6 * len(MARGINAL_FACTOR_CONFIGS), 4.75 * len(METRICS)),
         squeeze=False,
     )
     fig.suptitle(
         "Mean Test Performance by Hyperparameter "
         "(slice aggregator and features stratified by encoder)",
-        y=1.02,
+        y=0.98,
     )
 
     for row_idx, metric in enumerate(METRICS):
@@ -206,8 +242,6 @@ def plot_marginal_means(df: pd.DataFrame, output_dir: Path) -> None:
                     errorbar=None,
                     palette="muted",
                 )
-                if col_idx > 0 or row_idx > 0:
-                    ax.get_legend().remove()
             else:
                 sns.barplot(
                     data=factor_subset,
@@ -227,11 +261,10 @@ def plot_marginal_means(df: pd.DataFrame, output_dir: Path) -> None:
             ax.grid(axis="y", linestyle="--", alpha=0.4)
             ax.tick_params(axis="x", rotation=15)
 
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper right", bbox_to_anchor=(1.0, 1.0))
+    add_shared_legend(fig, axes.ravel(), "Encoder")
 
     output_path = output_dir / "adni_marginal_means.png"
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 0.86, 0.95), pad=1.4, w_pad=2.2, h_pad=2.0)
     fig.savefig(output_path, bbox_inches="tight", dpi=150)
     plt.close(fig)
     print(f"Saved {output_path}")

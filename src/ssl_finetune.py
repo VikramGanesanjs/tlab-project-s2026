@@ -19,6 +19,17 @@ from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with
 from dinov3.utils import count_parameters
 
 logger = logging.getLogger("dinov3")
+
+class CrossViewDecoder(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+
+    def forward(self, full_view, masked_view):
+        raise NotImplementedError("CrossViewDecoder is not implemented")
+
+
 class SSLMetaArch(nn.Module):
     """
     Modified version of SSLMetaArch, removing gram loss and distillation, and setting up for 
