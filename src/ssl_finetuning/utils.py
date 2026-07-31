@@ -243,3 +243,26 @@ class PatchEmbed(nn.Module):
     def _init_weights(self):
         w = self.proj.weight.data
         torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1])) 
+
+
+
+
+
+
+def select_rope_positions(rope_sincos, idx):
+    if isinstance(rope_sincos, (tuple, list)):
+        return type(rope_sincos)(
+            select_rope_positions(x, idx) for x in rope_sincos
+        )
+
+    # Select along whichever axis is the flattened H*W sequence axis.
+    if rope_sincos.shape[0] >= idx.max().item() + 1:
+        return rope_sincos[idx]
+
+    if rope_sincos.shape[1] >= idx.max().item() + 1:
+        return rope_sincos[:, idx]
+
+    if rope_sincos.shape[-2] >= idx.max().item() + 1:
+        return rope_sincos[..., idx, :]
+
+    raise ValueError(f"Cannot find sequence axis in RoPE tensor {rope_sincos.shape}")

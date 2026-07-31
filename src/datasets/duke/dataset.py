@@ -33,26 +33,20 @@ def _apply_shared_pair_transform(transform: Callable, images: Tuple[Any, Any]) -
     torch_initial = torch.get_rng_state()
     numpy_initial = np.random.get_state()
     python_initial = random.getstate()
-    cuda_initial = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
     first = transform(images[0])
     torch_advanced = torch.get_rng_state()
     numpy_advanced = np.random.get_state()
     python_advanced = random.getstate()
-    cuda_advanced = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
     torch.set_rng_state(torch_initial)
     np.random.set_state(numpy_initial)
     random.setstate(python_initial)
-    if cuda_initial is not None:
-        torch.cuda.set_rng_state_all(cuda_initial)
     second = transform(images[1])
 
     torch.set_rng_state(torch_advanced)
     np.random.set_state(numpy_advanced)
     random.setstate(python_advanced)
-    if cuda_advanced is not None:
-        torch.cuda.set_rng_state_all(cuda_advanced)
     return first, second
 
 # ---------------------------------------------------------------------------

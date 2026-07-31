@@ -21,6 +21,7 @@ for _path in (_SRC_DIR, _DINOV3_DIR):
 import torch
 import torch.distributed
 from torch.distributed._tensor import DTensor
+from omegaconf import OmegaConf
 
 import dinov3.distributed as distributed
 from dinov3.checkpointer import (
@@ -30,12 +31,12 @@ from dinov3.checkpointer import (
     load_checkpoint,
     save_checkpoint,
 )
-from dinov3.configs import setup_config, setup_job
+from dinov3.configs import apply_scaling_rules_to_cfg, setup_job
 from dinov3.data import (
     SamplerType,
     make_data_loader,
 )
-from dinov3.logging import MetricLogger, setup_logging
+from dinov3.logging import MetricLogger, SmoothedValue, setup_logging
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
 
 from datasets.adni import ADNIPairedSliceDataset, DEFAULT_ROOT as ADNI_DEFAULT_ROOT
@@ -56,6 +57,32 @@ logger = logging.getLogger("dinov3")
 
 def identity_transform(image):
     return image
+
+
+def load_ssl_config(args):
+    """Load only the slice-finetuning config and explicit CLI overrides.
+
+    The upstream ``setup_config`` merges the entire DINOv3 SSL default config,
+    which reintroduces legacy GRAM, distillation, KoLeo, and ImageNet fields
+    into the saved run configuration. This task has its own complete Vit-B
+    config, so merging those unrelated defaults is both unnecessary and
+    misleading.
+    """
+    cfg = OmegaConf.load(args.config_file)
+    overrides = list(args.opts or [])
+    if args.output_dir is not None:
+        overrides.append(f"train.output_dir={os.path.realpath(args.output_dir)}")
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(overrides))
+    logger.info("Loaded slice-finetuning config from %s", args.config_file)
+    return cfg
+
+
+def save_ssl_config(cfg, output_dir):
+    """Save the explicit slice-finetuning configuration without DINO defaults."""
+    output_path = os.path.join(os.path.abspath(output_dir), "config.yaml")
+    OmegaConf.save(config=cfg, f=output_path)
+    logger.info("Saved slice-finetuning config: %s", output_path)
 
 
 class _PairedSliceCollator:
@@ -139,41 +166,84 @@ def build_optimizer(cfg, params_groups):
     return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
 
-def build_schedulers(cfg):
+def _delayed_lora_schedule(
+    *,
+    peak_value,
+    final_value,
+    total_iterations,
+    freeze_iterations,
+    warmup_iterations,
+    trunc_extra,
+):
+    """Keep LoRA at zero while frozen, then warm it up after unfreezing."""
+    if freeze_iterations >= total_iterations:
+        raise ValueError(
+            "freeze_backbone_epochs must be shorter than the total training run"
+        )
+    remaining_iterations = total_iterations - freeze_iterations
+    if warmup_iterations > remaining_iterations:
+        raise ValueError(
+            "LoRA warmup extends beyond the end of training: "
+            f"warmup_iterations={warmup_iterations}, "
+            f"remaining_iterations={remaining_iterations}"
+        )
+    tail = CosineScheduler(
+        base_value=peak_value,
+        final_value=final_value,
+        total_iters=remaining_iterations,
+        warmup_iters=warmup_iterations,
+        start_warmup_value=0.0,
+        trunc_extra=trunc_extra,
+    )
+    import numpy as np
+
+    return np.concatenate((np.zeros(freeze_iterations, dtype=np.float64), tail.schedule))
+
+
+def build_schedulers(cfg, iterations_per_epoch):
     if "schedules" in cfg:
         logger.info("Using schedules v2")
-        return build_schedulers_v2(cfg)
+        return build_schedulers_v2(cfg, iterations_per_epoch)
 
-    OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
+    total_iterations = cfg.optim["epochs"] * iterations_per_epoch
+    freeze_iterations = cfg.optim["freeze_backbone_epochs"] * iterations_per_epoch
     lr = dict(
         base_value=cfg.optim["lr"],
         final_value=cfg.optim["min_lr"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
-        warmup_iters=cfg.optim["warmup_epochs"] * OFFICIAL_EPOCH_LENGTH,
-        start_warmup_value=0,
+        total_iters=total_iterations,
+        warmup_iters=0,
+        start_warmup_value=cfg.optim["lr"],
         trunc_extra=cfg.optim["schedule_trunc_extra"],
     )
     wd = dict(
         base_value=cfg.optim["weight_decay"],
         final_value=cfg.optim["weight_decay_end"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
+        total_iters=total_iterations,
         trunc_extra=cfg.optim["schedule_trunc_extra"],
     )
     momentum = dict(
         base_value=cfg.teacher["momentum_teacher"],
         final_value=cfg.teacher["final_momentum_teacher"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
+        total_iters=total_iterations,
         trunc_extra=cfg.optim["schedule_trunc_extra"],
     )
     teacher_temp = dict(
         base_value=cfg.teacher["teacher_temp"],
         final_value=cfg.teacher["teacher_temp"],
-        total_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
-        warmup_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
+        total_iters=cfg.teacher["warmup_teacher_temp_epochs"] * iterations_per_epoch,
+        warmup_iters=cfg.teacher["warmup_teacher_temp_epochs"] * iterations_per_epoch,
         start_warmup_value=cfg.teacher["warmup_teacher_temp"],
     )
 
     lr_schedule = CosineScheduler(**lr)
+    lora_lr_schedule = _delayed_lora_schedule(
+        peak_value=cfg.optim["lr"],
+        final_value=cfg.optim["min_lr"],
+        total_iterations=total_iterations,
+        freeze_iterations=freeze_iterations,
+        warmup_iterations=cfg.optim["warmup_epochs"] * iterations_per_epoch,
+        trunc_extra=cfg.optim["schedule_trunc_extra"],
+    )
     wd_schedule = CosineScheduler(**wd)
     momentum_schedule = CosineScheduler(**momentum)
     teacher_temp_schedule = CosineScheduler(**teacher_temp)
@@ -187,12 +257,25 @@ def build_schedulers(cfg):
         momentum_schedule,
         teacher_temp_schedule,
         last_layer_lr_schedule,
+        lora_lr_schedule,
     )
 
 
-def build_schedulers_v2(cfg):
-    iter_per_epoch = cfg.train.OFFICIAL_EPOCH_LENGTH
-    total_iterations = cfg.train.OFFICIAL_EPOCH_LENGTH * cfg.optim.epochs
+def build_schedulers_v2(cfg, iterations_per_epoch):
+    iter_per_epoch = iterations_per_epoch
+    total_iterations = iterations_per_epoch * cfg.optim.epochs
+    freeze_iterations = cfg.optim.freeze_backbone_epochs * iterations_per_epoch
+    lora_warmup_iterations = iter_per_epoch * cfg.schedules.lr.warmup_epochs
+    if freeze_iterations >= total_iterations:
+        raise ValueError(
+            "freeze_backbone_epochs must be shorter than the total training run"
+        )
+    if lora_warmup_iterations > total_iterations - freeze_iterations:
+        raise ValueError(
+            "LoRA warmup extends beyond the end of training: "
+            f"warmup_iterations={lora_warmup_iterations}, "
+            f"remaining_iterations={total_iterations - freeze_iterations}"
+        )
     logger.info(f"Total training iterations {total_iterations}")
 
     # LR scaling rules
@@ -215,15 +298,25 @@ def build_schedulers_v2(cfg):
         logger.info(f"No scaling rule for {cfg.optim.scaling_rule=}")
 
     lr = linear_warmup_cosine_decay(
-        start=cfg.schedules.lr.start,
+        start=lr_peak,
         peak=lr_peak,
         end=lr_end,
-        warmup_iterations=iter_per_epoch * cfg.schedules.lr.warmup_epochs,
+        warmup_iterations=0,
         total_iterations=total_iterations,
         cosine_iterations=(
             iter_per_epoch * cfg.schedules.lr.cosine_epochs if "cosine_epochs" in cfg.schedules.lr else None
         ),
     )
+    lora_lr = linear_warmup_cosine_decay(
+        start=0.0,
+        peak=lr_peak,
+        end=lr_end,
+        warmup_iterations=lora_warmup_iterations,
+        total_iterations=total_iterations - freeze_iterations,
+    )
+    import numpy as np
+
+    lora_lr = np.concatenate((np.zeros(freeze_iterations, dtype=np.float64), lora_lr))
     # The custom SSL objective trains both heads from the beginning. Keep the
     # last-layer schedule active during Stage A (heads + CVD only).
     last_layer_lr = lr.copy()
@@ -261,16 +354,18 @@ def build_schedulers_v2(cfg):
             else None
         ),
     )
-    return lr, weight_decay, momentum, teacher_temp, last_layer_lr
+    return lr, weight_decay, momentum, teacher_temp, last_layer_lr, lora_lr
 
 
-def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
+def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr, lora_lr):
     for param_group in optimizer.param_groups:
         is_last_layer = param_group["is_last_layer"]
         lr_multiplier = param_group["lr_multiplier"]
         wd_multiplier = param_group["wd_multiplier"]
         param_group["weight_decay"] = wd * wd_multiplier
-        if is_last_layer:
+        if param_group.get("is_lora", False):
+            param_group["lr"] = lora_lr * lr_multiplier
+        elif is_last_layer:
             param_group["lr"] = last_layer_lr * lr_multiplier
         else:
             param_group["lr"] = lr * lr_multiplier
@@ -358,7 +453,7 @@ def build_data_loader_from_cfg(
         drop_last=True,
         collate_fn=_PairedSliceCollator(pair_transform),
     )
-    return data_loader
+    return data_loader, len(dataset)
 
 
 def build_multi_resolution_data_loader_from_cfg(
@@ -369,6 +464,14 @@ def build_multi_resolution_data_loader_from_cfg(
 ):
     del seed
     return build_data_loader_from_cfg(cfg=cfg, model=model, start_iter=start_iter)
+
+
+def _period_in_iterations(section, *, epoch_key, iteration_key, iterations_per_epoch):
+    """Resolve a schedule period, preferring dataset-relative epoch units."""
+    epoch_period = section.get(epoch_key)
+    if epoch_period is not None:
+        return int(epoch_period) * iterations_per_epoch
+    return int(section.get(iteration_key, 0))
 
 
 def set_backbone_trainable(model, trainable: bool):
@@ -387,13 +490,6 @@ def do_train(cfg, model, resume=False):
     model.train()
     # Optimizer
     optimizer = build_optimizer(cfg, model.get_params_groups())
-    (
-        lr_schedule,
-        wd_schedule,
-        momentum_schedule,
-        teacher_temp_schedule,
-        last_layer_lr_schedule,
-    ) = build_schedulers(cfg)
     start_iter = 0
     if resume and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
@@ -407,10 +503,82 @@ def do_train(cfg, model, resume=False):
             )
             + 1
         )
-    OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
-    max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
+
+    # The paired dataset is finite, but its sampler is intentionally infinite.
+    # Define one logical epoch as one complete pass of full global batches.
+    data_loader, dataset_size = build_multi_resolution_data_loader_from_cfg(
+        cfg=cfg,
+        model=model,
+        start_iter=start_iter,
+    )
     global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_subgroup_size()
-    freeze_backbone_iters = cfg.optim.freeze_backbone_epochs * OFFICIAL_EPOCH_LENGTH
+    if dataset_size < global_batch_size:
+        raise ValueError(
+            "The paired dataset has fewer examples than one global batch: "
+            f"dataset_size={dataset_size}, global_batch_size={global_batch_size}"
+        )
+    iterations_per_epoch = dataset_size // global_batch_size
+    if iterations_per_epoch <= 0:
+        raise ValueError(
+            f"Could not form a complete epoch from dataset_size={dataset_size} "
+            f"and global_batch_size={global_batch_size}"
+        )
+    max_iter = cfg.optim.epochs * iterations_per_epoch
+    freeze_backbone_iters = cfg.optim.freeze_backbone_epochs * iterations_per_epoch
+    eval_period_iterations = _period_in_iterations(
+        cfg.evaluation,
+        epoch_key="eval_period_epochs",
+        iteration_key="eval_period_iterations",
+        iterations_per_epoch=iterations_per_epoch,
+    )
+    checkpoint_period_iterations = _period_in_iterations(
+        cfg.checkpointing,
+        epoch_key="period_epochs",
+        iteration_key="period",
+        iterations_per_epoch=iterations_per_epoch,
+    )
+    (
+        lr_schedule,
+        wd_schedule,
+        momentum_schedule,
+        teacher_temp_schedule,
+        last_layer_lr_schedule,
+        lora_lr_schedule,
+    ) = build_schedulers(cfg, iterations_per_epoch)
+
+    logger.info(
+        "Training data: %d paired examples; per-GPU batch size=%d; "
+        "distributed group size=%d; effective batch size=%d",
+        dataset_size,
+        cfg.train.batch_size_per_gpu,
+        distributed.get_subgroup_size(),
+        global_batch_size,
+    )
+    logger.info(
+        "Training schedule: %d epochs × %d iterations/epoch = %d total iterations",
+        cfg.optim.epochs,
+        iterations_per_epoch,
+        max_iter,
+    )
+    logger.info(
+        "LR policy: heads/CVD start at %.6g immediately; LoRA stays at 0 for "
+        "%d iterations, then warms to the configured peak over %d iterations",
+        float(lr_schedule[0]),
+        freeze_backbone_iters,
+        cfg.optim.warmup_epochs * iterations_per_epoch,
+    )
+    logger.info(
+        "Schedule settings: LoRA warmup=%d epochs; freeze LoRA=%d epochs "
+        "(%d iterations)",
+        cfg.optim.warmup_epochs,
+        cfg.optim.freeze_backbone_epochs,
+        freeze_backbone_iters,
+    )
+    logger.info(
+        "Evaluation period: %d iterations; checkpoint period: %d iterations",
+        eval_period_iterations,
+        checkpoint_period_iterations,
+    )
     backbone_frozen = start_iter < freeze_backbone_iters
     set_backbone_trainable(model, not backbone_frozen)
     logger.info(
@@ -419,17 +587,14 @@ def do_train(cfg, model, resume=False):
         cfg.optim.freeze_backbone_epochs,
     )
 
-    # Build data loader
-    data_loader = build_multi_resolution_data_loader_from_cfg(
-        cfg=cfg,
-        model=model,
-        start_iter=start_iter,
-    )
-
     # Metric logging
     logger.info("Starting training from iteration %d", start_iter)
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+    # Keep these as current-value meters so the progress line shows the
+    # exact epoch position alongside the smoothed training metrics.
+    metric_logger.add_meter("epoch", SmoothedValue(window_size=1, fmt="{value:.0f}"))
+    metric_logger.add_meter("epoch_iteration", SmoothedValue(window_size=1, fmt="{value:.0f}"))
     # Manual garbage collection
     gc.disable()
     gc.collect()
@@ -441,7 +606,10 @@ def do_train(cfg, model, resume=False):
     for data in metric_logger.log_every(
         data_loader,
         print_freq=10,
-        header="Training",
+        header=(
+            f"Training ({cfg.optim.epochs} epochs × "
+            f"{iterations_per_epoch} iterations/epoch)"
+        ),
         n_iterations=max_iter,
         start_iteration=start_iter,
     ):
@@ -460,13 +628,23 @@ def do_train(cfg, model, resume=False):
             backbone_frozen = False
             logger.info("Backbone LoRA parameters unfrozen at iteration %d", iteration)
 
+        if iteration % iterations_per_epoch == 0:
+            logger.info(
+                "Starting epoch %d/%d (iteration %d/%d)",
+                iteration // iterations_per_epoch + 1,
+                cfg.optim.epochs,
+                iteration,
+                max_iter,
+            )
+
         # Learning rates and other schedules
         lr = lr_schedule[it]
         wd = wd_schedule[it]
         mom = momentum_schedule[it]
         teacher_temp = teacher_temp_schedule[it]
         last_layer_lr = last_layer_lr_schedule[it]
-        apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
+        lora_lr = lora_lr_schedule[it]
+        apply_optim_scheduler(optimizer, lr, wd, last_layer_lr, lora_lr)
 
         # Forward backward
         optimizer.zero_grad(set_to_none=True)
@@ -522,20 +700,26 @@ def do_train(cfg, model, resume=False):
         # Log metrics
         metric_logger.update(lr=lr)
         metric_logger.update(wd=wd)
+        metric_logger.update(lora_lr=lora_lr)
         metric_logger.update(mom=mom)
+        metric_logger.update(teacher_temp=teacher_temp)
         metric_logger.update(last_layer_lr=last_layer_lr)
+        metric_logger.update(
+            epoch=iteration // iterations_per_epoch + 1,
+            epoch_iteration=iteration % iterations_per_epoch + 1,
+        )
         metric_logger.update(total_loss=total_loss, **metrics_dict)
 
         # Submit evaluation jobs
         if (
-            cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0
+            eval_period_iterations > 0 and (iteration + 1) % eval_period_iterations == 0
             # and iteration != max_iter - 1
         ):
             do_test(cfg, model, f"training_{iteration}", process_group=process_subgroup)
             torch.cuda.synchronize()
 
         # Checkpointing
-        if (iteration + 1) % cfg.checkpointing.period == 0:
+        if checkpoint_period_iterations > 0 and (iteration + 1) % checkpoint_period_iterations == 0:
             torch.cuda.synchronize()
             save_checkpoint(
                 ckpt_dir / str(iteration),
@@ -565,11 +749,15 @@ def main(argv=None):
             argv = argv[1:]
         args = get_args_parser().parse_args(argv)
     setup_job(output_dir=args.output_dir, seed=args.seed)
-    cfg = setup_config(args, strict_cfg=False)
+    cfg = load_ssl_config(args)
     if args.pretrained_weights:
         cfg.student.resume_from_teacher_chkpt = args.pretrained_weights
     elif cfg.student.pretrained_weights and not cfg.student.resume_from_teacher_chkpt:
         cfg.student.resume_from_teacher_chkpt = cfg.student.pretrained_weights
+    save_ssl_config(cfg, args.output_dir)
+    # Apply the same batch-size learning-rate scaling used by DINOv3, but do
+    # so only after saving the user-facing configuration snapshot.
+    apply_scaling_rules_to_cfg(cfg)
     logger.info(cfg)
     setup_logging(
         output=os.path.join(os.path.abspath(args.output_dir), "nan_logs"),
@@ -578,6 +766,10 @@ def main(argv=None):
     logger.info("Making slice-pair SSL fine-tuner")
     with torch.device("meta"):
         model = SSLFineTune(cfg)
+    # DINOv3's distributed setup materializes the meta-device model. Weight
+    # initialization must happen after that step; otherwise FSDP2's
+    # ``to_empty`` can replace initialized storage with empty values.
+    model.prepare_for_distributed_training()
     # Fill all values with `nans` so that we identify
     # non-initialized values
     model._apply(
@@ -589,7 +781,7 @@ def main(argv=None):
         recurse=True,
     )
     model.init_weights()
-    model.prepare_for_distributed_training()
+    model.assert_finite_state("after initialization and checkpoint loading")
     logger.info(f"Model after distributed:\n{model}")
     if args.eval_only:
         return do_test(

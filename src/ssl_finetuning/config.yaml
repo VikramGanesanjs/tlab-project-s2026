@@ -17,7 +17,7 @@ ibot:
   head_nlayers: 3
   head_hidden_dim: 2048
 train:
-  batch_size_per_gpu: 64
+  batch_size_per_gpu: 128
   dataset: adni
   data_root: /common/ganesanv/tlab/data/ADNI
   adni_task: cn_mci_ad
@@ -27,11 +27,12 @@ train:
   output_dir: /common/ganesanv/tlab/runs/ssl_finetuning/adni_vitb16
   seed: 0
   num_workers: 10
-  OFFICIAL_EPOCH_LENGTH: 1250
   cache_dataset: true
   checkpointing: false
+  checkpointing_full: false
   compile: true
   cudagraphs: false
+  sharded_eval_checkpoint: false
 student:
   arch: vit_base
   patch_size: 16
@@ -43,9 +44,14 @@ student:
   qkv_bias: true
   proj_bias: true
   ffn_bias: true
+  ffn_ratio: 4.0
   norm_layer: layernorm
   n_storage_tokens: 0
   mask_k_bias: false
+  untie_cls_and_patch_norms: false
+  untie_global_and_local_cls_norm: false
+  in_chans: 3
+  pos_embed_type: rope
   pos_embed_rope_base: 100.0
   pos_embed_rope_min_period: null
   pos_embed_rope_max_period: null
@@ -53,6 +59,7 @@ student:
   pos_embed_rope_shift_coords: null
   pos_embed_rope_jitter_coords: null
   pos_embed_rope_rescale_coords: null
+  pos_embed_rope_dtype: bf16
   fp8_enabled: False  # Convert Linear layers to operate in fp8 precision
   fp8_filter: "blocks"  # Regex that must appear in module path; empty means everything
 teacher:
@@ -68,6 +75,7 @@ optim:
   lr: 0.001
   warmup_epochs: 10
   min_lr: 1.0e-06
+  schedule_trunc_extra: 0.0
   clip_grad: 3.0
   scaling_rule: sqrt_wrt_1024
   patch_embed_lr_mult: 0.2
@@ -91,9 +99,9 @@ crops:
   share_color_jitter: false
   horizontal_flips: true
 evaluation:
-  eval_period_iterations: 12500
+  eval_period_epochs: 10
 checkpointing:
-  period: 3750
+  period_epochs: 3
   max_to_keep: 3
 
 # Volumetric-DINO slice-pair fine-tuning options.

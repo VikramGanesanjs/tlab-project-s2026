@@ -301,14 +301,27 @@ class SSLFineTune(nn.Module):
                 "ibot_head": ibot_head_class(),
             }
         )
+
+        self.lora_enabled = bool(cfg.lora.enabled)
+        self.lora_rank = int(cfg.lora.rank)
+        self._lora_attached = False
+        # Adapters must exist before FSDP2 wraps the backbone so their
+        # parameters are included in the sharded module and optimizer groups.
+        if self.lora_enabled:
+            from vit_lora import add_lora_to_vit, freeze_non_lora_parameters
+
+            add_lora_to_vit(self.student.backbone, r=self.lora_rank)
+            add_lora_to_vit(self.teacher.backbone, r=self.lora_rank)
+            freeze_non_lora_parameters(self.student.backbone)
+            freeze_non_lora_parameters(self.teacher.backbone)
+            self._lora_attached = True
+
         self.teacher.requires_grad_(False)
         self.model_ema = self.teacher
 
         self.dino_loss = DINOLoss(self.dino_out_dim)
         self.ibot_patch_loss = iBOTPatchLoss(ibot_out_dim)
-        self.lora_enabled = bool(cfg.lora.enabled)
-        self.lora_rank = int(cfg.lora.rank)
-        self._lora_attached = False
+        self._distributed_prepared = False
         self.lambda1 = float(cfg.lambda1)
         self.lambda2 = float(cfg.lambda2)
         self.lam_cross = float(cfg.lam_cross)
@@ -363,18 +376,72 @@ class SSLFineTune(nn.Module):
             raise ValueError(f"Unsupported pretrained checkpoint format: {checkpoint}")
 
         backbone_state = {}
-        expected_keys = set(self.student.backbone.state_dict())
+        expected_backbone_keys = {
+            name[len("backbone.") :]
+            for name in self.student.state_dict()
+            if name.startswith("backbone.")
+        }
         for name, value in loaded.items():
             name = str(name)
             for prefix in ("module.", "teacher.", "student.", "backbone."):
                 if name.startswith(prefix):
                     name = name[len(prefix) :]
-            if name in expected_keys:
+            if self._lora_attached:
+                # The released checkpoint stores fused projections as
+                # ``attn.qkv.{weight,bias,bias_mask}``; LoRA wraps that base
+                # layer under ``attn.qkv.qkv``.
+                for suffix in ("weight", "bias", "bias_mask"):
+                    if name.endswith(f".attn.qkv.{suffix}"):
+                        name = name.replace(
+                            f".attn.qkv.{suffix}", f".attn.qkv.qkv.{suffix}"
+                        )
+                        break
+            if name in expected_backbone_keys:
                 backbone_state[name] = value
 
         if not backbone_state:
             raise ValueError(f"No backbone parameters found in pretrained checkpoint: {checkpoint}")
-        missing, unexpected = self.student.backbone.load_state_dict(backbone_state, strict=False)
+        if self._distributed_prepared:
+            # FSDP2 parameters are DTensors after ``prepare_for_distributed_training``.
+            # Match DINOv3's checkpoint loader by converting sharded backbone
+            # tensors to the active process mesh before loading them.
+            from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+            from torch.distributed.tensor import Shard, distribute_tensor
+
+            process_group = distributed.get_process_subgroup()
+            if process_group is None:
+                world_mesh = init_device_mesh(
+                    "cuda",
+                    mesh_shape=(dist.get_world_size(),),
+                    mesh_dim_names=("dp",),
+                )
+            else:
+                world_mesh = DeviceMesh.from_group(process_group, "cuda")
+
+            keys_not_sharded = ("backbone.rope_embed.periods", "qkv.bias_mask")
+            student_state = {
+                f"backbone.{name}": (
+                    value
+                    if any(key in f"backbone.{name}" for key in keys_not_sharded)
+                    # ``distribute_tensor`` defaults to Replicate. FSDP2
+                    # parameters are Shard(dim=0), so make that placement
+                    # explicit to avoid a replicated-to-sharded copy_().
+                    else distribute_tensor(
+                        value,
+                        world_mesh,
+                        placements=[Shard(0)] if value.ndim > 0 else None,
+                        src_data_rank=None,
+                    )
+                )
+                for name, value in backbone_state.items()
+            }
+        else:
+            student_state = {f"backbone.{name}": value for name, value in backbone_state.items()}
+
+        # Load through the FSDP-wrapped student container. Loading directly
+        # into ``student.backbone`` bypasses FSDP2's state-dict placement
+        # handling for replicated parameters such as cls_token and mask_token.
+        missing, unexpected = self.student.load_state_dict(student_state, strict=False)
         logger.info(
             "Loaded pretrained backbone from %s (%d tensors); missing=%d unexpected=%d",
             checkpoint,
@@ -391,6 +458,10 @@ class SSLFineTune(nn.Module):
         copied only after that load so both branches start identically.
         """
         self.student.backbone.init_weights()
+        if self.lora_enabled:
+            from vit_lora import init_lora_parameters
+
+            init_lora_parameters(self.student.backbone)
         self.student.dino_head.init_weights()
         self.student.ibot_head.init_weights()
         self.student.cvd.init_weights()
@@ -402,17 +473,38 @@ class SSLFineTune(nn.Module):
             logger.info("Loading pretrained fine-tuning checkpoint from %s", checkpoint)
             self._load_pretrained_backbone(checkpoint)
 
-        # Attach adapters after loading the released checkpoint so the base
-        # fused-QKV names in that checkpoint remain unchanged during loading.
-        if self.lora_enabled and not self._lora_attached:
-            from vit_lora import add_lora_to_vit, freeze_non_lora_parameters
-
-            add_lora_to_vit(self.student.backbone, r=self.lora_rank)
-            add_lora_to_vit(self.teacher.backbone, r=self.lora_rank)
-            freeze_non_lora_parameters(self.student.backbone)
-            freeze_non_lora_parameters(self.teacher.backbone)
-            self._lora_attached = True
         self._copy_student_to_teacher()
+
+    @torch.no_grad()
+    def assert_finite_state(self, stage: str) -> None:
+        """Raise with parameter names if initialization left non-finite values."""
+        non_finite = []
+        checked = 0
+
+        for name, tensor in list(self.named_parameters()) + list(self.named_buffers()):
+            # FSDP2 exposes sharded parameters as DTensors. Check each local
+            # shard; this avoids a full-tensor collective just for validation.
+            local_tensor = tensor.to_local() if hasattr(tensor, "to_local") else tensor
+            if local_tensor.is_meta:
+                non_finite.append(f"{name} (still on meta device)")
+                continue
+            if not local_tensor.is_floating_point() and not local_tensor.is_complex():
+                continue
+
+            checked += 1
+            if not torch.isfinite(local_tensor).all().item():
+                finite = torch.isfinite(local_tensor)
+                bad_values = int((~finite).sum().item())
+                non_finite.append(f"{name} ({bad_values} non-finite values)")
+
+        if non_finite:
+            details = "\n".join(f"  - {name}" for name in non_finite[:50])
+            if len(non_finite) > 50:
+                details += f"\n  - ... and {len(non_finite) - 50} more"
+            raise RuntimeError(
+                f"Non-finite model state detected {stage}; checked {checked} tensors:\n{details}"
+            )
+        logger.info("Finite model-state audit passed %s (%d floating tensors checked)", stage, checked)
 
     @staticmethod
     def _unpack_pair(data: Any) -> Tuple[Tensor, Tensor, Optional[Any], Optional[Any], Optional[Any], Optional[Any]]:
@@ -574,11 +666,11 @@ class SSLFineTune(nn.Module):
         while grid_h > 1 and num_patches % grid_h:
             grid_h -= 1
         grid_w = num_patches // grid_h
-        generator = MaskingGenerator((grid_h, grid_w))
+        generator = MaskingGenerator((grid_h, grid_w), max_num_patches=num_patches)
         masks = []
         for _ in range(batch_size):
             if torch.rand((), device=device).item() > self.mask_sample_probability:
-                mask = torch.zeros(num_patches, dtype=torch.bool)
+                mask = torch.zeros(num_patches, dtype=torch.bool, device=device)
             else:
                 ratio = torch.empty((), device=device).uniform_(self.mask_ratio_min, self.mask_ratio_max).item()
                 count = max(1, min(num_patches, int(round(num_patches * ratio))))
@@ -929,8 +1021,22 @@ class SSLFineTune(nn.Module):
             patch_embed_lr_mult=float(optim_cfg.patch_embed_lr_mult),
             dino_head_wd_multiplier=float(optim_cfg.dino_head_wd_multiplier),
         )
+        lora_markers = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
+        lora_param_ids = {
+            id(parameter)
+            for name, parameter in module.named_parameters()
+            if any(marker in name for marker in lora_markers)
+        }
+        for group in params_groups:
+            # ``get_params_groups_with_decay_fsdp`` creates one group per
+            # parameter.  Fused groups become lists only after this tagging
+            # step, so inspect the parameter directly here.
+            group["is_lora"] = id(group["params"]) in lora_param_ids
         if bool(optim_cfg.multi_tensor_optim):
-            fused_groups = fuse_params_groups(params_groups)
+            fused_groups = fuse_params_groups(
+                params_groups,
+                keys=("lr_multiplier", "wd_multiplier", "is_last_layer", "is_lora"),
+            )
             for group in fused_groups:
                 group["foreach"] = True
                 group["fused"] = True
@@ -953,6 +1059,7 @@ class SSLFineTune(nn.Module):
             trained_model_process_group=process_group,
             inference_only_models_process_groups=[process_group],
         )
+        self._distributed_prepared = True
 
     def broadcast_to_subgroups(self, tensor: Tensor, over_dim: int, global_batch_size: Optional[int] = None) -> Tensor:
         world_size = distributed.get_world_size()

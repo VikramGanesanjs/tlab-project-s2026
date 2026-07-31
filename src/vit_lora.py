@@ -105,6 +105,17 @@ def freeze_non_lora_parameters(model: nn.Module) -> nn.Module:
     return model
 
 
+@torch.no_grad()
+def init_lora_parameters(model: nn.Module) -> nn.Module:
+    """Restore the zero-initialized LoRA update after backbone initialization."""
+    for name, parameter in model.named_parameters():
+        if "w_a_" in name:
+            nn.init.kaiming_uniform_(parameter, a=math.sqrt(5))
+        elif "w_b_" in name:
+            nn.init.zeros_(parameter)
+    return model
+
+
 def load_vit_with_lora(
     encoder: str = "braindino",
     *,
@@ -163,6 +174,7 @@ __all__ = [
     "LoRA",
     "add_lora_to_vit",
     "freeze_non_lora_parameters",
+    "init_lora_parameters",
     "load_vit_with_lora",
     "lora_parameters",
 ]
