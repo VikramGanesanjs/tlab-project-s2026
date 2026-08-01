@@ -16,7 +16,7 @@ python -m dinov3.run.submit \
   --nodes 1 \
   --ngpus 2 \
   --timeout 2880 \
-  --mem-gb 128 \
+  --mem-gb 256 \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \

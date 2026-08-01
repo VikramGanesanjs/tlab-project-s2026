@@ -200,13 +200,28 @@ def _delayed_lora_schedule(
     return np.concatenate((np.zeros(freeze_iterations, dtype=np.float64), tail.schedule))
 
 
+def _epochs_to_iterations(epochs, iterations_per_epoch: int, *, field_name: str) -> int:
+    """Convert an epoch-valued schedule to a concrete iteration boundary."""
+    epochs = float(epochs)
+    if not math.isfinite(epochs) or epochs < 0:
+        raise ValueError(f"{field_name} must be a finite non-negative number, got {epochs}")
+    # Schedule arrays and range-based training logic require integer lengths.
+    # Round to the nearest iteration so fractional epochs retain their intended
+    # duration without silently truncating it.
+    return int(math.floor(epochs * iterations_per_epoch + 0.5))
+
+
 def build_schedulers(cfg, iterations_per_epoch):
     if "schedules" in cfg:
         logger.info("Using schedules v2")
         return build_schedulers_v2(cfg, iterations_per_epoch)
 
     total_iterations = cfg.optim["epochs"] * iterations_per_epoch
-    freeze_iterations = cfg.optim["freeze_backbone_epochs"] * iterations_per_epoch
+    freeze_iterations = _epochs_to_iterations(
+        cfg.optim["freeze_backbone_epochs"],
+        iterations_per_epoch,
+        field_name="optim.freeze_backbone_epochs",
+    )
     lr = dict(
         base_value=cfg.optim["lr"],
         final_value=cfg.optim["min_lr"],
@@ -264,7 +279,11 @@ def build_schedulers(cfg, iterations_per_epoch):
 def build_schedulers_v2(cfg, iterations_per_epoch):
     iter_per_epoch = iterations_per_epoch
     total_iterations = iterations_per_epoch * cfg.optim.epochs
-    freeze_iterations = cfg.optim.freeze_backbone_epochs * iterations_per_epoch
+    freeze_iterations = _epochs_to_iterations(
+        cfg.optim.freeze_backbone_epochs,
+        iterations_per_epoch,
+        field_name="optim.freeze_backbone_epochs",
+    )
     lora_warmup_iterations = iter_per_epoch * cfg.schedules.lr.warmup_epochs
     if freeze_iterations >= total_iterations:
         raise ValueError(
@@ -475,11 +494,29 @@ def _period_in_iterations(section, *, epoch_key, iteration_key, iterations_per_e
 
 
 def set_backbone_trainable(model, trainable: bool):
-    """Toggle only LoRA adapters; the pretrained backbone stays frozen."""
+    """Keep LoRA visible to FSDP while controlling updates through its LR.
+
+    FSDP2 initializes mixed-precision gradient metadata lazily.  Toggling a
+    parameter from ``requires_grad=False`` to ``True`` after the first forward
+    leaves an initially frozen FSDP parameter group without dtype metadata and
+    can make its bfloat16 gradient incompatible with the float32 sharded
+    parameter.  LoRA therefore stays ``requires_grad=True`` for the entire
+    run; the scheduler supplies a zero learning rate while it is logically
+    frozen.
+    """
+    del trainable
     lora_markers = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
     for name, parameter in model.student.backbone.named_parameters():
         if any(marker in name for marker in lora_markers):
-            parameter.requires_grad_(trainable)
+            parameter.requires_grad_(True)
+
+
+def discard_frozen_lora_grads(model) -> None:
+    """Prevent zero-LR LoRA parameters from accumulating optimizer state."""
+    lora_markers = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
+    for name, parameter in model.student.backbone.named_parameters():
+        if any(marker in name for marker in lora_markers) and parameter.grad is not None:
+            parameter.grad = None
 
 
 def do_train(cfg, model, resume=False):
@@ -524,7 +561,11 @@ def do_train(cfg, model, resume=False):
             f"and global_batch_size={global_batch_size}"
         )
     max_iter = cfg.optim.epochs * iterations_per_epoch
-    freeze_backbone_iters = cfg.optim.freeze_backbone_epochs * iterations_per_epoch
+    freeze_backbone_iters = _epochs_to_iterations(
+        cfg.optim.freeze_backbone_epochs,
+        iterations_per_epoch,
+        field_name="optim.freeze_backbone_epochs",
+    )
     eval_period_iterations = _period_in_iterations(
         cfg.evaluation,
         epoch_key="eval_period_epochs",
@@ -568,7 +609,7 @@ def do_train(cfg, model, resume=False):
         cfg.optim.warmup_epochs * iterations_per_epoch,
     )
     logger.info(
-        "Schedule settings: LoRA warmup=%d epochs; freeze LoRA=%d epochs "
+        "Schedule settings: LoRA warmup=%d epochs; freeze LoRA=%.3f epochs "
         "(%d iterations)",
         cfg.optim.warmup_epochs,
         cfg.optim.freeze_backbone_epochs,
@@ -582,9 +623,11 @@ def do_train(cfg, model, resume=False):
     backbone_frozen = start_iter < freeze_backbone_iters
     set_backbone_trainable(model, not backbone_frozen)
     logger.info(
-        "Backbone LoRA parameters are %s; freeze_backbone_epochs=%d",
+        "Backbone LoRA parameters are %s; freeze_backbone_epochs=%.3f "
+        "(%d iterations)",
         "frozen" if backbone_frozen else "trainable",
         cfg.optim.freeze_backbone_epochs,
+        freeze_backbone_iters,
     )
 
     # Metric logging
@@ -662,6 +705,14 @@ def do_train(cfg, model, resume=False):
                     if isinstance(grad_norm, torch.distributed.tensor.DTensor)
                     else grad_norm.item()
                 )
+
+        # Keep the LoRA parameters registered as trainable for FSDP2's dtype
+        # bookkeeping, but do not let the frozen phase update their optimizer
+        # state. Their learning rate is already zero in this phase; clearing
+        # the gradients also prevents AdamW moments from accumulating before
+        # the scheduled unfreeze.
+        if backbone_frozen:
+            discard_frozen_lora_grads(model)
 
         # Reduce total_loss to check for NaNs, reduce metrics for logging
         total_loss_all_ranks = total_loss.new_empty(distributed.get_subgroup_size())
