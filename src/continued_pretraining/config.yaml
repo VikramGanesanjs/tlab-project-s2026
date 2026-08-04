@@ -1,0 +1,28 @@
+# Merge this file with DINOv3's ssl_default_config.yaml through train.py.
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+
+train:
+  dataset_path: ADNI:root=/common/ganesanv/tlab/data/ADNI
+  output_dir: /common/ganesanv/tlab/runs/continued_pretraining/adni
+  batch_size_per_gpu: 64
+  num_workers: 8
+  cache_dataset: false
+
+optim:
+  warmup_iterations: 400
+  lr: 0.001
+checkpointing:
+  period: 500  # Save a checkpoint every N training iterations.
+  max_to_keep: 10
+
+student:
+  arch: vit_base
+  patch_size: 16
+  drop_path_rate: 0.1
+  freeze_last_layer_epochs: 0
+  resume_from_teacher_chkpt: /common/ganesanv/tlab/opt/dinov3-weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+
+lora_r: 8
+freeze_iterations: 800  # LoRA remains frozen for the first N training iterations.

@@ -66,6 +66,270 @@ MultiSliceDataset = Union[DukeMultiSliceDataset, ADNIMultiSliceDataset]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
 
+def _checkpoint_state_dict(checkpoint: object) -> Dict[str, torch.Tensor]:
+    """Select a backbone-bearing state dict from a regular checkpoint."""
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Checkpoint must contain a mapping of parameter names to tensors")
+
+    state: object = checkpoint
+    for key in ("teacher", "student"):
+        candidate = checkpoint.get(key)
+        if isinstance(candidate, dict):
+            state = candidate
+            break
+    else:
+        candidate = checkpoint.get("model")
+        if isinstance(candidate, dict):
+            for key in ("teacher", "student"):
+                nested = candidate.get(key)
+                if isinstance(nested, dict):
+                    state = nested
+                    break
+            else:
+                state = candidate
+
+    if not isinstance(state, dict):
+        raise ValueError("Checkpoint does not contain a usable state dict")
+    return {
+        str(name): value
+        for name, value in state.items()
+        if isinstance(value, torch.Tensor)
+    }
+
+
+def _normalize_backbone_state(
+    state: Dict[str, torch.Tensor],
+    encoder: nn.Module,
+) -> Dict[str, torch.Tensor]:
+    """Keep and normalize only parameters understood by ``encoder``."""
+    expected = set(encoder.state_dict())
+    normalized: Dict[str, torch.Tensor] = {}
+    for original_name, value in state.items():
+        name = original_name
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("module.", "model.", "teacher.", "student.", "backbone."):
+                if name.startswith(prefix):
+                    name = name[len(prefix) :]
+                    changed = True
+                    break
+
+        candidates = [name]
+        if ".attn.qkv.qkv." in name:
+            candidates.append(name.replace(".attn.qkv.qkv.", ".attn.qkv."))
+        elif ".attn.qkv." in name:
+            candidates.append(name.replace(".attn.qkv.", ".attn.qkv.qkv."))
+        for candidate in candidates:
+            if candidate in expected:
+                normalized[candidate] = value
+                break
+    return normalized
+
+
+def _build_custom_vit_base(
+    *,
+    repo_dir: Path,
+    ssl_architecture: bool,
+    with_lora: bool,
+    lora_rank: int,
+) -> nn.Module:
+    """Build the ViT-B variant used by a custom DINOv3 SSL checkpoint."""
+    repo_dir = Path(repo_dir)
+    if not repo_dir.is_dir():
+        raise FileNotFoundError(f"DINOv3 repo not found: {repo_dir}")
+    if str(repo_dir) not in sys.path:
+        sys.path.insert(0, str(repo_dir))
+
+    from dinov3.models.vision_transformer import vit_base
+
+    if ssl_architecture:
+        encoder = vit_base(
+            patch_size=16,
+            pos_embed_rope_base=100.0,
+            pos_embed_rope_normalize_coords="separate",
+            pos_embed_rope_dtype="bf16",
+            qkv_bias=True,
+            layerscale_init=1.0e-05,
+            norm_layer="layernorm",
+            ffn_layer="mlp",
+            ffn_bias=True,
+            proj_bias=True,
+            n_storage_tokens=0,
+            mask_k_bias=False,
+        )
+    else:
+        # Match the released ``dinov3_vitb16`` hub model for ordinary raw
+        # DINOv3 .pth files, while still loading the file ourselves.
+        encoder = vit_base(
+            patch_size=16,
+            pos_embed_rope_base=100.0,
+            pos_embed_rope_normalize_coords="separate",
+            pos_embed_rope_rescale_coords=2,
+            pos_embed_rope_dtype="fp32",
+            qkv_bias=True,
+            layerscale_init=1.0e-05,
+            norm_layer="layernormbf16",
+            ffn_layer="mlp",
+            ffn_bias=True,
+            proj_bias=True,
+            n_storage_tokens=4,
+            mask_k_bias=True,
+        )
+    if with_lora:
+        add_lora_to_vit(encoder, r=lora_rank)
+    return encoder
+
+
+def _resolve_dcp_checkpoint(path: Path) -> Path:
+    """Accept either one DCP directory or a DINOv3 ``ckpt`` parent."""
+    if (path / ".metadata").is_file():
+        return path
+    candidates = sorted(
+        (child for child in path.iterdir() if child.is_dir() and child.name.isdigit()),
+        key=lambda child: int(child.name),
+    )
+    if candidates and (candidates[-1] / ".metadata").is_file():
+        resolved = candidates[-1]
+        logger.info("Checkpoint directory contains multiple DCP steps; using latest: %s", resolved)
+        return resolved
+    raise ValueError(
+        f"No DINOv3 distributed checkpoint metadata found in directory: {path}"
+    )
+
+
+def _load_dcp_backbone(
+    encoder: nn.Module,
+    checkpoint_dir: Path,
+    *,
+    source_prefix: str,
+) -> int:
+    """Load only one backbone prefix from a DINOv3 DCP checkpoint."""
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.filesystem import FileSystemReader
+
+    state = {name: torch.empty_like(value) for name, value in encoder.state_dict().items()}
+    destination: Dict[str, object] = {"model": {}}
+    cursor: Dict[str, object] = destination["model"]  # type: ignore[assignment]
+    prefix_parts = source_prefix.removesuffix(".").split(".")
+    for part in prefix_parts[1:]:  # ``model`` is already the top-level key.
+        child: Dict[str, object] = {}
+        cursor[part] = child
+        cursor = child
+    cursor.update(state)
+
+    dcp.load(destination, storage_reader=FileSystemReader(checkpoint_dir))
+    loaded_state = cursor
+    assert isinstance(loaded_state, dict)
+    result = encoder.load_state_dict(loaded_state, strict=True)  # type: ignore[arg-type]
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError(
+            "Unexpected distributed-backbone load result: "
+            f"missing={result.missing_keys}, unexpected={result.unexpected_keys}"
+        )
+    return len(state)
+
+
+def _load_custom_dinov3_encoder(
+    *,
+    checkpoint: Path,
+    repo_dir: Path,
+    device: torch.device,
+    encoder_training: str,
+    lora_rank: int,
+) -> nn.Module:
+    """Load a ViT-B backbone from a regular or distributed custom checkpoint."""
+    if checkpoint.is_dir():
+        checkpoint = _resolve_dcp_checkpoint(checkpoint)
+        from torch.distributed.checkpoint.filesystem import FileSystemReader
+
+        metadata = FileSystemReader(checkpoint).read_metadata()
+        metadata_keys = set(metadata.state_dict_metadata)
+        prefixes = (
+            "model.teacher.backbone.",
+            "model.backbone.",
+        )
+        source_prefix = next(
+            (prefix for prefix in prefixes if any(key.startswith(prefix) for key in metadata_keys)),
+            None,
+        )
+        if source_prefix is None:
+            raise ValueError(
+                "Distributed checkpoint has no ViT backbone under the expected "
+                f"prefixes: {checkpoint}"
+            )
+        backbone_keys = [key for key in metadata_keys if key.startswith(source_prefix)]
+        has_lora = any(".w_a_" in key or ".w_b_" in key for key in backbone_keys)
+        has_storage_tokens = any(key.endswith(".storage_tokens") for key in backbone_keys)
+        checkpoint_lora_rank = next(
+            (
+                int(metadata.state_dict_metadata[key].size[0])
+                for key in backbone_keys
+                if key.endswith(".w_a_q.weight")
+            ),
+            lora_rank,
+        )
+        encoder = _build_custom_vit_base(
+            repo_dir=repo_dir,
+            ssl_architecture=not has_storage_tokens,
+            with_lora=has_lora,
+            lora_rank=checkpoint_lora_rank,
+        )
+        loaded_count = _load_dcp_backbone(
+            encoder, checkpoint, source_prefix=source_prefix.removesuffix(".")
+        )
+        logger.info(
+            "Loaded ViT-B teacher/backbone from distributed checkpoint %s (%d tensors); "
+            "discarded decoder, heads, losses, and optimizer",
+            checkpoint,
+            loaded_count,
+        )
+    else:
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Custom DINOv3 checkpoint not found: {checkpoint}")
+        loaded = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        state = _checkpoint_state_dict(loaded)
+        has_lora = any(".w_a_" in key or ".w_b_" in key for key in state)
+        has_storage_tokens = any(
+            key.removeprefix("module.").endswith("storage_tokens") for key in state
+        )
+        checkpoint_lora_rank = next(
+            (int(value.shape[0]) for key, value in state.items() if key.endswith(".w_a_q.weight")),
+            lora_rank,
+        )
+        encoder = _build_custom_vit_base(
+            repo_dir=repo_dir,
+            ssl_architecture=not has_storage_tokens,
+            with_lora=has_lora,
+            lora_rank=checkpoint_lora_rank,
+        )
+        backbone_state = _normalize_backbone_state(state, encoder)
+        if not backbone_state:
+            raise ValueError(f"No ViT-B backbone parameters found in checkpoint: {checkpoint}")
+        incompatible = encoder.load_state_dict(backbone_state, strict=False)
+        missing = [key for key in incompatible.missing_keys if key in encoder.state_dict()]
+        if missing:
+            raise ValueError(
+                f"Custom checkpoint is missing {len(missing)} ViT-B backbone tensors; "
+                f"first missing keys: {missing[:5]}"
+            )
+        logger.info(
+            "Loaded ViT-B backbone from regular checkpoint %s (%d tensors); "
+            "discarded non-backbone entries",
+            checkpoint,
+            len(backbone_state),
+        )
+
+    has_encoder_lora = any(
+        is_lora_parameter_name(name) for name, _ in encoder.named_parameters()
+    )
+    if encoder_training == "lora" and not has_encoder_lora:
+        add_lora_to_vit(encoder, r=lora_rank)
+    if encoder_training == "lora":
+        freeze_non_lora_parameters(encoder)
+    return encoder.to(device).eval()
+
+
 def is_lora_parameter_name(name: str) -> bool:
     return any(parameter_name in name for parameter_name in LORA_PARAMETER_NAMES)
 
@@ -1000,18 +1264,27 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         else None
     )
 
-    encoder = load_encoder(
-        args.encoder,
-        device=device,
-        weights=args.weights,
-        repo_dir=args.dinov3_repo,
-        model_name=args.model_name,
-    )
-    if args.encoder_training == "lora":
-        add_lora_to_vit(encoder, r=args.lora_r)
-        freeze_non_lora_parameters(encoder)
-        if args.freeze_epochs > 0:
-            set_lora_requires_grad(encoder, False)
+    if args.weights is not None and args.encoder == "dinov3":
+        encoder = _load_custom_dinov3_encoder(
+            checkpoint=Path(args.weights),
+            repo_dir=args.dinov3_repo,
+            device=device,
+            encoder_training=args.encoder_training,
+            lora_rank=args.lora_r,
+        )
+    else:
+        encoder = load_encoder(
+            args.encoder,
+            device=device,
+            weights=args.weights,
+            repo_dir=args.dinov3_repo,
+            model_name=args.model_name,
+        )
+        if args.encoder_training == "lora":
+            add_lora_to_vit(encoder, r=args.lora_r)
+            freeze_non_lora_parameters(encoder)
+    if args.encoder_training == "lora" and args.freeze_epochs > 0:
+        set_lora_requires_grad(encoder, False)
     model = MultiSliceDinoModel(
         encoder,
         n_slices=args.n_slices,
@@ -1514,7 +1787,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Encoder checkpoint. Defaults: dinov3 → opt/dinov3-weights/...; "
+            "Encoder checkpoint. For encoder=dinov3, a .pth file or DINOv3 "
+            "distributed-checkpoint directory loads only the ViT-B teacher "
+            "backbone. Defaults: dinov3 → opt/dinov3-weights/...; "
             "meddinov3 → opt/meddinov3/model.pth; "
             "braindino → opt/braindino/brain_dino_weights.pth"
         ),

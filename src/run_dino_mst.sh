@@ -17,4 +17,4 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python dino_mst.py --params-file /common/ganesanv/tlab/runs/mst_configs/adni/dinov3_lora.yaml
+python dino_mst.py --params-file /common/ganesanv/tlab/runs/mst_configs/adni/ssl_finetune_adni.yaml
