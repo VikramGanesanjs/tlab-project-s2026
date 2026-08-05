@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import sys
+from collections import deque
 from functools import partial
 from pathlib import Path
 
@@ -368,11 +369,26 @@ def build_data_loader_from_cfg(
             if key not in ("root", "extra", "split"):
                 raise ValueError(f"Unsupported ADNI dataset option {key!r}")
             dataset_kwargs[key] = value
+        requested_split = str(dataset_kwargs.pop("split", "TRAIN")).strip().upper()
+        if requested_split != "TRAIN":
+            raise ValueError(
+                "Continued pretraining only accepts the ADNI train split; "
+                f"received split={requested_split!r}"
+            )
         dataset = ADNI(
+            split="TRAIN",
+            split_seed=int(cfg.train.seed),
+            split_file=Path(cfg.train.output_dir).expanduser() / "adni_patient_splits.json",
             transform=model.build_data_augmentation_dino(cfg),
             target_transform=lambda _: (),
             **dataset_kwargs,
         )
+        split_file = Path(cfg.train.output_dir).expanduser() / "adni_patient_splits.json"
+        if not torch.distributed.is_initialized() or distributed.is_subgroup_main_process():
+            dataset.save_split_dictionary(split_file)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier(group=distributed.get_process_subgroup())
+        logger.info("ADNI continued pretraining uses only the train patients; splits saved to %s", split_file)
     else:
         dataset = make_dataset(
             dataset_str=dataset_path,
@@ -488,6 +504,11 @@ def do_train(cfg, model, resume=False):
     checkpoint_period = int(cfg.checkpointing.period)
     if checkpoint_period <= 0:
         raise ValueError(f"checkpointing.period must be positive, got {checkpoint_period}")
+    checkpoint_loss_window = int(cfg.checkpointing.get("loss_window_iterations", 100))
+    if checkpoint_loss_window <= 0:
+        raise ValueError(
+            f"checkpointing.loss_window_iterations must be positive, got {checkpoint_loss_window}"
+        )
     if cfg.multidistillation.enabled:
         global_batch_size = cfg.multidistillation.global_batch_size
     else:
@@ -524,6 +545,8 @@ def do_train(cfg, model, resume=False):
         num_gram_updates = math.ceil((start_iter + 1 - cfg.gram.it_first_update) / cfg.gram.update_frequency)
         logger.info(f"Gram was updated {num_gram_updates} times before iteration {start_iter}")
     consecutive_nan_count = 0
+    recent_losses = deque(maxlen=checkpoint_loss_window)
+    best_checkpoint_loss = math.inf
     for data in metric_logger.log_every(
         data_loader,
         print_freq=10,
@@ -584,6 +607,9 @@ def do_train(cfg, model, resume=False):
             group=distributed.get_process_subgroup(),
         )
         total_loss = total_loss_all_ranks.mean()
+        total_loss_value = (
+            total_loss.full_tensor().item() if isinstance(total_loss, DTensor) else total_loss.detach().item()
+        )
         metrics_values = torch.stack(
             [torch.as_tensor(v, dtype=torch.float32, device=total_loss.device).detach() for v in metrics_dict.values()]
         )
@@ -606,6 +632,8 @@ def do_train(cfg, model, resume=False):
                 raise RuntimeError(msg)
         else:
             consecutive_nan_count = 0
+            if math.isfinite(total_loss_value):
+                recent_losses.append(total_loss_value)
         # Step optimizer
         optimizer.step()
         model.update_ema(mom)
@@ -640,19 +668,47 @@ def do_train(cfg, model, resume=False):
 
         # Checkpointing
         if (iteration + 1) % checkpoint_period == 0:
-            torch.cuda.synchronize()
-            save_checkpoint(
-                ckpt_dir / str(iteration),
-                iteration=iteration,
-                model=model,
-                optimizer=optimizer,
-                overwrite=True,
-                process_group=process_subgroup,
-            )
-            if distributed.is_subgroup_main_process():
-                keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
-                if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
-                    keep_checkpoint_copy(ckpt_dir / str(iteration))
+            if len(recent_losses) < checkpoint_loss_window:
+                logger.info(
+                    "Skipping checkpoint at iteration %d: only %d/%d recent finite losses are available",
+                    iteration,
+                    len(recent_losses),
+                    checkpoint_loss_window,
+                )
+            else:
+                recent_loss = sum(recent_losses) / len(recent_losses)
+                if recent_loss < best_checkpoint_loss:
+                    logger.info(
+                        "Saving checkpoint at iteration %d: recent %d-iteration loss %.6f "
+                        "(previous best %.6f)",
+                        iteration,
+                        checkpoint_loss_window,
+                        recent_loss,
+                        best_checkpoint_loss,
+                    )
+                    torch.cuda.synchronize()
+                    save_checkpoint(
+                        ckpt_dir / str(iteration),
+                        iteration=iteration,
+                        model=model,
+                        optimizer=optimizer,
+                        overwrite=True,
+                        process_group=process_subgroup,
+                    )
+                    best_checkpoint_loss = recent_loss
+                    if distributed.is_subgroup_main_process():
+                        keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
+                        if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
+                            keep_checkpoint_copy(ckpt_dir / str(iteration))
+                else:
+                    logger.info(
+                        "Skipping checkpoint at iteration %d: recent %d-iteration loss %.6f "
+                        "is not below previous best %.6f",
+                        iteration,
+                        checkpoint_loss_window,
+                        recent_loss,
+                        best_checkpoint_loss,
+                    )
 
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()

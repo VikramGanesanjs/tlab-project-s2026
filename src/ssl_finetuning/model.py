@@ -1,14 +1,5 @@
-"""Slice-pair self-supervised fine-tuning for DINOv3.
-
-The implementation keeps the DINOv3 backbone/head conventions used by the
-local repository, but changes the training graph to operate on two nearby
-slices from the same volume:
-
-* clean teacher features are computed for both slices;
-* masked student features are computed for both slices;
-* DINO loss compares within-slice local views (when supplied) and the two
-  global views cross-slice;
-* the cross-view decoder uses the other slice as context for iBOT completion.
+"""
+Adapted from DINOv3 SSLMetaArch script
 """
 
 from __future__ import annotations
@@ -47,6 +38,8 @@ from dinov3.utils import count_parameters
 from utils import DecoderBlock
 
 logger = logging.getLogger("dinov3")
+
+_LORA_MARKERS = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
 
 def _rotate_half(x: Tensor) -> Tensor:
@@ -347,11 +340,27 @@ class SSLFineTune(nn.Module):
 
     def _copy_student_to_teacher(self) -> None:
         student_state = self.student.state_dict()
-        teacher_state = {
-            name: student_state[name]
-            for name in self.teacher.state_dict()
-            if name in student_state
-        }
+        teacher_state = self.teacher.state_dict()
+        missing = sorted(name for name in teacher_state if name not in student_state)
+        if missing:
+            raise RuntimeError(
+                "Teacher has parameters/buffers missing from the student state: "
+                + ", ".join(missing[:8])
+            )
+        if self.lora_enabled:
+            student_lora_names = {
+                name for name in student_state if any(marker in name for marker in _LORA_MARKERS)
+            }
+            teacher_lora_names = {
+                name for name in teacher_state if any(marker in name for marker in _LORA_MARKERS)
+            }
+            if student_lora_names != teacher_lora_names:
+                raise RuntimeError(
+                    "Student and teacher LoRA state names do not match: "
+                    f"student_only={sorted(student_lora_names - teacher_lora_names)[:8]}, "
+                    f"teacher_only={sorted(teacher_lora_names - student_lora_names)[:8]}"
+                )
+        teacher_state = {name: student_state[name] for name in teacher_state}
         self.teacher.load_state_dict(teacher_state, strict=True)
 
     def _load_pretrained_backbone(self, checkpoint: str) -> None:
@@ -981,7 +990,13 @@ class SSLFineTune(nn.Module):
 
     @torch.no_grad()
     def update_ema(self, momentum: float) -> None:
-        """EMA only the student heads and any explicitly named LoRA weights."""
+        """EMA student heads and LoRA weights using stable parameter names.
+
+        The pretrained base backbone is frozen when LoRA is enabled and is
+        intentionally excluded. Name matching is required because inserting
+        LoRA wrappers changes the module structure and makes positional
+        parameter pairing unsafe.
+        """
         student_named = dict(self.student.named_parameters())
         teacher_named = dict(self.teacher.named_parameters())
         if self.ema_params_lists is None:
@@ -989,10 +1004,32 @@ class SSLFineTune(nn.Module):
             teacher_params: list[nn.Parameter] = []
             for name, student_param in student_named.items():
                 is_head = name.startswith(("dino_head.", "ibot_head."))
-                is_lora = any(token in name.lower() for token in ("lora", "w_a_", "w_b_"))
-                if (is_head or is_lora) and name in teacher_named:
-                    student_params.append(student_param)
-                    teacher_params.append(teacher_named[name])
+                is_lora = any(marker in name for marker in _LORA_MARKERS)
+                if not (is_head or is_lora):
+                    continue
+                teacher_param = teacher_named.get(name)
+                if teacher_param is None:
+                    raise RuntimeError(
+                        "EMA teacher is missing student parameter: " + name
+                    )
+                student_params.append(student_param)
+                teacher_params.append(teacher_param)
+
+            if self.lora_enabled:
+                student_lora_names = {
+                    name for name in student_named if any(marker in name for marker in _LORA_MARKERS)
+                }
+                teacher_lora_names = {
+                    name for name in teacher_named if any(marker in name for marker in _LORA_MARKERS)
+                }
+                missing_lora = sorted(student_lora_names - teacher_lora_names)
+                extra_lora = sorted(teacher_lora_names - student_lora_names)
+                if missing_lora or extra_lora:
+                    raise RuntimeError(
+                        "Student and teacher LoRA parameters do not match: "
+                        f"missing_in_teacher={missing_lora[:8]}, "
+                        f"extra_in_teacher={extra_lora[:8]}"
+                    )
             self.ema_params_lists = (student_params, teacher_params)
 
         student_params, teacher_params = self.ema_params_lists

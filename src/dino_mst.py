@@ -9,7 +9,7 @@ import math
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -882,6 +882,70 @@ def _held_out_counts(
     return n_val, n_test
 
 
+_SPLIT_NAMES = ("train", "val", "test")
+
+
+def _load_patient_split_assignments(
+    splits_file: Path,
+    available_patient_ids: Sequence[str],
+) -> Dict[str, str]:
+    """Load saved patient assignments, ignoring patients absent from this dataset.
+
+    Shared ADNI split files can contain patients from diagnoses that are not part
+    of the current ``--adni-task``.  The dataset has already filtered those
+    diagnoses, so only assignments for patients present in the current dataset
+    are retained.
+    """
+    path = Path(splits_file).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Patient splits file not found: {path}")
+
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"Patient splits file must contain a JSON object: {path}")
+
+    split_lists = payload.get("splits", payload)
+    if not isinstance(split_lists, Mapping):
+        raise ValueError(f"Patient splits file is missing a 'splits' mapping: {path}")
+
+    assignments: Dict[str, str] = {}
+    for split in _SPLIT_NAMES:
+        patients = split_lists.get(split, [])
+        if not isinstance(patients, list):
+            raise ValueError(
+                f"Patient splits file entry {split!r} must be a list: {path}"
+            )
+        for raw_patient_id in patients:
+            patient_id = str(raw_patient_id)
+            if patient_id in assignments:
+                raise ValueError(
+                    f"Patient {patient_id!r} occurs in multiple saved splits: {path}"
+                )
+            assignments[patient_id] = split
+
+    available = {str(patient_id) for patient_id in available_patient_ids}
+    missing = sorted(available - set(assignments))
+    if missing:
+        raise ValueError(
+            "Patient splits file is missing patients from the current dataset: "
+            f"{missing[:5]}" + (" ..." if len(missing) > 5 else "")
+        )
+
+    ignored = sorted(set(assignments) - available)
+    if ignored:
+        logger.info(
+            "Loaded patient splits from %s; ignoring %d patients not present "
+            "in the current dataset (likely excluded diagnoses)",
+            path,
+            len(ignored),
+        )
+    else:
+        logger.info("Loaded patient splits from %s", path)
+
+    return {patient_id: assignments[patient_id] for patient_id in available}
+
+
 def patient_level_split(
     dataset: MultiSliceDataset,
     *,
@@ -890,6 +954,7 @@ def patient_level_split(
     seed: int,
     get_stratum: Callable[[Any, int], Optional[int]],
     unit_name: str = "samples",
+    splits_file: Optional[Path] = None,
 ) -> Tuple[Subset, Optional[Subset], Optional[Subset]]:
     """Split samples by patient into train / validation / test with optional stratification.
 
@@ -903,40 +968,55 @@ def patient_level_split(
         raise ValueError(
             f"val_frac + test_frac must be < 1, got {val_frac} + {test_frac}"
         )
-    if val_frac == 0 and test_frac == 0:
+    if val_frac == 0 and test_frac == 0 and splits_file is None:
         return Subset(dataset, list(range(len(dataset)))), None, None
 
     patient_indices: Dict[str, List[int]] = defaultdict(list)
     strata: Dict[str, Optional[int]] = {}
     for index in range(len(dataset)):
-        patient_id = dataset.get_patient_id(index)
+        patient_id = str(dataset.get_patient_id(index))
         patient_indices[patient_id].append(index)
         if patient_id not in strata:
             strata[patient_id] = get_stratum(dataset, index)
 
-    rng = np.random.RandomState(seed)
-    grouped: Dict[Optional[int], List[str]] = defaultdict(list)
-    for patient_id in patient_indices:
-        grouped[strata.get(patient_id)].append(patient_id)
+    if splits_file is not None:
+        assignments = _load_patient_split_assignments(
+            splits_file,
+            list(patient_indices),
+        )
+        train_patients = sorted(
+            patient_id for patient_id, split in assignments.items() if split == "train"
+        )
+        val_patients = sorted(
+            patient_id for patient_id, split in assignments.items() if split == "val"
+        )
+        test_patients = sorted(
+            patient_id for patient_id, split in assignments.items() if split == "test"
+        )
+    else:
+        rng = np.random.RandomState(seed)
+        grouped: Dict[Optional[int], List[str]] = defaultdict(list)
+        for patient_id in patient_indices:
+            grouped[strata.get(patient_id)].append(patient_id)
 
-    train_patients: List[str] = []
-    val_patients: List[str] = []
-    test_patients: List[str] = []
-    for stratum, patients in grouped.items():
-        rng.shuffle(patients)
-        n_val, n_test = _held_out_counts(
-            len(patients), val_frac=val_frac, test_frac=test_frac
-        )
-        test_patients.extend(patients[:n_test])
-        val_patients.extend(patients[n_test : n_test + n_val])
-        train_patients.extend(patients[n_test + n_val :])
-        logger.info(
-            "patient split stratum=%s train=%d val=%d test=%d",
-            stratum,
-            len(patients) - n_val - n_test,
-            n_val,
-            n_test,
-        )
+        train_patients = []
+        val_patients = []
+        test_patients = []
+        for stratum, patients in grouped.items():
+            rng.shuffle(patients)
+            n_val, n_test = _held_out_counts(
+                len(patients), val_frac=val_frac, test_frac=test_frac
+            )
+            test_patients.extend(patients[:n_test])
+            val_patients.extend(patients[n_test : n_test + n_val])
+            train_patients.extend(patients[n_test + n_val :])
+            logger.info(
+                "patient split stratum=%s train=%d val=%d test=%d",
+                stratum,
+                len(patients) - n_val - n_test,
+                n_val,
+                n_test,
+            )
 
     train_indices = [
         index for patient_id in train_patients for index in patient_indices[patient_id]
@@ -1178,6 +1258,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         seed=args.seed,
         get_stratum=get_stratum,
         unit_name=unit_name,
+        splits_file=args.splits_file,
     )
     val_dataset: Optional[Subset] = None
     test_dataset: Optional[Subset] = None
@@ -1725,6 +1806,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "Patient-level held-out test fraction (never used for training or "
             "early stopping). Defaults to --val-frac"
+        ),
+    )
+    parser.add_argument(
+        "--splits-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON file containing saved patient IDs under train, val, "
+            "and test; patients absent from the current dataset are ignored"
         ),
     )
     parser.add_argument("--seed", type=int, default=0)

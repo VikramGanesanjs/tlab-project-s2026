@@ -334,6 +334,10 @@ class DukeBreastMRIDataset(VisionDataset):
     def __len__(self) -> int:
         return len(self._entries)
 
+    def get_patient_id(self, index: int) -> str:
+        """Return the patient identifier for patient-level dataset splits."""
+        return self._entries[index][0]
+
     def get_target(self, index: int) -> np.ndarray:
         pid = self._entries[index][0]
         entry = self._phenotypes.get(pid)

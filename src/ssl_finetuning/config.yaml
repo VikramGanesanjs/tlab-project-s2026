@@ -33,6 +33,12 @@ train:
   compile: true
   cudagraphs: false
   sharded_eval_checkpoint: false
+data_split:
+  train_fraction: 0.70
+  val_fraction: 0.15
+  test_fraction: 0.15
+  seed: null
+  file: null
 student:
   arch: vit_base
   patch_size: 16
@@ -72,8 +78,8 @@ optim:
   epochs: 100
   weight_decay: 0.04
   weight_decay_end: 0.4
-  lr: 0.003
-  warmup_epochs: 2
+  lr: 0.001
+  warmup_epochs: 0.2
   min_lr: 1.0e-06
   schedule_trunc_extra: 0.0
   clip_grad: 3.0
@@ -82,7 +88,7 @@ optim:
   dino_head_wd_multiplier: 1.0
   layerwise_decay: 0.9
   multi_tensor_optim: true
-  freeze_backbone_epochs: 0.2
+  freeze_backbone_epochs: 0.4
   adamw_beta1: 0.9
   adamw_beta2: 0.999
 crops:

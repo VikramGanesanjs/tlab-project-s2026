@@ -23,11 +23,35 @@ from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
 
-from vit_lora import add_lora_to_vit, freeze_non_lora_parameters, init_lora_parameters
+from vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters, init_lora_parameters
 
 LORA_MARKERS = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
 logger = logging.getLogger("dinov3")
+
+
+def _add_lora_with_unfrozen_tail(model: nn.Module, rank: int, unfreeze_last_layers: int) -> None:
+    """Attach LoRA except for the fully trainable final backbone blocks."""
+    n_blocks = len(model.blocks)
+    if not 0 <= unfreeze_last_layers <= n_blocks:
+        raise ValueError(
+            f"unfreeze_last_layers must be between 0 and {n_blocks}, got {unfreeze_last_layers}"
+        )
+
+    # Use the shared LoRA implementation, then restore the original QKV
+    # module in the final blocks. This leaves no LoRA parameters in those
+    # blocks and preserves vanilla checkpoint parameter names for their full
+    # weights.
+    add_lora_to_vit(model, rank)
+    for block in model.blocks[-unfreeze_last_layers:] if unfreeze_last_layers else ():
+        if not isinstance(block.attn.qkv, LoRA):
+            raise TypeError("Expected LoRA-wrapped QKV while restoring the unfrozen tail")
+        block.attn.qkv = block.attn.qkv.qkv
+
+
+def _unfreeze_backbone_tail(model: nn.Module, unfreeze_last_layers: int) -> None:
+    if unfreeze_last_layers:
+        model.blocks[-unfreeze_last_layers:].requires_grad_(True)
 
 
 class SSLMetaArch(nn.Module):
@@ -56,11 +80,27 @@ class SSLMetaArch(nn.Module):
         student_backbone, teacher_backbone, embed_dim = build_model_from_cfg(cfg)
         self.lora_r = int(getattr(cfg, "lora_r", 0))
         self.lora_enabled = self.lora_r > 0
+        self.unfreeze_last_layers = int(getattr(cfg, "unfreeze_last_layers", 0))
+        if self.unfreeze_last_layers < 0:
+            raise ValueError(f"unfreeze_last_layers must be non-negative, got {self.unfreeze_last_layers}")
+        if self.unfreeze_last_layers > len(student_backbone.blocks):
+            raise ValueError(
+                f"unfreeze_last_layers must be no greater than the number of backbone blocks "
+                f"({len(student_backbone.blocks)}), got {self.unfreeze_last_layers}"
+            )
         if self.lora_enabled:
-            add_lora_to_vit(student_backbone, self.lora_r)
-            add_lora_to_vit(teacher_backbone, self.lora_r)
+            _add_lora_with_unfrozen_tail(student_backbone, self.lora_r, self.unfreeze_last_layers)
+            _add_lora_with_unfrozen_tail(teacher_backbone, self.lora_r, self.unfreeze_last_layers)
             freeze_non_lora_parameters(student_backbone)
             freeze_non_lora_parameters(teacher_backbone)
+            _unfreeze_backbone_tail(student_backbone, self.unfreeze_last_layers)
+            logger.info(
+                "LoRA enabled with rank=%d; fully unfrozen student backbone tail blocks=%d",
+                self.lora_r,
+                self.unfreeze_last_layers,
+            )
+        elif self.unfreeze_last_layers:
+            _unfreeze_backbone_tail(student_backbone, self.unfreeze_last_layers)
         torch.cuda.empty_cache()
         gc.collect()
         gram_backbone, _ = build_model_from_cfg(cfg, only_teacher=True)
@@ -737,11 +777,12 @@ class SSLMetaArch(nn.Module):
                     continue
 
                 # The ordinary backbone is frozen when LoRA is enabled. EMA
-                # only the parameters that can actually be trained, while
-                # retaining the usual all-parameter behavior for vanilla
-                # DINOv3 training. Name matching is important here: positional
-                # zipping can silently pair the wrong parameters after a
-                # wrapper such as LoRA is inserted into the backbone.
+                # the LoRA parameters and any fully unfrozen parameters (the
+                # optional final backbone blocks), while retaining the usual
+                # all-parameter behavior for vanilla DINOv3 training. Name
+                # matching is important here: positional zipping can silently
+                # pair the wrong parameters after a wrapper such as LoRA is
+                # inserted into the backbone.
                 if self.lora_enabled and not (
                     student_param.requires_grad or any(marker in name for marker in LORA_MARKERS)
                 ):

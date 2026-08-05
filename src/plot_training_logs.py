@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot training metrics from DINOv3-style log files.
+"""Plot training metrics from DINOv3 logs or JSONL metric files.
 
 The training logger writes records like::
 
@@ -13,14 +13,14 @@ Examples
 python src/plot_training_logs.py runs/continued_pretraining/adni/5353170_0_log.out
 
 python src/plot_training_logs.py \
-    runs/continued_pretraining/adni/5353170_0_log.out \
-    runs/ssl_finetuning/adni_vitb16/5334042/5334042_0_log.out \
-    --output runs/training_curves.png --value average
+    runs/continued_pretraining/adni-fixed/training_metrics.json \
+    --output runs/training_curves.png --smooth 5 --no-show
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +47,8 @@ class ParsedLog:
     def label(self) -> str:
         """A short label suitable for a plot legend."""
 
+        if self.path.stem == "training_metrics":
+            return self.path.parent.name
         return self.path.stem.removesuffix("_log")
 
 
@@ -89,6 +91,49 @@ def parse_log(path: str | Path) -> ParsedLog:
         raise ValueError(f"No training records found in {path}")
 
     return ParsedLog(path=path, iterations=iterations, values=values)
+
+
+def parse_metrics_json(path: str | Path) -> ParsedLog:
+    """Parse newline-delimited JSON records written by ``MetricLogger``."""
+
+    path = Path(path)
+    iterations: list[int] = []
+    values: list[dict[str, tuple[float, float | None]]] = []
+
+    with path.open(encoding="utf-8") as metrics_file:
+        for line_number, line in enumerate(metrics_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON on line {line_number} of {path}") from error
+            if not isinstance(record, dict) or "iteration" not in record:
+                raise ValueError(f"Expected an object with an iteration on line {line_number} of {path}")
+
+            metrics: dict[str, tuple[float, float | None]] = {}
+            for key, value in record.items():
+                if key == "iteration" or isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                metrics[key] = (float(value), None)
+
+            if metrics:
+                iterations.append(int(record["iteration"]))
+                values.append(metrics)
+
+    if not iterations:
+        raise ValueError(f"No metric records found in {path}")
+
+    return ParsedLog(path=path, iterations=iterations, values=values)
+
+
+def parse_input(path: str | Path) -> ParsedLog:
+    """Parse a legacy text log or a newline-delimited JSON metrics file."""
+
+    path = Path(path)
+    if path.suffix.lower() in {".json", ".jsonl"}:
+        return parse_metrics_json(path)
+    return parse_log(path)
 
 
 def _metric_names(logs: Iterable[ParsedLog], kind: str) -> list[str]:
@@ -246,7 +291,7 @@ def plot_logs(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("logs", nargs="+", type=Path, help="Training log files")
+    parser.add_argument("logs", nargs="+", type=Path, help="Training logs or JSONL metric files")
     parser.add_argument(
         "-o",
         "--output",
@@ -258,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--value",
         choices=("current", "average"),
         default="current",
-        help="Plot per-iteration values or values in parentheses (default: current)",
+        help="Plot per-iteration values or legacy log averages in parentheses (default: current)",
     )
     parser.add_argument(
         "--smooth",
@@ -283,7 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    logs = [parse_log(path) for path in args.logs]
+    logs = [parse_input(path) for path in args.logs]
     for log in logs:
         print(f"Parsed {log.path}: {len(log.iterations)} training records")
     plot_logs(

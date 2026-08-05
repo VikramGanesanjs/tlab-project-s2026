@@ -20,6 +20,6 @@ python -m dinov3.run.submit \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \
-  --output-dir "${PROJECT_ROOT}/runs/ssl_finetuning/adni_vitb16/%j" \
+  --output-dir "${PROJECT_ROOT}/runs/ssl_finetuning/adni_vitb16_fixed" \
   "${PROJECT_ROOT}/src/ssl_finetuning/train.py" \
   --config-file "${PROJECT_ROOT}/src/ssl_finetuning/config.yaml"

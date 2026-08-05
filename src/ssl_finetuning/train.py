@@ -5,10 +5,12 @@
 
 import argparse
 import gc
+import json
 import logging
 import math
 import os
 import sys
+from collections import deque
 from pathlib import Path
 
 _MODULE_DIR = Path(__file__).resolve().parent
@@ -42,6 +44,11 @@ from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosi
 from datasets.adni import ADNIPairedSliceDataset, DEFAULT_ROOT as ADNI_DEFAULT_ROOT
 from datasets.duke import DukeBreastMRIDataset, PairToDinoGlobalCrops
 from datasets.duke.dataset import _DEFAULT_OUT_ROOT as DUKE_DEFAULT_ROOT
+
+try:
+    from .splits import patient_level_stratified_split, save_patient_split
+except ImportError:  # Support direct execution: python src/ssl_finetuning/train.py
+    from splits import patient_level_stratified_split, save_patient_split
 
 try:
     from .model import SSLFineTune
@@ -166,6 +173,43 @@ def build_optimizer(cfg, params_groups):
     return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
 
+_CHECKPOINT_LOSS_WINDOW = 100
+
+
+def _load_checkpoint_loss_state(checkpoint_dir):
+    """Restore rolling-loss state saved beside the latest checkpoint."""
+    state_path = Path(checkpoint_dir) / "rolling_loss_state.json"
+    if not state_path.is_file():
+        return deque(maxlen=_CHECKPOINT_LOSS_WINDOW), math.inf
+    try:
+        with state_path.open(encoding="utf-8") as handle:
+            state = json.load(handle)
+        values = [float(value) for value in state.get("loss_window", [])]
+        values = values[-_CHECKPOINT_LOSS_WINDOW:]
+        lowest = float(state.get("lowest_average_loss", math.inf))
+        if not math.isfinite(lowest) and lowest != math.inf:
+            raise ValueError("lowest_average_loss is not finite")
+        return deque(values, maxlen=_CHECKPOINT_LOSS_WINDOW), lowest
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Could not restore checkpoint loss state from %s: %s", state_path, exc)
+        return deque(maxlen=_CHECKPOINT_LOSS_WINDOW), math.inf
+
+
+def _save_checkpoint_loss_state(checkpoint_dir, loss_window, lowest_average_loss):
+    """Save rolling-loss state beside an accepted checkpoint."""
+    state_path = Path(checkpoint_dir) / "rolling_loss_state.json"
+    temporary_path = state_path.with_name(f".{state_path.name}.tmp")
+    state = {
+        "window_size": _CHECKPOINT_LOSS_WINDOW,
+        "loss_window": list(loss_window),
+        "lowest_average_loss": float(lowest_average_loss),
+    }
+    with temporary_path.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+        handle.write("\n")
+    temporary_path.replace(state_path)
+
+
 def _delayed_lora_schedule(
     *,
     peak_value,
@@ -242,11 +286,21 @@ def build_schedulers(cfg, iterations_per_epoch):
         total_iters=total_iterations,
         trunc_extra=cfg.optim["schedule_trunc_extra"],
     )
+    teacher_warmup_iterations = _epochs_to_iterations(
+        cfg.teacher["warmup_teacher_temp_epochs"],
+        iterations_per_epoch,
+        field_name="teacher.warmup_teacher_temp_epochs",
+    )
+    lora_warmup_iterations = _epochs_to_iterations(
+        cfg.optim["warmup_epochs"],
+        iterations_per_epoch,
+        field_name="optim.warmup_epochs",
+    )
     teacher_temp = dict(
         base_value=cfg.teacher["teacher_temp"],
         final_value=cfg.teacher["teacher_temp"],
-        total_iters=cfg.teacher["warmup_teacher_temp_epochs"] * iterations_per_epoch,
-        warmup_iters=cfg.teacher["warmup_teacher_temp_epochs"] * iterations_per_epoch,
+        total_iters=teacher_warmup_iterations,
+        warmup_iters=teacher_warmup_iterations,
         start_warmup_value=cfg.teacher["warmup_teacher_temp"],
     )
 
@@ -256,7 +310,7 @@ def build_schedulers(cfg, iterations_per_epoch):
         final_value=cfg.optim["min_lr"],
         total_iterations=total_iterations,
         freeze_iterations=freeze_iterations,
-        warmup_iterations=cfg.optim["warmup_epochs"] * iterations_per_epoch,
+        warmup_iterations=lora_warmup_iterations,
         trunc_extra=cfg.optim["schedule_trunc_extra"],
     )
     wd_schedule = CosineScheduler(**wd)
@@ -284,7 +338,26 @@ def build_schedulers_v2(cfg, iterations_per_epoch):
         iterations_per_epoch,
         field_name="optim.freeze_backbone_epochs",
     )
-    lora_warmup_iterations = iter_per_epoch * cfg.schedules.lr.warmup_epochs
+    lora_warmup_iterations = _epochs_to_iterations(
+        cfg.schedules.lr.warmup_epochs,
+        iter_per_epoch,
+        field_name="schedules.lr.warmup_epochs",
+    )
+    weight_decay_warmup_iterations = _epochs_to_iterations(
+        cfg.schedules.weight_decay.warmup_epochs,
+        iter_per_epoch,
+        field_name="schedules.weight_decay.warmup_epochs",
+    )
+    momentum_warmup_iterations = _epochs_to_iterations(
+        cfg.schedules.momentum.warmup_epochs,
+        iter_per_epoch,
+        field_name="schedules.momentum.warmup_epochs",
+    )
+    teacher_temp_warmup_iterations = _epochs_to_iterations(
+        cfg.schedules.teacher_temp.warmup_epochs,
+        iter_per_epoch,
+        field_name="schedules.teacher_temp.warmup_epochs",
+    )
     if freeze_iterations >= total_iterations:
         raise ValueError(
             "freeze_backbone_epochs must be shorter than the total training run"
@@ -343,7 +416,7 @@ def build_schedulers_v2(cfg, iterations_per_epoch):
         start=cfg.schedules.weight_decay.start,
         peak=cfg.schedules.weight_decay.peak,
         end=cfg.schedules.weight_decay.end,
-        warmup_iterations=iter_per_epoch * cfg.schedules.weight_decay.warmup_epochs,
+        warmup_iterations=weight_decay_warmup_iterations,
         total_iterations=total_iterations,
         cosine_iterations=(
             iter_per_epoch * cfg.schedules.weight_decay.cosine_epochs
@@ -355,7 +428,7 @@ def build_schedulers_v2(cfg, iterations_per_epoch):
         start=cfg.schedules.momentum.start,
         peak=cfg.schedules.momentum.peak,
         end=cfg.schedules.momentum.end,
-        warmup_iterations=iter_per_epoch * cfg.schedules.momentum.warmup_epochs,
+        warmup_iterations=momentum_warmup_iterations,
         total_iterations=total_iterations,
         cosine_iterations=(
             iter_per_epoch * cfg.schedules.momentum.cosine_epochs if "cosine_epochs" in cfg.schedules.momentum else None
@@ -365,7 +438,7 @@ def build_schedulers_v2(cfg, iterations_per_epoch):
         start=cfg.schedules.teacher_temp.start,
         peak=cfg.schedules.teacher_temp.peak,
         end=cfg.schedules.teacher_temp.end,
-        warmup_iterations=iter_per_epoch * cfg.schedules.teacher_temp.warmup_epochs,
+        warmup_iterations=teacher_temp_warmup_iterations,
         total_iterations=total_iterations,
         cosine_iterations=(
             iter_per_epoch * cfg.schedules.teacher_temp.cosine_epochs
@@ -419,6 +492,91 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
         logger.info("Saved eval checkpoint: %s", ckpt_path)
 
 
+def _duke_patient_split_stratum(dataset, index):
+    """Stratify Duke patients by laterality/bilateral phenotype."""
+    raw = dataset.get_phenotype_raw(index)
+    bilateral = raw.get("bilateral")
+    if bilateral is not None and str(bilateral).strip().upper() in {
+        "1",
+        "1.0",
+        "TRUE",
+        "YES",
+        "BILATERAL",
+    }:
+        return 2
+    location = raw.get("tumor_location")
+    if location is None:
+        return None
+    normalized = str(location).strip().upper()
+    if normalized in {"L", "LEFT", "0", "0.0"}:
+        return 0
+    if normalized in {"R", "RIGHT", "1", "1.0"}:
+        return 1
+    return None
+
+
+def _adni_patient_split_stratum(dataset, index):
+    """Stratify ADNI patients by the selected diagnosis task."""
+    # ADNIPairedSliceDataset.get_target() returns its configured phenotype
+    # vector (Group/Sex/Age), not a scalar diagnosis label. Use the raw Group
+    # field so this remains valid for every phenotype-column configuration.
+    raw = dataset.get_phenotype_raw(index)
+    diagnosis = str(raw.get("Group", "")).strip().upper()
+    return {"CN": 0, "MCI": 1, "AD": 2}.get(diagnosis)
+
+
+def _build_train_patient_subset(cfg, dataset, dataset_name):
+    split_cfg = cfg.get("data_split", {})
+    train_fraction = float(split_cfg.get("train_fraction", 0.70))
+    val_fraction = float(split_cfg.get("val_fraction", 0.15))
+    test_fraction = float(split_cfg.get("test_fraction", 0.15))
+    split_seed = split_cfg.get("seed")
+    split_seed = cfg.train.seed if split_seed is None else int(split_seed)
+
+    configured_path = split_cfg.get("file")
+    if configured_path:
+        split_path = Path(configured_path).expanduser()
+        if not split_path.is_absolute():
+            split_path = Path(cfg.train.output_dir).expanduser() / split_path
+    else:
+        split_path = Path(cfg.train.output_dir).expanduser() / f"{dataset_name}_patient_splits.json"
+
+    stratum_fn = (
+        _adni_patient_split_stratum
+        if dataset_name == "adni"
+        else _duke_patient_split_stratum
+    )
+    train_dataset, metadata = patient_level_stratified_split(
+        dataset,
+        dataset_name=dataset_name,
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        seed=split_seed,
+        stratum_fn=stratum_fn,
+        split_file=split_path,
+    )
+
+    # Every rank computes the same split. Only rank 0 writes it, then all
+    # ranks wait so workers cannot observe a partially written split file.
+    is_main_process = (
+        not torch.distributed.is_initialized() or distributed.is_subgroup_main_process()
+    )
+    if not split_path.is_file() and is_main_process:
+        save_patient_split(split_path, metadata)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier(group=distributed.get_process_subgroup())
+
+    logger.info(
+        "Fine-tuning uses only the patient train split: %d samples; "
+        "validation/test samples are reserved (%d/%d samples)",
+        metadata["sample_counts"]["train"],
+        metadata["sample_counts"]["val"],
+        metadata["sample_counts"]["test"],
+    )
+    return train_dataset
+
+
 def build_data_loader_from_cfg(
     cfg,
     model,
@@ -451,6 +609,7 @@ def build_data_loader_from_cfg(
     else:
         raise ValueError(f"Unknown paired dataset={dataset_name!r}; expected 'adni' or 'duke'")
 
+    dataset = _build_train_patient_subset(cfg, dataset, dataset_name)
     pair_transform = PairToDinoGlobalCrops(model.build_data_augmentation_dino(cfg))
 
     batch_size = cfg.train.batch_size_per_gpu
@@ -528,6 +687,8 @@ def do_train(cfg, model, resume=False):
     # Optimizer
     optimizer = build_optimizer(cfg, model.get_params_groups())
     start_iter = 0
+    loss_window = deque(maxlen=_CHECKPOINT_LOSS_WINDOW)
+    lowest_average_loss = math.inf
     if resume and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
         start_iter = (
@@ -539,6 +700,13 @@ def do_train(cfg, model, resume=False):
                 process_group=process_subgroup,
             )
             + 1
+        )
+        loss_window, lowest_average_loss = _load_checkpoint_loss_state(last_checkpoint_dir)
+        logger.info(
+            "Restored checkpoint loss tracking: window=%d/%d lowest_average_loss=%s",
+            len(loss_window),
+            _CHECKPOINT_LOSS_WINDOW,
+            "unset" if lowest_average_loss == math.inf else f"{lowest_average_loss:.6f}",
         )
 
     # The paired dataset is finite, but its sampler is intentionally infinite.
@@ -606,12 +774,21 @@ def do_train(cfg, model, resume=False):
         "%d iterations, then warms to the configured peak over %d iterations",
         float(lr_schedule[0]),
         freeze_backbone_iters,
-        cfg.optim.warmup_epochs * iterations_per_epoch,
+        _epochs_to_iterations(
+            cfg.optim.warmup_epochs,
+            iterations_per_epoch,
+            field_name="optim.warmup_epochs",
+        ),
     )
     logger.info(
-        "Schedule settings: LoRA warmup=%d epochs; freeze LoRA=%.3f epochs "
-        "(%d iterations)",
+        "Schedule settings: LoRA warmup=%.3f epochs (%d iterations); "
+        "freeze LoRA=%.3f epochs (%d iterations)",
         cfg.optim.warmup_epochs,
+        _epochs_to_iterations(
+            cfg.optim.warmup_epochs,
+            iterations_per_epoch,
+            field_name="optim.warmup_epochs",
+        ),
         cfg.optim.freeze_backbone_epochs,
         freeze_backbone_iters,
     )
@@ -722,6 +899,12 @@ def do_train(cfg, model, resume=False):
             group=distributed.get_process_subgroup(),
         )
         total_loss = total_loss_all_ranks.mean()
+        loss_window.append(float(total_loss.item()))
+        rolling_loss_100 = (
+            sum(loss_window) / len(loss_window)
+            if len(loss_window) == _CHECKPOINT_LOSS_WINDOW
+            else None
+        )
         metrics_values = torch.stack(
             [torch.as_tensor(v, dtype=torch.float32, device=total_loss.device).detach() for v in metrics_dict.values()]
         )
@@ -759,6 +942,8 @@ def do_train(cfg, model, resume=False):
             epoch=iteration // iterations_per_epoch + 1,
             epoch_iteration=iteration % iterations_per_epoch + 1,
         )
+        if rolling_loss_100 is not None:
+            metric_logger.update(rolling_loss_100=rolling_loss_100)
         metric_logger.update(total_loss=total_loss, **metrics_dict)
 
         # Submit evaluation jobs
@@ -771,19 +956,47 @@ def do_train(cfg, model, resume=False):
 
         # Checkpointing
         if checkpoint_period_iterations > 0 and (iteration + 1) % checkpoint_period_iterations == 0:
-            torch.cuda.synchronize()
-            save_checkpoint(
-                ckpt_dir / str(iteration),
-                iteration=iteration,
-                model=model,
-                optimizer=optimizer,
-                overwrite=True,
-                process_group=process_subgroup,
-            )
-            if distributed.is_subgroup_main_process():
-                keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
-                if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
-                    keep_checkpoint_copy(ckpt_dir / str(iteration))
+            if rolling_loss_100 is None:
+                logger.info(
+                    "Skipping checkpoint at iteration %d: only %d/%d loss values "
+                    "are available for the rolling average",
+                    iteration,
+                    len(loss_window),
+                    _CHECKPOINT_LOSS_WINDOW,
+                )
+            elif rolling_loss_100 < lowest_average_loss:
+                torch.cuda.synchronize()
+                save_checkpoint(
+                    ckpt_dir / str(iteration),
+                    iteration=iteration,
+                    model=model,
+                    optimizer=optimizer,
+                    overwrite=True,
+                    process_group=process_subgroup,
+                )
+                lowest_average_loss = rolling_loss_100
+                if distributed.is_subgroup_main_process():
+                    _save_checkpoint_loss_state(
+                        ckpt_dir / str(iteration),
+                        loss_window,
+                        lowest_average_loss,
+                    )
+                    keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
+                    if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
+                        keep_checkpoint_copy(ckpt_dir / str(iteration))
+                logger.info(
+                    "Saved improving checkpoint at iteration %d: rolling_loss_100=%.6f",
+                    iteration,
+                    rolling_loss_100,
+                )
+            else:
+                logger.info(
+                    "Skipping checkpoint at iteration %d: rolling_loss_100=%.6f "
+                    "is not below best=%.6f",
+                    iteration,
+                    rolling_loss_100,
+                    lowest_average_loss,
+                )
 
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()

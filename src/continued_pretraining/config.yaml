@@ -15,6 +15,7 @@ optim:
   lr: 0.001
 checkpointing:
   period: 500  # Save a checkpoint every N training iterations.
+  loss_window_iterations: 100  # Only save when this window's mean loss improves.
   max_to_keep: 10
 
 student:
@@ -25,4 +26,5 @@ student:
   resume_from_teacher_chkpt: /common/ganesanv/tlab/opt/dinov3-weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
 
 lora_r: 8
+unfreeze_last_layers: 0
 freeze_iterations: 800  # LoRA remains frozen for the first N training iterations.
