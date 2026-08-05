@@ -11,7 +11,7 @@ train:
   cache_dataset: false
 
 optim:
-  warmup_iterations: 400
+  warmup_iterations: 800
   lr: 0.001
 checkpointing:
   period: 500  # Save a checkpoint every N training iterations.
@@ -25,6 +25,6 @@ student:
   freeze_last_layer_epochs: 0
   resume_from_teacher_chkpt: /common/ganesanv/tlab/opt/dinov3-weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
 
-lora_r: 8
-unfreeze_last_layers: 0
-freeze_iterations: 800  # LoRA remains frozen for the first N training iterations.
+lora_r: 32
+unfreeze_last_layers: 2
+freeze_iterations: 1600  # LoRA remains frozen for the first N training iterations.
