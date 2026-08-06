@@ -17,6 +17,7 @@ python src/pca_dino_backbones.py \
   --braindino-checkpoint /path/to/brain_dino_weights.pth \
   --custom-checkpoint /path/to/distributed/checkpoint \
   --dinov3-repo /path/to/dinov3 \
+  --image-size 512 \
   --output pca_adni_slice.png
 ```
 
@@ -51,6 +52,7 @@ python src/pca_dino_backbones.py evolution \
   --checkpoint-parent /path/to/checkpoint_parent \
   --data-root /common/ganesanv/tlab/data/ADNI \
   --n-images 5 \
+  --image-size 512 \
   --output pca_checkpoint_evolution.png
 ```
 

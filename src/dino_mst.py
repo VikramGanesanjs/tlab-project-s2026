@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import math
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -54,7 +55,7 @@ from datasets.adni import (  # noqa: E402
     build_adni_transform,
 )
 from datasets.duke import DukeMultiSliceDataset  # noqa: E402
-from vit_lora import add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
+from vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 MultiSliceDataset = Union[DukeMultiSliceDataset, ADNIMultiSliceDataset]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
+_BLOCK_QKV_RE = re.compile(r"blocks\.(\d+)\.attn\.qkv\.")
+_LORA_QKV_RE = re.compile(r"blocks\.(\d+)\.attn\.qkv\.w_[ab]_[qkv]\.weight$")
+_VANILLA_QKV_RE = re.compile(r"blocks\.(\d+)\.attn\.qkv\.weight$")
 
 
 def _checkpoint_state_dict(checkpoint: object) -> Dict[str, torch.Tensor]:
@@ -127,12 +131,61 @@ def _normalize_backbone_state(
     return normalized
 
 
+def _canonical_checkpoint_name(name: str) -> str:
+    """Strip common checkpoint containers from a parameter name."""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("module.", "model.", "teacher.", "student.", "backbone."):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                changed = True
+                break
+    return name
+
+
+def _infer_unfrozen_tail(names: Sequence[str]) -> int:
+    """Infer the number of final blocks using vanilla-vs-LoRA QKV names.
+
+    Mixed checkpoints produced by continued pretraining have LoRA QKV names
+    in the early blocks (``qkv.qkv`` plus ``w_a_*``/``w_b_*``) and ordinary
+    QKV names in the fully unfrozen suffix. Pure-LoRA and ordinary checkpoints
+    therefore naturally resolve to zero here.
+    """
+    block_ids = set()
+    lora_blocks = set()
+    vanilla_blocks = set()
+    for original_name in names:
+        name = _canonical_checkpoint_name(str(original_name))
+        match = _BLOCK_QKV_RE.search(name)
+        if match:
+            block_ids.add(int(match.group(1)))
+        match = _LORA_QKV_RE.search(name)
+        if match:
+            lora_blocks.add(int(match.group(1)))
+        match = _VANILLA_QKV_RE.search(name)
+        if match:
+            vanilla_blocks.add(int(match.group(1)))
+
+    if not lora_blocks or not block_ids:
+        return 0
+
+    tail = 0
+    for block_index in range(max(block_ids), -1, -1):
+        if block_index in vanilla_blocks and block_index not in lora_blocks:
+            tail += 1
+        else:
+            break
+    return tail
+
+
 def _build_custom_vit_base(
     *,
     repo_dir: Path,
     ssl_architecture: bool,
     with_lora: bool,
     lora_rank: int,
+    unfreeze_last_layers: int = 0,
 ) -> nn.Module:
     """Build the ViT-B variant used by a custom DINOv3 SSL checkpoint."""
     repo_dir = Path(repo_dir)
@@ -178,6 +231,15 @@ def _build_custom_vit_base(
         )
     if with_lora:
         add_lora_to_vit(encoder, r=lora_rank)
+        if not 0 <= unfreeze_last_layers <= len(encoder.blocks):
+            raise ValueError(
+                "unfreeze_last_layers must be between 0 and the number of ViT blocks; "
+                f"got {unfreeze_last_layers}"
+            )
+        for block in encoder.blocks[-unfreeze_last_layers:] if unfreeze_last_layers else ():
+            if not isinstance(block.attn.qkv, LoRA):
+                raise TypeError("Expected a LoRA-wrapped QKV while restoring the unfrozen tail")
+            block.attn.qkv = block.attn.qkv.qkv
     return encoder
 
 
@@ -247,6 +309,7 @@ def _load_custom_dinov3_encoder(
         metadata_keys = set(metadata.state_dict_metadata)
         prefixes = (
             "model.teacher.backbone.",
+            "model.student.backbone.",
             "model.backbone.",
         )
         source_prefix = next(
@@ -261,6 +324,7 @@ def _load_custom_dinov3_encoder(
         backbone_keys = [key for key in metadata_keys if key.startswith(source_prefix)]
         has_lora = any(".w_a_" in key or ".w_b_" in key for key in backbone_keys)
         has_storage_tokens = any(key.endswith(".storage_tokens") for key in backbone_keys)
+        unfreeze_last_layers = _infer_unfrozen_tail(backbone_keys)
         checkpoint_lora_rank = next(
             (
                 int(metadata.state_dict_metadata[key].size[0])
@@ -274,15 +338,20 @@ def _load_custom_dinov3_encoder(
             ssl_architecture=not has_storage_tokens,
             with_lora=has_lora,
             lora_rank=checkpoint_lora_rank,
+            unfreeze_last_layers=unfreeze_last_layers,
         )
         loaded_count = _load_dcp_backbone(
             encoder, checkpoint, source_prefix=source_prefix.removesuffix(".")
         )
         logger.info(
-            "Loaded ViT-B teacher/backbone from distributed checkpoint %s (%d tensors); "
+            "Loaded ViT-B backbone from distributed checkpoint %s (%d tensors); "
+            "LoRA=%s, unfrozen_tail=%d, rank=%d; "
             "discarded decoder, heads, losses, and optimizer",
             checkpoint,
             loaded_count,
+            has_lora,
+            unfreeze_last_layers,
+            checkpoint_lora_rank,
         )
     else:
         if not checkpoint.is_file():
@@ -290,8 +359,9 @@ def _load_custom_dinov3_encoder(
         loaded = torch.load(checkpoint, map_location="cpu", weights_only=False)
         state = _checkpoint_state_dict(loaded)
         has_lora = any(".w_a_" in key or ".w_b_" in key for key in state)
+        unfreeze_last_layers = _infer_unfrozen_tail(state)
         has_storage_tokens = any(
-            key.removeprefix("module.").endswith("storage_tokens") for key in state
+            _canonical_checkpoint_name(key).endswith("storage_tokens") for key in state
         )
         checkpoint_lora_rank = next(
             (int(value.shape[0]) for key, value in state.items() if key.endswith(".w_a_q.weight")),
@@ -302,6 +372,7 @@ def _load_custom_dinov3_encoder(
             ssl_architecture=not has_storage_tokens,
             with_lora=has_lora,
             lora_rank=checkpoint_lora_rank,
+            unfreeze_last_layers=unfreeze_last_layers,
         )
         backbone_state = _normalize_backbone_state(state, encoder)
         if not backbone_state:
@@ -315,9 +386,13 @@ def _load_custom_dinov3_encoder(
             )
         logger.info(
             "Loaded ViT-B backbone from regular checkpoint %s (%d tensors); "
+            "LoRA=%s, unfrozen_tail=%d, rank=%d; "
             "discarded non-backbone entries",
             checkpoint,
             len(backbone_state),
+            has_lora,
+            unfreeze_last_layers,
+            checkpoint_lora_rank,
         )
 
     has_encoder_lora = any(
@@ -327,6 +402,10 @@ def _load_custom_dinov3_encoder(
         add_lora_to_vit(encoder, r=lora_rank)
     if encoder_training == "lora":
         freeze_non_lora_parameters(encoder)
+        # A mixed checkpoint has a fully trainable suffix whose parameters do
+        # not carry LoRA markers. Restore that training behavior if requested.
+        if unfreeze_last_layers:
+            encoder.blocks[-unfreeze_last_layers:].requires_grad_(True)
     return encoder.to(device).eval()
 
 
@@ -1155,6 +1234,7 @@ def _checkpoint_payload(
         "weights": str(args.weights) if args.weights is not None else None,
         "features": args.features,
         "slice_aggregator": args.slice_aggregator,
+        "train_slice_sampling": args.train_slice_sampling,
         "n_slices": args.n_slices,
         "minimum_z_index_distance": args.minimum_z_index_distance,
         "include_bilateral": args.include_bilateral,
@@ -1239,9 +1319,13 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     )
     binary = is_binary_task(num_classes)
     unit_name = "breasts" if args.dataset == "duke" else "scans"
-    # Train keeps stochastic augmentations + random slice sampling.
+    # Train keeps stochastic augmentations; slice sampling is configurable.
     # Validation/test are deterministic: no augmentations + evenly spaced slices.
-    train_full = build_dataset(args, augment=args.augment, slice_sampling="random")
+    train_full = build_dataset(
+        args,
+        augment=args.augment,
+        slice_sampling=args.train_slice_sampling,
+    )
     labels = collect_labels(train_full)
     summarize_class_counts(labels, name=f"full dataset ({unit_name})", class_names=class_names)
 
@@ -1407,7 +1491,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     )
 
     logger.info(
-        "dataset=%s adni_task=%s encoder=%s features=%s aggregator=%s n_slices=%d "
+        "dataset=%s adni_task=%s encoder=%s features=%s aggregator=%s "
+        "train_slice_sampling=%s n_slices=%d "
         "encoder_training=%s lora_r=%s freeze_epochs=%d num_classes=%d "
         "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
         args.dataset,
@@ -1415,6 +1500,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         args.encoder,
         args.features,
         args.slice_aggregator,
+        args.train_slice_sampling,
         args.n_slices,
         args.encoder_training,
         args.lora_r if args.encoder_training == "lora" else None,
@@ -1728,6 +1814,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--z-min", type=float, default=0)
     parser.add_argument("--z-max", type=float, default=1)
     parser.add_argument("--n-slices", type=int, default=8)
+    parser.add_argument(
+        "--train-slice-sampling",
+        choices=("random", "even"),
+        default="random",
+        help=(
+            "How slices are sampled for training: random (default) or even "
+            "for deterministic evenly spaced slices"
+        ),
+    )
     parser.add_argument(
         "--minimum-z-index-distance",
         "--min-slices-dist",

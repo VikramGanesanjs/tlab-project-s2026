@@ -37,6 +37,7 @@ STD = torch.tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
 ADNI_DEFAULT_ROOT = Path("/common/ganesanv/tlab/data/ADNI")
 DUKE_DEFAULT_ROOT = Path("/common/ganesanv/tlab/data/tcia/duke_breast_cancer_processed")
 DINOV3_DEFAULT_REPO = Path("/common/ganesanv/tlab/opt/dinov3")
+DEFAULT_IMAGE_SIZE = 224
 
 
 def sample_adni_slice(args):
@@ -69,6 +70,8 @@ def sample_adni_slice(args):
 
 @torch.inference_mode()
 def patch_features(model, image, grid, device):
+    # DINOv3-family backbones compute RoPE from the runtime patch grid. For
+    # ViT-B/16, 512x512 therefore arrives here as a 32x32 patch grid.
     output = model.forward_features(image.to(device))
     features = output["x_norm_patchtokens"]
     expected = grid[0] * grid[1]
@@ -231,6 +234,7 @@ def plot_checkpoint_evolution(args):
     )
     checkpoints = discover_distributed_checkpoints(args.checkpoint_parent)
     grid = (args.image_size // 16, args.image_size // 16)
+    LOGGER.info("Evolution image size=%dx%d, patch grid=%s", args.image_size, args.image_size, grid)
     pca_maps = np.empty(
         (len(images), len(checkpoints), grid[0], grid[1], 3), dtype=np.float32
     )
@@ -280,15 +284,15 @@ def parse_evolution_args(argv=None):
     parser.add_argument("--z-min", type=float, default=0.25)
     parser.add_argument("--z-max", type=float, default=0.75)
     parser.add_argument("--n-images", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--dinov3-repo", type=Path, default=DINOV3_DEFAULT_REPO)
     parser.add_argument("--output", type=Path, default=Path("pca_checkpoint_evolution.png"))
     parser.add_argument("--device", default=None)
     args = parser.parse_args(argv)
-    if args.image_size % 16:
-        parser.error("--image-size must be divisible by 16")
+    if args.image_size <= 0 or args.image_size % 16:
+        parser.error("--image-size must be positive and divisible by 16")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     return args
@@ -306,9 +310,9 @@ def parse_args():
     parser.add_argument("--dinov3-checkpoint", type=Path, required=True)
     parser.add_argument("--braindino-checkpoint", type=Path, required=True)
     parser.add_argument("--custom-checkpoint", type=Path, required=True)
-    parser.add_argument("--dinov3-repo", type=Path, required=True)
+    parser.add_argument("--dinov3-repo", type=Path, default=DINOV3_DEFAULT_REPO)
     parser.add_argument("--dinov3-model", default="dinov3_vitb16")
-    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--output", type=Path, default=Path("pca_adni_slice.png"))
     parser.add_argument("--device", default=None)
     return parser.parse_args()
@@ -322,11 +326,12 @@ def main():
         return
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    if args.image_size % 16:
-        raise ValueError("--image-size must be divisible by 16")
+    if args.image_size <= 0 or args.image_size % 16:
+        raise ValueError("--image-size must be positive and divisible by 16")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     image, index = sample_adni_slice(args)
     grid = (args.image_size // 16, args.image_size // 16)
+    LOGGER.info("Image size=%dx%d, patch grid=%s", args.image_size, args.image_size, grid)
 
     model_loaders = [
         (

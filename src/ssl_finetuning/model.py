@@ -717,8 +717,8 @@ class SSLFineTune(nn.Module):
         return (ce * weights).sum(), weights.sum()
 
     def _uncertainty_weight(self, teacher_probs: Tensor) -> Tensor:
-        entropy = -(teacher_probs.float().clamp_min(1e-8) * teacher_probs.float().clamp_min(1e-8).log()).sum(-1)
-        entropy = entropy / math.log(max(teacher_probs.shape[-1], 2))
+        probs = teacher_probs.float().clamp_min(1e-8)
+        entropy = -(probs * probs.log()).sum(dim=-1)
         return 1.0 + self.gamma * entropy
 
     def uwsd_loss(
