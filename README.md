@@ -6,16 +6,18 @@
 
 `src/pca_dino_backbones.py` constructs the repository ADNI dataset, samples one
 slice from the middle 50% of a volume, and compares DINOv3, BrainDINO, and a
-dino_mst-style checkpoint. The PCA uses `whiten=True`, matching the DINOv3
-reference notebook. Patch features remain in CPU memory while the next model
-is loaded.
+dino_mst-style checkpoint. The custom checkpoint may be a distributed
+checkpoint directory, a plain merged teacher `.pth`, or a
+`--hub-compatible` merged teacher `.pth`. The PCA uses `whiten=True`, matching
+the DINOv3 reference notebook. Patch features remain in CPU memory while the
+next model is loaded.
 
 ```bash
 python src/pca_dino_backbones.py \
   --data-root /path/to/data/ADNI \
   --dinov3-checkpoint /path/to/dinov3_vitb16.pth \
   --braindino-checkpoint /path/to/brain_dino_weights.pth \
-  --custom-checkpoint /path/to/distributed/checkpoint \
+  --custom-checkpoint /path/to/distributed/checkpoint-or-merged-backbone.pth \
   --dinov3-repo /path/to/dinov3 \
   --image-size 512 \
   --output pca_adni_slice.png

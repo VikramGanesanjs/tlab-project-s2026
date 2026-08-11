@@ -22,7 +22,7 @@ SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from dino_mst import _load_custom_dinov3_encoder  # noqa: E402
+from merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from dinov3_baseline import load_braindino_encoder, load_dinov3_encoder  # noqa: E402
 from datasets.adni import (  # noqa: E402
     ADNIClassificationDataset,
@@ -38,6 +38,33 @@ ADNI_DEFAULT_ROOT = Path("/common/ganesanv/tlab/data/ADNI")
 DUKE_DEFAULT_ROOT = Path("/common/ganesanv/tlab/data/tcia/duke_breast_cancer_processed")
 DINOV3_DEFAULT_REPO = Path("/common/ganesanv/tlab/opt/dinov3")
 DEFAULT_IMAGE_SIZE = 224
+
+
+def load_pca_backbone(
+    checkpoint: Path,
+    *,
+    repo_dir: Path,
+    device: torch.device,
+    lora_rank: int = 8,
+):
+    """Load a DINOv3 PCA backbone from DCP or either merged ``.pth`` format.
+
+    ``load_custom_dinov3_encoder`` selects the SSL ViT configuration for the
+    plain merged export and the released DINOv3 configuration for the
+    ``--hub-compatible`` export by inspecting the presence of storage tokens.
+    """
+    checkpoint = Path(checkpoint)
+    if not checkpoint.is_dir() and not checkpoint.is_file():
+        raise FileNotFoundError(f"PCA backbone checkpoint not found: {checkpoint}")
+    checkpoint_kind = "merged backbone .pth" if checkpoint.is_file() else "distributed checkpoint"
+    LOGGER.info("Loading %s (%s)", checkpoint, checkpoint_kind)
+    return load_custom_dinov3_encoder(
+        checkpoint=checkpoint,
+        repo_dir=repo_dir,
+        device=device,
+        encoder_training="frozen",
+        lora_rank=lora_rank,
+    )
 
 
 def sample_adni_slice(args):
@@ -243,11 +270,10 @@ def plot_checkpoint_evolution(args):
     )
     for column, checkpoint in enumerate(checkpoints):
         LOGGER.info("Loading checkpoint %s (%d/%d)", checkpoint.name, column + 1, len(checkpoints))
-        model = _load_custom_dinov3_encoder(
+        model = load_pca_backbone(
             checkpoint=checkpoint,
             repo_dir=args.dinov3_repo,
             device=device,
-            encoder_training="frozen",
             lora_rank=8,
         )
         features = _batched_patch_features(
@@ -309,7 +335,15 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None, help="Optional seed for reproducible sampling")
     parser.add_argument("--dinov3-checkpoint", type=Path, required=True)
     parser.add_argument("--braindino-checkpoint", type=Path, required=True)
-    parser.add_argument("--custom-checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--custom-checkpoint",
+        type=Path,
+        required=True,
+        help=(
+            "DINOv3 DCP directory, plain merged teacher .pth, or "
+            "--hub-compatible merged teacher .pth"
+        ),
+    )
     parser.add_argument("--dinov3-repo", type=Path, default=DINOV3_DEFAULT_REPO)
     parser.add_argument("--dinov3-model", default="dinov3_vitb16")
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
@@ -352,12 +386,11 @@ def main():
             ),
         ),
         (
-            "Custom distributed checkpoint",
-            lambda: _load_custom_dinov3_encoder(
+            "Custom teacher backbone",
+            lambda: load_pca_backbone(
                 checkpoint=args.custom_checkpoint,
                 repo_dir=args.dinov3_repo,
                 device=device,
-                encoder_training="frozen",
                 lora_rank=8,
             ),
         ),

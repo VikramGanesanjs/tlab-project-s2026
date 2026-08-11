@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms as tv_transforms
 from torchvision.datasets.vision import VisionDataset
@@ -302,29 +303,6 @@ def _z_index_range(n_z: int, z_min: float, z_max: float) -> Tuple[int, int]:
     return start, end
 
 
-SLICE_SAMPLING_CHOICES = ("random", "even")
-
-
-def _evenly_spaced_slice_indices(start: int, end: int, n_slices: int) -> Tuple[int, ...]:
-    """Return ``n_slices`` deterministic indices spanning ``[start, end)``."""
-    eligible_slices = end - start
-    if eligible_slices <= 0:
-        raise ValueError(f"Empty z-range [{start}, {end})")
-    if n_slices <= 0:
-        raise ValueError(f"n_slices must be positive, got {n_slices}")
-    if n_slices > eligible_slices:
-        raise ValueError(
-            f"Cannot place {n_slices} evenly spaced slices in "
-            f"{eligible_slices} eligible slices"
-        )
-    if n_slices == 1:
-        return (start + eligible_slices // 2,)
-    span = eligible_slices - 1
-    return tuple(
-        start + int(round(index * span / (n_slices - 1))) for index in range(n_slices)
-    )
-
-
 def _slice_to_pil(
     volume: np.ndarray,
     z: int,
@@ -345,6 +323,88 @@ def _slice_to_pil(
     )
     pixels = (normalized * 255.0).astype(np.uint8)
     return Image.fromarray(pixels, mode="L").convert("RGB")
+
+
+def _zscore_normalize_volume(volume: np.ndarray) -> np.ndarray:
+    """Normalize a whole canonical volume using its nonzero intensities."""
+    volume = np.asarray(volume, dtype=np.float32)
+    finite = volume[np.isfinite(volume)]
+    nonzero = volume[(volume > 0) & np.isfinite(volume)]
+    if nonzero.size < 10:
+        nonzero = finite
+    if nonzero.size == 0:
+        raise ValueError("ADNI volume contains no finite voxel values")
+
+    low, high = np.percentile(nonzero, (1.0, 99.0))
+    if high <= low:
+        high = low + 1.0
+    volume = np.nan_to_num(volume, nan=0.0, posinf=high, neginf=0.0)
+    volume = np.clip(volume, low, high)
+    nonzero = volume[(volume > 0) & np.isfinite(volume)]
+    if nonzero.size == 0:
+        nonzero = volume.reshape(-1)
+    mean = float(nonzero.mean())
+    std = max(float(nonzero.std()), 1e-6)
+    return ((volume - mean) / std).astype(np.float32, copy=False)
+
+
+def _resample_volume(
+    volume: np.ndarray,
+    n_slices: int,
+    image_size: int,
+) -> torch.Tensor:
+    """Return a canonical volume as ``[depth, image_size, image_size]``."""
+    if volume.ndim != 3:
+        raise ValueError(f"Expected a 3D volume, got shape {volume.shape}")
+    if n_slices <= 0:
+        raise ValueError(f"n_slices must be positive, got {n_slices}")
+    if image_size <= 0:
+        raise ValueError(f"image_size must be positive, got {image_size}")
+
+    height, width, _ = volume.shape
+    volume_t = torch.from_numpy(
+        np.ascontiguousarray(np.asarray(volume, dtype=np.float32))
+    ).permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+    volume_t = F.interpolate(
+        volume_t,
+        size=(int(n_slices), height, width),
+        mode="trilinear",
+        align_corners=False,
+    )
+    volume_t = F.interpolate(
+        volume_t.squeeze(0),
+        size=(int(image_size), int(image_size)),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return volume_t.squeeze(0)
+
+
+def _slice_to_imagenet_tensor(image_slice: torch.Tensor) -> torch.Tensor:
+    """Convert one augmented grayscale slice to an ImageNet-normalized RGB tensor."""
+    image_array = np.asarray(image_slice.detach().cpu(), dtype=np.float32)
+    finite = image_array[np.isfinite(image_array)]
+    if finite.size == 0:
+        raise ValueError("ADNI slice contains no finite values")
+
+    low = float(finite.min())
+    high = float(finite.max())
+    if high <= low:
+        scaled = np.zeros_like(image_array, dtype=np.float32)
+    else:
+        scaled = np.clip((image_array - low) / (high - low), 0.0, 1.0)
+    scaled = np.nan_to_num(scaled, nan=0.0, posinf=1.0, neginf=0.0)
+
+    grayscale = Image.fromarray(
+        np.rint(scaled * 255.0).astype(np.uint8), mode="L"
+    )
+    rgb_image = grayscale.convert("RGB")
+    image_tensor = tv_transforms.functional.to_tensor(rgb_image)
+    return tv_transforms.functional.normalize(
+        image_tensor,
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD,
+    )
 
 
 def build_adni_transform(
@@ -402,6 +462,57 @@ def build_adni_transform(
     return tv_transforms.Compose(operations)
 
 
+def build_adni_volume_transform(*, augment: bool = True) -> Optional[Callable]:
+    """Build a MONAI transform for an entire ADNI volume.
+
+    The returned callable accepts a channel-first ``[1, D, H, W]`` tensor and
+    returns a transformed tensor with the same layout.  MONAI is imported
+    lazily so the single-slice ADNI datasets retain their existing dependency
+    requirements when this multi-slice path is not used.
+    """
+    if not augment:
+        return None
+
+    try:
+        from monai.transforms import (
+            Compose,
+            RandAdjustContrastd,
+            RandAffined,
+            RandFlipd,
+            RandGaussianNoised,
+            RandGaussianSmoothd,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "MONAI is required for ADNI multi-slice augmentation; "
+            "install the project's MONAI dependency or set augment=False"
+        ) from exc
+
+    transform = Compose(
+        [
+            RandAffined(
+                keys=("image",),
+                rotate_range=(0.1, 0.1, 0.1),
+                translate_range=(5, 5, 5),
+                scale_range=(0.1, 0.1, 0.1),
+                prob=0.5,
+                padding_mode="border",
+                mode="trilinear",
+            ),
+            RandFlipd(keys=("image",), spatial_axis=[2], prob=0.5),
+            RandGaussianSmoothd(keys=("image",), prob=0.2),
+            RandGaussianNoised(keys=("image",), prob=0.2, std=0.05),
+            RandAdjustContrastd(keys=("image",), prob=0.2, gamma=(0.7, 1.3)),
+        ]
+    )
+
+    def apply(volume: torch.Tensor) -> torch.Tensor:
+        transformed = transform({"image": volume})
+        return transformed["image"]
+
+    return apply
+
+
 class _ADNIBaseDataset(VisionDataset):
     def __init__(
         self,
@@ -409,6 +520,7 @@ class _ADNIBaseDataset(VisionDataset):
         *,
         csv_path: Optional[Union[str, Path]] = None,
         task: str = DEFAULT_ADNI_TASK,
+        patient_ids: Optional[Sequence[str]] = None,
         z_min: float = 0.0,
         z_max: float = 1.0,
         transforms: Optional[Callable] = None,
@@ -417,6 +529,7 @@ class _ADNIBaseDataset(VisionDataset):
         volume_cache_size: int = 8,
         augment: bool = True,
         image_size: int = 224,
+        build_default_transform: bool = True,
     ) -> None:
         root_path = Path(root).expanduser().resolve()
         metadata_path = (
@@ -424,7 +537,7 @@ class _ADNIBaseDataset(VisionDataset):
             if csv_path is not None
             else root_path / DEFAULT_CSV_NAME
         )
-        if transforms is None and transform is None:
+        if build_default_transform and transforms is None and transform is None:
             transform = build_adni_transform(image_size=image_size, augment=augment)
         super().__init__(
             str(root_path),
@@ -448,6 +561,11 @@ class _ADNIBaseDataset(VisionDataset):
             for record in records
             if record.phenotype["Group"] in allowed
         ]
+        if patient_ids is not None:
+            selected_patients = {str(patient_id) for patient_id in patient_ids}
+            self._records = [
+                record for record in self._records if record.patient_id in selected_patients
+            ]
         if not self._records:
             raise RuntimeError(
                 f"No ADNI scans for task={self.task!r} under {self.root_path} "
@@ -549,10 +667,13 @@ class ADNIClassificationDataset(_ADNIBaseDataset):
 
 
 class ADNIMultiSliceDataset(_ADNIBaseDataset):
-    """Scan-level classification using an ordered stack of axial slices.
+    """Scan-level classification using an interpolated stack of axial slices.
 
     ``task`` selects the label space (see :class:`ADNIClassificationDataset`).
     Binary tasks mirror Duke: labels are ``0``/``1`` with a single-logit BCE head.
+    Each volume is resampled to exactly ``n_slices`` slices with trilinear
+    interpolation. When enabled, MONAI 3-D transforms are applied once to the
+    complete volume rather than independently to each slice.
     """
 
     def __init__(
@@ -562,48 +683,36 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
         n_slices: int = 8,
         csv_path: Optional[Union[str, Path]] = None,
         task: str = DEFAULT_ADNI_TASK,
-        z_min: float = 0.0,
-        z_max: float = 1.0,
+        patient_ids: Optional[Sequence[str]] = None,
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         volume_cache_size: int = 8,
         augment: bool = True,
         image_size: int = 224,
-        minimum_z_index_distance: Optional[int] = None,
-        slice_sampling: str = "random",
     ) -> None:
         if n_slices <= 0:
             raise ValueError(f"n_slices must be positive, got {n_slices}")
-        if minimum_z_index_distance is not None and minimum_z_index_distance < 0:
-            raise ValueError(
-                "minimum_z_index_distance must be non-negative or None, "
-                f"got {minimum_z_index_distance}"
-            )
-        if slice_sampling not in SLICE_SAMPLING_CHOICES:
-            raise ValueError(
-                f"slice_sampling must be one of {SLICE_SAMPLING_CHOICES}, "
-                f"got {slice_sampling!r}"
-            )
         self.n_slices = int(n_slices)
-        self.minimum_z_index_distance = minimum_z_index_distance
-        self.slice_sampling = slice_sampling
+        self.image_size = int(image_size)
+        if self.image_size <= 0:
+            raise ValueError(f"image_size must be positive, got {image_size}")
+        if transforms is None and transform is None and augment:
+            transform = build_adni_volume_transform(augment=True)
         super().__init__(
             root=root,
             csv_path=csv_path,
             task=task,
-            z_min=z_min,
-            z_max=z_max,
+            patient_ids=patient_ids,
             transforms=transforms,
             transform=transform,
             target_transform=target_transform,
             volume_cache_size=volume_cache_size,
             augment=augment,
             image_size=image_size,
+            build_default_transform=False,
         )
         self._entries = list(self._records)
-        for record in self._entries:
-            self._validate_slice_capacity(record)
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -620,79 +729,37 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
     def get_phenotype_raw(self, index: int) -> Dict[str, str]:
         return self._record_metadata(self._entries[index])
 
-    def _sampling_parameters(self, record: _ScanRecord) -> Tuple[int, int, int]:
-        start, end = _z_index_range(record.n_slices, self.z_min, self.z_max)
-        eligible_slices = end - start
-        distance = self.minimum_z_index_distance
-        if distance is None:
-            distance = max(eligible_slices // self.n_slices - 1, 0)
-        return start, end, int(distance)
-
-    def _validate_slice_capacity(self, record: _ScanRecord) -> None:
-        start, end, distance = self._sampling_parameters(record)
-        eligible_slices = end - start
-        if self.slice_sampling == "even":
-            if self.n_slices > eligible_slices:
-                raise ValueError(
-                    f"Cannot place {self.n_slices} evenly spaced slices in "
-                    f"{eligible_slices} eligible slices for image ID {record.image_id}"
-                )
-            return
-        effective_distance = max(distance, 1)
-        required_span = 1 + (self.n_slices - 1) * effective_distance
-        if required_span > eligible_slices:
-            raise ValueError(
-                f"Cannot sample {self.n_slices} slices with minimum z-index "
-                f"distance {distance} from {eligible_slices} eligible slices "
-                f"for image ID {record.image_id}"
-            )
-
-    def get_slice_indices(self, index: int) -> Tuple[int, ...]:
-        record = self._entries[index]
-        start, end, distance = self._sampling_parameters(record)
-        if self.slice_sampling == "even":
-            try:
-                return _evenly_spaced_slice_indices(start, end, self.n_slices)
-            except ValueError as exc:
-                raise ValueError(f"{exc} for image ID {record.image_id}") from exc
-
-        eligible_slices = end - start
-        effective_distance = max(distance, 1)
-        compressed_size = eligible_slices - (
-            effective_distance - 1
-        ) * (self.n_slices - 1)
-        compressed = torch.randperm(compressed_size)[: self.n_slices]
-        compressed, _ = torch.sort(compressed)
-        offsets = torch.arange(self.n_slices) * (effective_distance - 1)
-        return tuple(int(z) for z in (compressed + offsets + start).tolist())
-
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         record = self._entries[index]
         volume = self._volume_cache.get(record.volume_path)
-        images: List[Any] = [
-            _slice_to_pil(volume, z) for z in self.get_slice_indices(index)
-        ]
+        volume_t = _resample_volume(
+            _zscore_normalize_volume(volume), self.n_slices, self.image_size
+        ).unsqueeze(0)
         target: Any = record.label
 
-        if self.transform is not None:
-            initial_rng_state = torch.get_rng_state()
-            images[0] = self.transform(images[0])
-            advanced_rng_state = torch.get_rng_state()
-            for image_index in range(1, len(images)):
-                torch.set_rng_state(initial_rng_state)
-                images[image_index] = self.transform(images[image_index])
-            torch.set_rng_state(advanced_rng_state)
+        if self.transforms is not None:
+            volume_t, target = self.transforms(volume_t, target)
+        else:
+            if self.transform is not None:
+                volume_t = self.transform(volume_t)
             if self.target_transform is not None:
                 target = self.target_transform(target)
-        elif self.transforms is not None:
-            transformed = [self.transforms(image, target) for image in images]
-            images = [pair[0] for pair in transformed]
-            target = transformed[0][1]
-        elif self.target_transform is not None:
-            target = self.target_transform(target)
 
-        if images and all(torch.is_tensor(image) for image in images):
-            return torch.stack(images, dim=0), target
+        volume_t = torch.as_tensor(volume_t)
+        if volume_t.ndim == 3:
+            volume_t = volume_t.unsqueeze(0)
+        if volume_t.ndim != 4 or volume_t.shape[0] != 1:
+            raise ValueError(
+                "ADNI multi-slice transforms must return [1, depth, height, width], "
+                f"got shape {tuple(volume_t.shape)}"
+            )
+        images = torch.stack(
+            [
+                _slice_to_imagenet_tensor(image_slice)
+                for image_slice in volume_t.squeeze(0)
+            ],
+            dim=0,
+        )
         return images, target
 
 
@@ -818,5 +885,6 @@ __all__ = [
     "LABEL_TO_DIAGNOSIS",
     "PHENOTYPE_SENTINEL",
     "build_adni_transform",
+    "build_adni_volume_transform",
     "resolve_adni_task",
 ]

@@ -10,7 +10,7 @@ Example::
         --output umap_adni.png
 
 The default ``auto`` encoder detects BrainDINO/DINOv3 ``.pth`` files and sends
-distributed-checkpoint directories through the dino_mst loader. The checkpoint
+distributed-checkpoint directories through the shared checkpoint loader. The checkpoint
 is used as a DINOv3-compatible backbone; colors come from the dataset labels.
 """
 
@@ -42,7 +42,7 @@ from datasets.adni import (  # noqa: E402
     build_adni_transform,
 )
 from datasets.duke import DukeClassificationDataset, build_duke_transform  # noqa: E402
-from dino_mst import _load_custom_dinov3_encoder  # noqa: E402
+from merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from dinov3_baseline import load_braindino_encoder, load_dinov3_encoder  # noqa: E402
 
 LOGGER = logging.getLogger("classification_visualization")
@@ -143,9 +143,9 @@ def _looks_like_braindino(checkpoint: Path) -> bool:
 
 
 def load_encoder(args, device: torch.device) -> torch.nn.Module:
-    # Distributed checkpoints are handled by the dino_mst-compatible loader.
+    # Distributed checkpoints are handled by the shared checkpoint loader.
     if args.checkpoint.is_dir():
-        return _load_custom_dinov3_encoder(
+        return load_custom_dinov3_encoder(
             checkpoint=args.checkpoint,
             repo_dir=args.dinov3_repo,
             device=device,
@@ -169,7 +169,7 @@ def load_encoder(args, device: torch.device) -> torch.nn.Module:
             weights=args.checkpoint,
             device=device,
         )
-    return _load_custom_dinov3_encoder(
+    return load_custom_dinov3_encoder(
         checkpoint=args.checkpoint,
         repo_dir=args.dinov3_repo,
         device=device,

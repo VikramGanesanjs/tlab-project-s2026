@@ -107,7 +107,7 @@ crops:
 evaluation:
   eval_period_epochs: 10
 checkpointing:
-  period_epochs: 1
+  period_iterations: 1000
   max_to_keep: 5
 
 # Volumetric-DINO slice-pair fine-tuning options.

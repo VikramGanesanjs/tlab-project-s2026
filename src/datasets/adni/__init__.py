@@ -18,6 +18,7 @@ __all__ = [
     "LABEL_TO_DIAGNOSIS",
     "PHENOTYPE_SENTINEL",
     "build_adni_transform",
+    "build_adni_volume_transform",
     "resolve_adni_task",
 ]
 

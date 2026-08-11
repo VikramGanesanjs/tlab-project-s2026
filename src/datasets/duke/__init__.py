@@ -13,6 +13,7 @@ __all__ = [
     "DukeMultiSliceDataset",
     "PairToDinoGlobalCrops",
     "build_duke_transform",
+    "build_duke_volume_transform",
     "build_breastdivider_duke_scan_map",
     "build_mapping_slices_index",
     "build_phenotype_json",
@@ -28,6 +29,7 @@ _DATASET_ATTRS = {
     "DukeMultiSliceDataset",
     "PairToDinoGlobalCrops",
     "build_duke_transform",
+    "build_duke_volume_transform",
 }
 _CONVERT_ATTRS = {
     "CANONICAL_SCAN_TYPES",

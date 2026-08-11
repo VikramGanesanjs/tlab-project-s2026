@@ -740,12 +740,12 @@ def do_train(cfg, model, resume=False):
         iteration_key="eval_period_iterations",
         iterations_per_epoch=iterations_per_epoch,
     )
-    checkpoint_period_iterations = _period_in_iterations(
-        cfg.checkpointing,
-        epoch_key="period_epochs",
-        iteration_key="period",
-        iterations_per_epoch=iterations_per_epoch,
-    )
+    checkpoint_period_iterations = int(cfg.checkpointing.period_iterations)
+    if checkpoint_period_iterations < 0:
+        raise ValueError(
+            "checkpointing.period_iterations must be non-negative, "
+            f"got {checkpoint_period_iterations}"
+        )
     (
         lr_schedule,
         wd_schedule,

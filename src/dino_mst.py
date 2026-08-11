@@ -6,11 +6,10 @@ import argparse
 import json
 import logging
 import math
-import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,7 +28,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
 _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
@@ -41,7 +40,6 @@ from dinov3_baseline import (  # noqa: E402
     ENCODER_CHOICES,
     FEATURE_CHOICES,
     REPO_ROOT,
-    build_transform,
     inverse_frequency_weights,
     load_encoder,
     patient_strata,
@@ -52,9 +50,14 @@ from datasets.adni import (  # noqa: E402
     DEFAULT_ADNI_TASK,
     DEFAULT_ROOT as ADNI_DEFAULT_ROOT,
     resolve_adni_task,
-    build_adni_transform,
+    build_adni_volume_transform,
 )
-from datasets.duke import DukeMultiSliceDataset  # noqa: E402
+from datasets.duke import (  # noqa: E402
+    DukeMultiSliceDataset,
+    build_duke_volume_transform,
+)
+from ssl_finetuning.splits import patient_level_stratified_split  # noqa: E402
+from merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -63,351 +66,9 @@ DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
 DATASET_CHOICES = ("duke", "adni")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
+EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
 MultiSliceDataset = Union[DukeMultiSliceDataset, ADNIMultiSliceDataset]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
-_BLOCK_QKV_RE = re.compile(r"blocks\.(\d+)\.attn\.qkv\.")
-_LORA_QKV_RE = re.compile(r"blocks\.(\d+)\.attn\.qkv\.w_[ab]_[qkv]\.weight$")
-_VANILLA_QKV_RE = re.compile(r"blocks\.(\d+)\.attn\.qkv\.weight$")
-
-
-def _checkpoint_state_dict(checkpoint: object) -> Dict[str, torch.Tensor]:
-    """Select a backbone-bearing state dict from a regular checkpoint."""
-    if not isinstance(checkpoint, dict):
-        raise ValueError("Checkpoint must contain a mapping of parameter names to tensors")
-
-    state: object = checkpoint
-    for key in ("teacher", "student"):
-        candidate = checkpoint.get(key)
-        if isinstance(candidate, dict):
-            state = candidate
-            break
-    else:
-        candidate = checkpoint.get("model")
-        if isinstance(candidate, dict):
-            for key in ("teacher", "student"):
-                nested = candidate.get(key)
-                if isinstance(nested, dict):
-                    state = nested
-                    break
-            else:
-                state = candidate
-
-    if not isinstance(state, dict):
-        raise ValueError("Checkpoint does not contain a usable state dict")
-    return {
-        str(name): value
-        for name, value in state.items()
-        if isinstance(value, torch.Tensor)
-    }
-
-
-def _normalize_backbone_state(
-    state: Dict[str, torch.Tensor],
-    encoder: nn.Module,
-) -> Dict[str, torch.Tensor]:
-    """Keep and normalize only parameters understood by ``encoder``."""
-    expected = set(encoder.state_dict())
-    normalized: Dict[str, torch.Tensor] = {}
-    for original_name, value in state.items():
-        name = original_name
-        changed = True
-        while changed:
-            changed = False
-            for prefix in ("module.", "model.", "teacher.", "student.", "backbone."):
-                if name.startswith(prefix):
-                    name = name[len(prefix) :]
-                    changed = True
-                    break
-
-        candidates = [name]
-        if ".attn.qkv.qkv." in name:
-            candidates.append(name.replace(".attn.qkv.qkv.", ".attn.qkv."))
-        elif ".attn.qkv." in name:
-            candidates.append(name.replace(".attn.qkv.", ".attn.qkv.qkv."))
-        for candidate in candidates:
-            if candidate in expected:
-                normalized[candidate] = value
-                break
-    return normalized
-
-
-def _canonical_checkpoint_name(name: str) -> str:
-    """Strip common checkpoint containers from a parameter name."""
-    changed = True
-    while changed:
-        changed = False
-        for prefix in ("module.", "model.", "teacher.", "student.", "backbone."):
-            if name.startswith(prefix):
-                name = name[len(prefix) :]
-                changed = True
-                break
-    return name
-
-
-def _infer_unfrozen_tail(names: Sequence[str]) -> int:
-    """Infer the number of final blocks using vanilla-vs-LoRA QKV names.
-
-    Mixed checkpoints produced by continued pretraining have LoRA QKV names
-    in the early blocks (``qkv.qkv`` plus ``w_a_*``/``w_b_*``) and ordinary
-    QKV names in the fully unfrozen suffix. Pure-LoRA and ordinary checkpoints
-    therefore naturally resolve to zero here.
-    """
-    block_ids = set()
-    lora_blocks = set()
-    vanilla_blocks = set()
-    for original_name in names:
-        name = _canonical_checkpoint_name(str(original_name))
-        match = _BLOCK_QKV_RE.search(name)
-        if match:
-            block_ids.add(int(match.group(1)))
-        match = _LORA_QKV_RE.search(name)
-        if match:
-            lora_blocks.add(int(match.group(1)))
-        match = _VANILLA_QKV_RE.search(name)
-        if match:
-            vanilla_blocks.add(int(match.group(1)))
-
-    if not lora_blocks or not block_ids:
-        return 0
-
-    tail = 0
-    for block_index in range(max(block_ids), -1, -1):
-        if block_index in vanilla_blocks and block_index not in lora_blocks:
-            tail += 1
-        else:
-            break
-    return tail
-
-
-def _build_custom_vit_base(
-    *,
-    repo_dir: Path,
-    ssl_architecture: bool,
-    with_lora: bool,
-    lora_rank: int,
-    unfreeze_last_layers: int = 0,
-) -> nn.Module:
-    """Build the ViT-B variant used by a custom DINOv3 SSL checkpoint."""
-    repo_dir = Path(repo_dir)
-    if not repo_dir.is_dir():
-        raise FileNotFoundError(f"DINOv3 repo not found: {repo_dir}")
-    if str(repo_dir) not in sys.path:
-        sys.path.insert(0, str(repo_dir))
-
-    from dinov3.models.vision_transformer import vit_base
-
-    if ssl_architecture:
-        encoder = vit_base(
-            patch_size=16,
-            pos_embed_rope_base=100.0,
-            pos_embed_rope_normalize_coords="separate",
-            pos_embed_rope_dtype="bf16",
-            qkv_bias=True,
-            layerscale_init=1.0e-05,
-            norm_layer="layernorm",
-            ffn_layer="mlp",
-            ffn_bias=True,
-            proj_bias=True,
-            n_storage_tokens=0,
-            mask_k_bias=False,
-        )
-    else:
-        # Match the released ``dinov3_vitb16`` hub model for ordinary raw
-        # DINOv3 .pth files, while still loading the file ourselves.
-        encoder = vit_base(
-            patch_size=16,
-            pos_embed_rope_base=100.0,
-            pos_embed_rope_normalize_coords="separate",
-            pos_embed_rope_rescale_coords=2,
-            pos_embed_rope_dtype="fp32",
-            qkv_bias=True,
-            layerscale_init=1.0e-05,
-            norm_layer="layernormbf16",
-            ffn_layer="mlp",
-            ffn_bias=True,
-            proj_bias=True,
-            n_storage_tokens=4,
-            mask_k_bias=True,
-        )
-    if with_lora:
-        add_lora_to_vit(encoder, r=lora_rank)
-        if not 0 <= unfreeze_last_layers <= len(encoder.blocks):
-            raise ValueError(
-                "unfreeze_last_layers must be between 0 and the number of ViT blocks; "
-                f"got {unfreeze_last_layers}"
-            )
-        for block in encoder.blocks[-unfreeze_last_layers:] if unfreeze_last_layers else ():
-            if not isinstance(block.attn.qkv, LoRA):
-                raise TypeError("Expected a LoRA-wrapped QKV while restoring the unfrozen tail")
-            block.attn.qkv = block.attn.qkv.qkv
-    return encoder
-
-
-def _resolve_dcp_checkpoint(path: Path) -> Path:
-    """Accept either one DCP directory or a DINOv3 ``ckpt`` parent."""
-    if (path / ".metadata").is_file():
-        return path
-    candidates = sorted(
-        (child for child in path.iterdir() if child.is_dir() and child.name.isdigit()),
-        key=lambda child: int(child.name),
-    )
-    if candidates and (candidates[-1] / ".metadata").is_file():
-        resolved = candidates[-1]
-        logger.info("Checkpoint directory contains multiple DCP steps; using latest: %s", resolved)
-        return resolved
-    raise ValueError(
-        f"No DINOv3 distributed checkpoint metadata found in directory: {path}"
-    )
-
-
-def _load_dcp_backbone(
-    encoder: nn.Module,
-    checkpoint_dir: Path,
-    *,
-    source_prefix: str,
-) -> int:
-    """Load only one backbone prefix from a DINOv3 DCP checkpoint."""
-    import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.filesystem import FileSystemReader
-
-    state = {name: torch.empty_like(value) for name, value in encoder.state_dict().items()}
-    destination: Dict[str, object] = {"model": {}}
-    cursor: Dict[str, object] = destination["model"]  # type: ignore[assignment]
-    prefix_parts = source_prefix.removesuffix(".").split(".")
-    for part in prefix_parts[1:]:  # ``model`` is already the top-level key.
-        child: Dict[str, object] = {}
-        cursor[part] = child
-        cursor = child
-    cursor.update(state)
-
-    dcp.load(destination, storage_reader=FileSystemReader(checkpoint_dir))
-    loaded_state = cursor
-    assert isinstance(loaded_state, dict)
-    result = encoder.load_state_dict(loaded_state, strict=True)  # type: ignore[arg-type]
-    if result.missing_keys or result.unexpected_keys:
-        raise RuntimeError(
-            "Unexpected distributed-backbone load result: "
-            f"missing={result.missing_keys}, unexpected={result.unexpected_keys}"
-        )
-    return len(state)
-
-
-def _load_custom_dinov3_encoder(
-    *,
-    checkpoint: Path,
-    repo_dir: Path,
-    device: torch.device,
-    encoder_training: str,
-    lora_rank: int,
-) -> nn.Module:
-    """Load a ViT-B backbone from a regular or distributed custom checkpoint."""
-    if checkpoint.is_dir():
-        checkpoint = _resolve_dcp_checkpoint(checkpoint)
-        from torch.distributed.checkpoint.filesystem import FileSystemReader
-
-        metadata = FileSystemReader(checkpoint).read_metadata()
-        metadata_keys = set(metadata.state_dict_metadata)
-        prefixes = (
-            "model.teacher.backbone.",
-            "model.student.backbone.",
-            "model.backbone.",
-        )
-        source_prefix = next(
-            (prefix for prefix in prefixes if any(key.startswith(prefix) for key in metadata_keys)),
-            None,
-        )
-        if source_prefix is None:
-            raise ValueError(
-                "Distributed checkpoint has no ViT backbone under the expected "
-                f"prefixes: {checkpoint}"
-            )
-        backbone_keys = [key for key in metadata_keys if key.startswith(source_prefix)]
-        has_lora = any(".w_a_" in key or ".w_b_" in key for key in backbone_keys)
-        has_storage_tokens = any(key.endswith(".storage_tokens") for key in backbone_keys)
-        unfreeze_last_layers = _infer_unfrozen_tail(backbone_keys)
-        checkpoint_lora_rank = next(
-            (
-                int(metadata.state_dict_metadata[key].size[0])
-                for key in backbone_keys
-                if key.endswith(".w_a_q.weight")
-            ),
-            lora_rank,
-        )
-        encoder = _build_custom_vit_base(
-            repo_dir=repo_dir,
-            ssl_architecture=not has_storage_tokens,
-            with_lora=has_lora,
-            lora_rank=checkpoint_lora_rank,
-            unfreeze_last_layers=unfreeze_last_layers,
-        )
-        loaded_count = _load_dcp_backbone(
-            encoder, checkpoint, source_prefix=source_prefix.removesuffix(".")
-        )
-        logger.info(
-            "Loaded ViT-B backbone from distributed checkpoint %s (%d tensors); "
-            "LoRA=%s, unfrozen_tail=%d, rank=%d; "
-            "discarded decoder, heads, losses, and optimizer",
-            checkpoint,
-            loaded_count,
-            has_lora,
-            unfreeze_last_layers,
-            checkpoint_lora_rank,
-        )
-    else:
-        if not checkpoint.is_file():
-            raise FileNotFoundError(f"Custom DINOv3 checkpoint not found: {checkpoint}")
-        loaded = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        state = _checkpoint_state_dict(loaded)
-        has_lora = any(".w_a_" in key or ".w_b_" in key for key in state)
-        unfreeze_last_layers = _infer_unfrozen_tail(state)
-        has_storage_tokens = any(
-            _canonical_checkpoint_name(key).endswith("storage_tokens") for key in state
-        )
-        checkpoint_lora_rank = next(
-            (int(value.shape[0]) for key, value in state.items() if key.endswith(".w_a_q.weight")),
-            lora_rank,
-        )
-        encoder = _build_custom_vit_base(
-            repo_dir=repo_dir,
-            ssl_architecture=not has_storage_tokens,
-            with_lora=has_lora,
-            lora_rank=checkpoint_lora_rank,
-            unfreeze_last_layers=unfreeze_last_layers,
-        )
-        backbone_state = _normalize_backbone_state(state, encoder)
-        if not backbone_state:
-            raise ValueError(f"No ViT-B backbone parameters found in checkpoint: {checkpoint}")
-        incompatible = encoder.load_state_dict(backbone_state, strict=False)
-        missing = [key for key in incompatible.missing_keys if key in encoder.state_dict()]
-        if missing:
-            raise ValueError(
-                f"Custom checkpoint is missing {len(missing)} ViT-B backbone tensors; "
-                f"first missing keys: {missing[:5]}"
-            )
-        logger.info(
-            "Loaded ViT-B backbone from regular checkpoint %s (%d tensors); "
-            "LoRA=%s, unfrozen_tail=%d, rank=%d; "
-            "discarded non-backbone entries",
-            checkpoint,
-            len(backbone_state),
-            has_lora,
-            unfreeze_last_layers,
-            checkpoint_lora_rank,
-        )
-
-    has_encoder_lora = any(
-        is_lora_parameter_name(name) for name, _ in encoder.named_parameters()
-    )
-    if encoder_training == "lora" and not has_encoder_lora:
-        add_lora_to_vit(encoder, r=lora_rank)
-    if encoder_training == "lora":
-        freeze_non_lora_parameters(encoder)
-        # A mixed checkpoint has a fully trainable suffix whose parameters do
-        # not carry LoRA markers. Restore that training behavior if requested.
-        if unfreeze_last_layers:
-            encoder.blocks[-unfreeze_last_layers:].requires_grad_(True)
-    return encoder.to(device).eval()
-
 
 def is_lora_parameter_name(name: str) -> bool:
     return any(parameter_name in name for parameter_name in LORA_PARAMETER_NAMES)
@@ -523,7 +184,7 @@ class MultiSliceDinoModel(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(d_model, classifier_hidden),
             nn.Dropout(0.5),
-            nn.BatchNorm1d(classifier_hidden),
+            nn.LayerNorm(classifier_hidden),
             nn.GELU(),
             nn.Linear(classifier_hidden, self.num_classes),
         )
@@ -912,7 +573,7 @@ def should_early_stop(
     min_epochs: int,
     patience: int,
 ) -> bool:
-    """Return whether validation loss has failed to improve long enough."""
+    """Return whether the selected validation metric has failed to improve."""
     return (
         best_epoch > 0
         and epoch >= min_epochs
@@ -928,208 +589,47 @@ def _adni_patient_stratum(dataset: ADNIMultiSliceDataset, index: int) -> int:
     return int(dataset.get_target(index))
 
 
-def _held_out_counts(
-    n_patients: int,
-    *,
-    val_frac: float,
-    test_frac: float,
-) -> Tuple[int, int]:
-    """Choose per-stratum val/test sizes, leaving at least one train patient when possible."""
-    n_val = int(round(n_patients * val_frac)) if val_frac > 0 else 0
-    n_test = int(round(n_patients * test_frac)) if test_frac > 0 else 0
-    if n_patients >= 3 and val_frac > 0 and test_frac > 0:
-        n_val = max(n_val, 1)
-        n_test = max(n_test, 1)
-        overflow = n_val + n_test - (n_patients - 1)
-        if overflow > 0:
-            reduce_test = min(overflow, max(n_test - 1, 0))
-            n_test -= reduce_test
-            overflow -= reduce_test
-            n_val -= overflow
-    elif n_patients >= 2:
-        # Tiny strata can support only one held-out patient while keeping train.
-        if val_frac > 0:
-            n_val = min(max(n_val, 1), n_patients - 1)
-            n_test = 0
-        elif test_frac > 0:
-            n_test = min(max(n_test, 1), n_patients - 1)
-            n_val = 0
-        else:
-            n_val = n_test = 0
-    else:
-        n_val = n_test = 0
-    return n_val, n_test
 
-
-_SPLIT_NAMES = ("train", "val", "test")
-
-
-def _load_patient_split_assignments(
-    splits_file: Path,
-    available_patient_ids: Sequence[str],
-) -> Dict[str, str]:
-    """Load saved patient assignments, ignoring patients absent from this dataset.
-
-    Shared ADNI split files can contain patients from diagnoses that are not part
-    of the current ``--adni-task``.  The dataset has already filtered those
-    diagnoses, so only assignments for patients present in the current dataset
-    are retained.
-    """
-    path = Path(splits_file).expanduser()
-    if not path.is_file():
-        raise FileNotFoundError(f"Patient splits file not found: {path}")
-
-    with path.open(encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"Patient splits file must contain a JSON object: {path}")
-
-    split_lists = payload.get("splits", payload)
-    if not isinstance(split_lists, Mapping):
-        raise ValueError(f"Patient splits file is missing a 'splits' mapping: {path}")
-
-    assignments: Dict[str, str] = {}
-    for split in _SPLIT_NAMES:
-        patients = split_lists.get(split, [])
-        if not isinstance(patients, list):
-            raise ValueError(
-                f"Patient splits file entry {split!r} must be a list: {path}"
-            )
-        for raw_patient_id in patients:
-            patient_id = str(raw_patient_id)
-            if patient_id in assignments:
-                raise ValueError(
-                    f"Patient {patient_id!r} occurs in multiple saved splits: {path}"
-                )
-            assignments[patient_id] = split
-
-    available = {str(patient_id) for patient_id in available_patient_ids}
-    missing = sorted(available - set(assignments))
-    if missing:
-        raise ValueError(
-            "Patient splits file is missing patients from the current dataset: "
-            f"{missing[:5]}" + (" ..." if len(missing) > 5 else "")
+def _dataset_patient_ids(dataset: Dataset) -> set[str]:
+    """Return the patient IDs represented by a dataset."""
+    get_patient_id = getattr(dataset, "get_patient_id", None)
+    if get_patient_id is None:
+        raise TypeError(
+            f"Dataset {type(dataset).__name__} must provide get_patient_id()"
         )
-
-    ignored = sorted(set(assignments) - available)
-    if ignored:
-        logger.info(
-            "Loaded patient splits from %s; ignoring %d patients not present "
-            "in the current dataset (likely excluded diagnoses)",
-            path,
-            len(ignored),
-        )
-    else:
-        logger.info("Loaded patient splits from %s", path)
-
-    return {patient_id: assignments[patient_id] for patient_id in available}
+    return {str(get_patient_id(index)) for index in range(len(dataset))}
 
 
-def patient_level_split(
-    dataset: MultiSliceDataset,
-    *,
-    val_frac: float,
-    test_frac: float,
-    seed: int,
-    get_stratum: Callable[[Any, int], Optional[int]],
-    unit_name: str = "samples",
-    splits_file: Optional[Path] = None,
-) -> Tuple[Subset, Optional[Subset], Optional[Subset]]:
-    """Split samples by patient into train / validation / test with optional stratification.
-
-    ``test_frac`` patients are reserved and never used for training or model selection.
-    """
-    if not 0.0 <= val_frac < 1.0:
-        raise ValueError(f"val_frac must be in [0, 1), got {val_frac}")
-    if not 0.0 <= test_frac < 1.0:
-        raise ValueError(f"test_frac must be in [0, 1), got {test_frac}")
-    if val_frac + test_frac >= 1.0:
-        raise ValueError(
-            f"val_frac + test_frac must be < 1, got {val_frac} + {test_frac}"
-        )
-    if val_frac == 0 and test_frac == 0 and splits_file is None:
-        return Subset(dataset, list(range(len(dataset)))), None, None
-
-    patient_indices: Dict[str, List[int]] = defaultdict(list)
-    strata: Dict[str, Optional[int]] = {}
-    for index in range(len(dataset)):
-        patient_id = str(dataset.get_patient_id(index))
-        patient_indices[patient_id].append(index)
-        if patient_id not in strata:
-            strata[patient_id] = get_stratum(dataset, index)
-
-    if splits_file is not None:
-        assignments = _load_patient_split_assignments(
-            splits_file,
-            list(patient_indices),
-        )
-        train_patients = sorted(
-            patient_id for patient_id, split in assignments.items() if split == "train"
-        )
-        val_patients = sorted(
-            patient_id for patient_id, split in assignments.items() if split == "val"
-        )
-        test_patients = sorted(
-            patient_id for patient_id, split in assignments.items() if split == "test"
-        )
-    else:
-        rng = np.random.RandomState(seed)
-        grouped: Dict[Optional[int], List[str]] = defaultdict(list)
-        for patient_id in patient_indices:
-            grouped[strata.get(patient_id)].append(patient_id)
-
-        train_patients = []
-        val_patients = []
-        test_patients = []
-        for stratum, patients in grouped.items():
-            rng.shuffle(patients)
-            n_val, n_test = _held_out_counts(
-                len(patients), val_frac=val_frac, test_frac=test_frac
-            )
-            test_patients.extend(patients[:n_test])
-            val_patients.extend(patients[n_test : n_test + n_val])
-            train_patients.extend(patients[n_test + n_val :])
-            logger.info(
-                "patient split stratum=%s train=%d val=%d test=%d",
-                stratum,
-                len(patients) - n_val - n_test,
-                n_val,
-                n_test,
-            )
-
-    train_indices = [
-        index for patient_id in train_patients for index in patient_indices[patient_id]
-    ]
-    val_indices = [
-        index for patient_id in val_patients for index in patient_indices[patient_id]
-    ]
-    test_indices = [
-        index for patient_id in test_patients for index in patient_indices[patient_id]
-    ]
-    disjoint = (
-        set(train_patients).isdisjoint(val_patients)
-        and set(train_patients).isdisjoint(test_patients)
-        and set(val_patients).isdisjoint(test_patients)
+def _assert_loader_patient_disjoint(
+    train_loader: DataLoader,
+    val_loader: Optional[DataLoader],
+    test_loader: Optional[DataLoader],
+) -> None:
+    """Assert that no patient is represented in more than one split loader."""
+    train_patients = _dataset_patient_ids(train_loader.dataset)
+    val_patients = (
+        _dataset_patient_ids(val_loader.dataset) if val_loader is not None else set()
     )
-    if not disjoint:
-        raise RuntimeError("Patient leakage across train/validation/test split")
+    test_patients = (
+        _dataset_patient_ids(test_loader.dataset) if test_loader is not None else set()
+    )
+    assert train_patients.isdisjoint(val_patients), (
+        "Patient leakage between train and validation loaders: "
+        f"{sorted(train_patients.intersection(val_patients))[:5]}"
+    )
+    assert train_patients.isdisjoint(test_patients), (
+        "Patient leakage between train and test loaders: "
+        f"{sorted(train_patients.intersection(test_patients))[:5]}"
+    )
+    assert val_patients.isdisjoint(test_patients), (
+        "Patient leakage between validation and test loaders: "
+        f"{sorted(val_patients.intersection(test_patients))[:5]}"
+    )
     logger.info(
-        "patient-level split: train_patients=%d val_patients=%d test_patients=%d "
-        "train_%s=%d val_%s=%d test_%s=%d",
+        "Verified mutually exclusive loader patients: train=%d val=%d test=%d",
         len(train_patients),
         len(val_patients),
         len(test_patients),
-        unit_name,
-        len(train_indices),
-        unit_name,
-        len(val_indices),
-        unit_name,
-        len(test_indices),
-    )
-    return (
-        Subset(dataset, train_indices),
-        Subset(dataset, val_indices) if val_indices else None,
-        Subset(dataset, test_indices) if test_indices else None,
     )
 
 
@@ -1140,39 +640,52 @@ def evaluate(
     device: torch.device,
     *,
     class_weights: Optional[torch.Tensor] = None,
-) -> Tuple[float, float]:
-    """Return mean validation loss and F1 (binary or macro)."""
+    bce_pos_weight: Optional[torch.Tensor] = None,
+) -> Tuple[float, float, float]:
+    """Return mean validation loss, F1, and AUROC."""
     model.eval()
     total_loss = 0.0
     total = 0
     targets_all: List[np.ndarray] = []
     predictions_all: List[np.ndarray] = []
+    probabilities_all: List[np.ndarray] = []
     binary = is_binary_task(model.num_classes)
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         logits = model(images)
         if binary:
             targets = targets.to(device, non_blocking=True).float()
-            loss = F.binary_cross_entropy_with_logits(logits, targets)
-            predictions = (logits >= 0).long()
+            if bce_pos_weight is None:
+                loss = F.binary_cross_entropy_with_logits(logits, targets)
+            else:
+                loss = F.binary_cross_entropy_with_logits(
+                    logits, targets, pos_weight=bce_pos_weight
+                )
+            probabilities = torch.sigmoid(logits)
+            predictions = (probabilities >= 0.5).long()
             target_labels = targets.long()
         else:
             targets = targets.to(device, non_blocking=True).long()
             loss = F.cross_entropy(logits, targets, weight=class_weights)
-            predictions = logits.argmax(dim=-1)
+            probabilities = torch.softmax(logits, dim=-1)
+            predictions = probabilities.argmax(dim=-1)
             target_labels = targets
         n_items = int(targets.numel())
         total_loss += float(loss.item()) * n_items
         total += n_items
         targets_all.append(target_labels.cpu().numpy())
         predictions_all.append(predictions.cpu().numpy())
+        probabilities_all.append(probabilities.cpu().numpy())
 
     if total == 0:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan")
     y_true = np.concatenate(targets_all)
     y_pred = np.concatenate(predictions_all)
-    return total_loss / total, classification_f1(
-        y_true, y_pred, num_classes=model.num_classes
+    y_probability = np.concatenate(probabilities_all)
+    return (
+        total_loss / total,
+        classification_f1(y_true, y_pred, num_classes=model.num_classes),
+        compute_auroc(y_true, y_probability, num_classes=model.num_classes),
     )
 
 
@@ -1234,19 +747,12 @@ def _checkpoint_payload(
         "weights": str(args.weights) if args.weights is not None else None,
         "features": args.features,
         "slice_aggregator": args.slice_aggregator,
-        "train_slice_sampling": args.train_slice_sampling,
+        "weight_ce_loss": args.weight_ce_loss,
+        "early_stopping_metric": args.early_stopping_metric,
         "n_slices": args.n_slices,
-        "minimum_z_index_distance": args.minimum_z_index_distance,
         "include_bilateral": args.include_bilateral,
-        "z_min": args.z_min,
-        "z_max": args.z_max,
         "image_size": args.image_size,
         "augment": args.augment,
-        "crop_scale_min": args.crop_scale_min,
-        "jitter": args.jitter,
-        "rotation_degrees": args.rotation_degrees,
-        "horizontal_flip_prob": args.horizontal_flip_prob,
-        "vertical_flip_prob": args.vertical_flip_prob,
         "d_model": args.d_model,
         "mst_depth": args.mst_depth,
         "mst_heads": args.mst_heads,
@@ -1273,29 +779,19 @@ def build_dataset(
     args: argparse.Namespace,
     *,
     augment: Optional[bool] = None,
-    slice_sampling: str = "random",
+    patient_ids: Optional[Sequence[str]] = None,
 ) -> MultiSliceDataset:
     use_augment = args.augment if augment is None else bool(augment)
-    transform_kwargs = dict(
-        image_size=args.image_size,
-        augment=use_augment,
-        crop_scale_min=args.crop_scale_min,
-        jitter=args.jitter,
-        rotation_degrees=args.rotation_degrees,
-        horizontal_flip_prob=args.horizontal_flip_prob,
-        vertical_flip_prob=args.vertical_flip_prob,
-    )
     if args.dataset == "duke":
         return DukeMultiSliceDataset(
             root=args.data_root,
             n_slices=args.n_slices,
-            minimum_z_index_distance=args.minimum_z_index_distance,
             include_bilateral=args.include_bilateral,
             scan=args.scan,
-            z_min=args.z_min,
-            z_max=args.z_max,
-            transform=build_transform(**transform_kwargs),
-            slice_sampling=slice_sampling,
+            patient_ids=patient_ids,
+            augment=use_augment,
+            image_size=args.image_size,
+            transform=build_duke_volume_transform(augment=use_augment),
         )
     if args.dataset == "adni":
         return ADNIMultiSliceDataset(
@@ -1303,11 +799,10 @@ def build_dataset(
             csv_path=args.csv_path,
             task=args.adni_task,
             n_slices=args.n_slices,
-            minimum_z_index_distance=args.minimum_z_index_distance,
-            z_min=args.z_min,
-            z_max=args.z_max,
-            transform=build_adni_transform(**transform_kwargs),
-            slice_sampling=slice_sampling,
+            patient_ids=patient_ids,
+            augment=use_augment,
+            image_size=args.image_size,
+            transform=build_adni_volume_transform(augment=use_augment),
         )
     raise ValueError(f"Unknown dataset={args.dataset!r}")
 
@@ -1319,73 +814,129 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     )
     binary = is_binary_task(num_classes)
     unit_name = "breasts" if args.dataset == "duke" else "scans"
-    # Train keeps stochastic augmentations; slice sampling is configurable.
-    # Validation/test are deterministic: no augmentations + evenly spaced slices.
-    train_full = build_dataset(
-        args,
-        augment=args.augment,
-        slice_sampling=args.train_slice_sampling,
-    )
-    labels = collect_labels(train_full)
+    # Generate or load patient IDs once, then construct each split directly.
+    split_dataset = build_dataset(args, augment=False)
+    labels = collect_labels(split_dataset)
     summarize_class_counts(labels, name=f"full dataset ({unit_name})", class_names=class_names)
 
-    get_stratum: Callable[[Any, int], Optional[int]]
-    if args.dataset == "duke":
-        get_stratum = _duke_patient_stratum
-    else:
-        get_stratum = _adni_patient_stratum
-
-    train_dataset, train_val_subset, train_test_subset = patient_level_split(
-        train_full,
-        val_frac=args.val_frac,
-        test_frac=args.test_frac,
-        seed=args.seed,
-        get_stratum=get_stratum,
-        unit_name=unit_name,
-        splits_file=args.splits_file,
+    get_stratum: Callable[[Any, int], Optional[int]] = (
+        _duke_patient_stratum if args.dataset == "duke" else _adni_patient_stratum
     )
-    val_dataset: Optional[Subset] = None
-    test_dataset: Optional[Subset] = None
-    if train_val_subset is not None or train_test_subset is not None:
-        eval_full = build_dataset(args, augment=False, slice_sampling="even")
-        if len(eval_full) != len(train_full):
-            raise RuntimeError(
-                "Train/eval dataset index mismatch: "
-                f"train_full={len(train_full)} eval_full={len(eval_full)}"
-            )
-        if train_val_subset is not None:
-            val_dataset = Subset(eval_full, list(train_val_subset.indices))
+    _, split_metadata = patient_level_stratified_split(
+        split_dataset,
+        dataset_name=args.dataset,
+        train_fraction=1.0 - args.val_frac - args.test_frac,
+        val_fraction=args.val_frac,
+        test_fraction=args.test_frac,
+        seed=args.seed,
+        stratum_fn=get_stratum,
+        split_file=args.splits_file,
+        use_saved_split_config=False,
+        # A saved ADNI split can contain all diagnoses. The active task uses
+        # only its allowed diagnoses, so discard the other patient IDs while
+        # still requiring every task-eligible patient to be assigned once.
+        allow_saved_patient_superset=args.dataset == "adni",
+        # ADNI task label IDs depend on the pair of diagnoses, whereas the
+        # patient assignments remain valid across task-specific subsets.
+        validate_saved_patient_strata=args.dataset != "adni",
+    )
+    split_patients = split_metadata["splits"]
+    train_patient_ids = [str(patient_id) for patient_id in split_patients["train"]]
+    val_patient_ids = [str(patient_id) for patient_id in split_patients["val"]]
+    test_patient_ids = [str(patient_id) for patient_id in split_patients["test"]]
+    if args.dataset == "adni":
+        task_patient_ids = _dataset_patient_ids(split_dataset)
+        split_patient_lists = (train_patient_ids, val_patient_ids, test_patient_ids)
+        excluded_patients = sum(
+            patient_id not in task_patient_ids
+            for patient_ids in split_patient_lists
+            for patient_id in patient_ids
+        )
+        train_patient_ids = [
+            patient_id for patient_id in train_patient_ids if patient_id in task_patient_ids
+        ]
+        val_patient_ids = [
+            patient_id for patient_id in val_patient_ids if patient_id in task_patient_ids
+        ]
+        test_patient_ids = [
+            patient_id for patient_id in test_patient_ids if patient_id in task_patient_ids
+        ]
+        if excluded_patients:
             logger.info(
-                "Validation uses augment=False and evenly spaced slices "
-                "(n_val=%d)",
-                len(val_dataset),
-            )
-        if train_test_subset is not None:
-            test_dataset = Subset(eval_full, list(train_test_subset.indices))
-            logger.info(
-                "Test uses augment=False and evenly spaced slices "
-                "(n_test=%d)",
-                len(test_dataset),
+                "Excluded %d patients outside ADNI task %s from the saved split",
+                excluded_patients,
+                resolve_adni_task(args.adni_task).name,
             )
 
-    train_labels = labels[train_dataset.indices]
+    train_dataset = build_dataset(
+        args, augment=args.augment, patient_ids=train_patient_ids
+    )
+    val_dataset: Optional[MultiSliceDataset] = (
+        build_dataset(args, augment=False, patient_ids=val_patient_ids)
+        if val_patient_ids
+        else None
+    )
+    test_dataset: Optional[MultiSliceDataset] = (
+        build_dataset(args, augment=False, patient_ids=test_patient_ids)
+        if test_patient_ids
+        else None
+    )
+    assert _dataset_patient_ids(train_dataset) == set(train_patient_ids)
+    if val_dataset is not None:
+        assert _dataset_patient_ids(val_dataset) == set(val_patient_ids)
+    if test_dataset is not None:
+        assert _dataset_patient_ids(test_dataset) == set(test_patient_ids)
+    logger.info(
+        "Datasets: train=%d patients/%d %s, val=%d patients/%d %s, "
+        "test=%d patients/%d %s",
+        len(train_patient_ids),
+        len(train_dataset),
+        unit_name,
+        len(val_patient_ids),
+        len(val_dataset) if val_dataset is not None else 0,
+        unit_name,
+        len(test_patient_ids),
+        len(test_dataset) if test_dataset is not None else 0,
+        unit_name,
+    )
+
+    train_labels = collect_labels(train_dataset)
     train_counts = summarize_class_counts(
         train_labels, name=f"train ({unit_name})", class_names=class_names
     )
     if val_dataset is not None:
         summarize_class_counts(
-            labels[val_dataset.indices],
+            collect_labels(val_dataset),
             name=f"val ({unit_name})",
             class_names=class_names,
         )
     if test_dataset is not None:
         summarize_class_counts(
-            labels[test_dataset.indices],
+            collect_labels(test_dataset),
             name=f"test ({unit_name})",
             class_names=class_names,
         )
 
     class_weights: Optional[torch.Tensor] = None
+    bce_pos_weight: Optional[torch.Tensor] = None
+    if binary and args.weight_ce_loss:
+        negative_count = train_counts.get(0, 0)
+        positive_count = train_counts.get(1, 0)
+        if negative_count <= 0 or positive_count <= 0:
+            raise ValueError(
+                "Cannot compute a weighted BCE loss without both binary classes "
+                f"in the training split: negative={negative_count}, "
+                f"positive={positive_count}"
+            )
+        bce_pos_weight = torch.tensor(
+            [negative_count / positive_count], dtype=torch.float32, device=device
+        )
+        logger.info(
+            "BCE positive-class weight: %.6f (negative=%d positive=%d)",
+            float(bce_pos_weight.item()),
+            negative_count,
+            positive_count,
+        )
     if not binary:
         class_weights = inverse_frequency_weights(
             train_counts, num_classes=num_classes
@@ -1428,9 +979,10 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         if test_dataset is not None
         else None
     )
+    _assert_loader_patient_disjoint(train_loader, val_loader, test_loader)
 
     if args.weights is not None and args.encoder == "dinov3":
-        encoder = _load_custom_dinov3_encoder(
+        encoder = load_custom_dinov3_encoder(
             checkpoint=Path(args.weights),
             repo_dir=args.dinov3_repo,
             device=device,
@@ -1480,7 +1032,12 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         else None
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_val = float("inf")
+    best_metric_value = (
+        float("inf")
+        if args.early_stopping_metric == "bce_loss"
+        else float("-inf")
+    )
+    best_checkpoint_val_loss = float("inf")
     best_epoch = 0
     best_path = checkpoint_dir / "best_mst.pt"
     epochs_trained = 0
@@ -1492,7 +1049,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
 
     logger.info(
         "dataset=%s adni_task=%s encoder=%s features=%s aggregator=%s "
-        "train_slice_sampling=%s n_slices=%d "
+        "n_slices=%d "
         "encoder_training=%s lora_r=%s freeze_epochs=%d num_classes=%d "
         "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
         args.dataset,
@@ -1500,7 +1057,6 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         args.encoder,
         args.features,
         args.slice_aggregator,
-        args.train_slice_sampling,
         args.n_slices,
         args.encoder_training,
         args.lora_r if args.encoder_training == "lora" else None,
@@ -1537,7 +1093,12 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             logits = model(images)
             if binary:
                 targets = targets.to(device, non_blocking=True).float()
-                loss = F.binary_cross_entropy_with_logits(logits, targets)
+                if bce_pos_weight is None:
+                    loss = F.binary_cross_entropy_with_logits(logits, targets)
+                else:
+                    loss = F.binary_cross_entropy_with_logits(
+                        logits, targets, pos_weight=bce_pos_weight
+                    )
                 predictions = (logits >= 0).float()
                 correct += int((predictions == targets).sum().item())
             else:
@@ -1567,12 +1128,28 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
                 scheduler.step()
             continue
 
-        val_loss, val_f1 = evaluate(
-            model, val_loader, device, class_weights=class_weights
+        val_loss, val_f1, val_auroc = evaluate(
+            model,
+            val_loader,
+            device,
+            class_weights=class_weights,
+            bce_pos_weight=bce_pos_weight,
         )
-        improved = val_loss < best_val
+        validation_metrics = {
+            "bce_loss": val_loss,
+            "f1": val_f1,
+            "auroc": val_auroc,
+        }
+        current_metric_value = validation_metrics[args.early_stopping_metric]
+        if math.isnan(current_metric_value):
+            improved = False
+        elif args.early_stopping_metric == "bce_loss":
+            improved = current_metric_value < best_metric_value
+        else:
+            improved = current_metric_value > best_metric_value
         if improved:
-            best_val = val_loss
+            best_metric_value = current_metric_value
+            best_checkpoint_val_loss = val_loss
             best_epoch = epoch
             torch.save(
                 _checkpoint_payload(
@@ -1584,17 +1161,20 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
                     optimizer=optimizer,
                     val_loss=val_loss,
                     val_f1=val_f1,
+                    val_auroc=val_auroc,
                     class_weights=(
                         class_weights.detach().cpu().tolist()
                         if class_weights is not None
                         else None
                     ),
+                    early_stopping_value=current_metric_value,
                 ),
                 best_path,
             )
         logger.info(
             "epoch %d/%d lr=%.6g train_%s=%.5f train_acc=%.3f "
-            "val_%s=%.5f val_f1=%.3f%s",
+            "val_%s=%.5f val_f1=%.3f val_auroc=%.3f "
+            "early_stopping_%s=%.5f%s",
             epoch,
             args.epochs,
             current_lr,
@@ -1604,6 +1184,9 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             loss_tag,
             val_loss,
             val_f1,
+            val_auroc,
+            args.early_stopping_metric,
+            current_metric_value,
             " *" if improved else "",
         )
         epochs_without_improvement = epoch - best_epoch
@@ -1615,13 +1198,13 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         ):
             stopped_early = True
             logger.info(
-                "Early stopping at epoch %d: validation loss has not decreased "
-                "for %d epochs (best epoch=%d, best val_%s=%.5f)",
+                "Early stopping at epoch %d: validation %s has not improved "
+                "for %d epochs (best epoch=%d, best value=%.5f)",
                 epoch,
+                args.early_stopping_metric,
                 epochs_without_improvement,
                 best_epoch,
-                loss_tag,
-                best_val,
+                best_metric_value,
             )
             break
         if scheduler is not None:
@@ -1642,7 +1225,9 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             class_names=class_names,
             loss_name=loss_name,
             optimizer=optimizer,
-            best_val_loss=best_val if val_loader is not None else None,
+            best_val_loss=(
+                best_checkpoint_val_loss if val_loader is not None else None
+            ),
             best_epoch=best_epoch if val_loader is not None else None,
             stopped_early=stopped_early,
             class_weights=(
@@ -1657,10 +1242,19 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
 
     metrics_by_split: Dict[str, Dict[str, object]] = {}
 
-    if val_loader is not None and best_path.is_file():
-        best = torch.load(best_path, map_location=device, weights_only=False)
-        model.load_trainable_state_dict(best["model"])
+    if val_loader is not None:
+        if best_path.is_file():
+            best = torch.load(best_path, map_location=device, weights_only=False)
+            model.load_trainable_state_dict(best["model"])
+            logger.info("Evaluating final validation metrics from best epoch %d", best["epoch"])
         y_true, y_pred, y_probability = collect_predictions(model, val_loader, device)
+        final_val_loss, _, _ = evaluate(
+            model,
+            val_loader,
+            device,
+            class_weights=class_weights,
+            bce_pos_weight=bce_pos_weight,
+        )
         val_metrics = compute_classification_metrics(
             y_true, y_pred, y_probability, num_classes=num_classes
         )
@@ -1671,11 +1265,16 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             class_names=class_names,
             title="Validation confusion matrix",
         )
-        metrics_by_split["val"] = {"n": int(len(y_true)), **val_metrics}
+        metrics_by_split["val"] = {
+            "n": int(len(y_true)),
+            "loss": final_val_loss,
+            **val_metrics,
+        }
         logger.info(
-            "Best-checkpoint val metrics: n=%d f1=%.4f auroc=%.4f "
+            "Final val metrics: n=%d loss=%.5f f1=%.4f auroc=%.4f "
             "acc=%.4f precision=%.4f recall=%.4f",
             len(y_true),
+            final_val_loss,
             val_metrics["f1"],
             val_metrics["auroc"],
             val_metrics["accuracy"],
@@ -1689,6 +1288,13 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             best = torch.load(best_path, map_location=device, weights_only=False)
             model.load_trainable_state_dict(best["model"])
         y_true, y_pred, y_probability = collect_predictions(model, test_loader, device)
+        final_test_loss, _, _ = evaluate(
+            model,
+            test_loader,
+            device,
+            class_weights=class_weights,
+            bce_pos_weight=bce_pos_weight,
+        )
         test_metrics = compute_classification_metrics(
             y_true, y_pred, y_probability, num_classes=num_classes
         )
@@ -1707,11 +1313,16 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             class_names=class_names,
             title="Test ROC curve",
         )
-        metrics_by_split["test"] = {"n": int(len(y_true)), **test_metrics}
+        metrics_by_split["test"] = {
+            "n": int(len(y_true)),
+            "loss": final_test_loss,
+            **test_metrics,
+        }
         logger.info(
-            "Best-checkpoint test metrics: n=%d f1=%.4f auroc=%.4f "
+            "Final test metrics: n=%d loss=%.5f f1=%.4f auroc=%.4f "
             "acc=%.4f precision=%.4f recall=%.4f",
             len(y_true),
+            final_test_loss,
             test_metrics["f1"],
             test_metrics["auroc"],
             test_metrics["accuracy"],
@@ -1811,29 +1422,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="ADNI metadata CSV (defaults to the CSV inside --data-root)",
     )
     parser.add_argument("--scan", type=str, default="pre")
-    parser.add_argument("--z-min", type=float, default=0)
-    parser.add_argument("--z-max", type=float, default=1)
     parser.add_argument("--n-slices", type=int, default=8)
-    parser.add_argument(
-        "--train-slice-sampling",
-        choices=("random", "even"),
-        default="random",
-        help=(
-            "How slices are sampled for training: random (default) or even "
-            "for deterministic evenly spaced slices"
-        ),
-    )
-    parser.add_argument(
-        "--minimum-z-index-distance",
-        "--min-slices-dist",
-        dest="minimum_z_index_distance",
-        type=int,
-        default=None,
-        help=(
-            "Minimum index difference between sampled slices. "
-            "Default: floor(eligible_slices / n_slices) - 1 per volume"
-        ),
-    )
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument(
         "--include-bilateral",
@@ -1846,23 +1435,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         dest="augment",
         action="store_true",
         default=True,
-        help="Enable random crop, jitter, rotation, and flips (default)",
+        help="Enable random MONAI 3-D volume transforms (default)",
     )
     augmentation.add_argument(
         "--no-augment",
         dest="augment",
         action="store_false",
-        help="Use deterministic resize preprocessing",
-    )
-    parser.add_argument("--crop-scale-min", type=float, default=0.8)
-    parser.add_argument("--jitter", type=float, default=0.2)
-    parser.add_argument("--rotation-degrees", type=float, default=15.0)
-    parser.add_argument("--horizontal-flip-prob", type=float, default=0.5)
-    parser.add_argument(
-        "--vertical-flip-prob",
-        type=float,
-        default=None,
-        help="Vertical flip probability (default: 0.5 for Duke, 0.0 for ADNI)",
+        help="Disable random volume transforms",
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -1877,7 +1456,32 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--early-stopping-patience",
         type=int,
         default=10,
-        help="Stop after this many epochs without lower validation loss",
+        help="Stop after this many epochs without improving the selected metric",
+    )
+    parser.add_argument(
+        "--early-stopping-metric",
+        choices=list(EARLY_STOPPING_METRIC_CHOICES),
+        default="bce_loss",
+        help=(
+            "Validation metric for best-checkpoint selection and early stopping: "
+            "bce_loss (minimize), f1 (maximize), or auroc (maximize)"
+        ),
+    )
+    ce_weight = parser.add_mutually_exclusive_group()
+    ce_weight.add_argument(
+        "--weight-ce-loss",
+        "--bce-loss-weight",
+        dest="weight_ce_loss",
+        action="store_true",
+        default=False,
+        help="Weight binary BCE positives by training class imbalance",
+    )
+    ce_weight.add_argument(
+        "--no-weight-ce-loss",
+        "--no-bce-loss-weight",
+        dest="weight_ce_loss",
+        action="store_false",
+        help="Disable binary BCE class weighting (default)",
     )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -2010,8 +1614,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.data_root = (
             ADNI_DEFAULT_ROOT if args.dataset == "adni" else DEFAULT_DATA_ROOT
         )
-    if args.vertical_flip_prob is None:
-        args.vertical_flip_prob = 0.0 if args.dataset == "adni" else 0.5
     if args.test_frac is None:
         args.test_frac = args.val_frac
     if args.n_slices <= 0:
@@ -2028,11 +1630,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--min-lr must be non-negative")
     if args.cosine_lr and args.min_lr > args.lr:
         parser.error("--min-lr cannot exceed --lr when --cosine-lr is enabled")
-    if (
-        args.minimum_z_index_distance is not None
-        and args.minimum_z_index_distance < 0
-    ):
-        parser.error("--minimum-z-index-distance must be non-negative")
     if args.d_model <= 0:
         parser.error("--d-model must be positive")
     if args.lora_r <= 0:
@@ -2046,8 +1643,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             parser.error("--mst-depth must be positive")
         if args.mst_heads <= 0 or args.d_model % args.mst_heads:
             parser.error("--d-model must be divisible by positive --mst-heads")
-    if not 0.0 <= args.vertical_flip_prob <= 1.0:
-        parser.error("--vertical-flip-prob must be in [0, 1]")
     if not 0.0 <= args.val_frac < 1.0:
         parser.error("--val-frac must be in [0, 1)")
     if not 0.0 <= args.test_frac < 1.0:

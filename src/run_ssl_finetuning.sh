@@ -14,12 +14,12 @@ cd "${DINOV3_ROOT}" || exit 1
 
 python -m dinov3.run.submit \
   --nodes 1 \
-  --ngpus 2 \
+  --ngpus 4 \
   --timeout 2880 \
   --mem-gb 256 \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \
-  --output-dir "${PROJECT_ROOT}/runs/ssl_finetuning/adni_vitb16_fixed" \
+  --output-dir "${PROJECT_ROOT}/runs/ssl_finetuning/adni_vitb16_z_5_gamma_1.25" \
   "${PROJECT_ROOT}/src/ssl_finetuning/train.py" \
-  --config-file "${PROJECT_ROOT}/src/ssl_finetuning/config.yaml"
+  --config-file "/common/ganesanv/tlab/runs/ssl_finetuning/config.yaml"

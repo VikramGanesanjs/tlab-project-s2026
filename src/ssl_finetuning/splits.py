@@ -56,28 +56,35 @@ def _validate_payload(
     *,
     dataset_name: str,
     patient_strata: Mapping[str, Any],
-    fractions: Tuple[float, float, float],
-    seed: int,
+    fractions: Optional[Tuple[float, float, float]],
+    seed: Optional[int],
+    allow_extra_patients: bool,
+    validate_patient_strata: bool,
 ) -> Dict[str, str]:
     if str(payload.get("dataset", "")).lower() != dataset_name.lower():
         raise ValueError(
             f"Split file dataset does not match: expected {dataset_name!r}, "
             f"got {payload.get('dataset')!r}"
         )
-    saved_fractions = tuple(float(value) for value in payload.get("fractions", ()))
-    if saved_fractions != fractions:
-        raise ValueError(
-            "Split file fractions do not match the current configuration: "
-            f"saved={saved_fractions}, current={fractions}"
-        )
-    if int(payload.get("seed", seed)) != seed:
+    if fractions is not None:
+        saved_fractions = tuple(float(value) for value in payload.get("fractions", ()))
+        if saved_fractions != fractions:
+            raise ValueError(
+                "Split file fractions do not match the current configuration: "
+                f"saved={saved_fractions}, current={fractions}"
+            )
+    if seed is not None and int(payload.get("seed", seed)) != seed:
         raise ValueError(
             f"Split file seed does not match the current configuration: "
             f"saved={payload.get('seed')}, current={seed}"
         )
 
     saved_strata = payload.get("patient_strata", {})
-    if saved_strata and dict(saved_strata) != dict(patient_strata):
+    if (
+        validate_patient_strata
+        and saved_strata
+        and dict(saved_strata) != dict(patient_strata)
+    ):
         raise ValueError("Split file patient strata do not match the current dataset")
 
     split_lists = payload.get("splits")
@@ -95,13 +102,24 @@ def _validate_payload(
             assignments[patient_id] = split
 
     expected_patients = set(patient_strata)
-    if set(assignments) != expected_patients:
+    missing_patients = expected_patients - set(assignments)
+    extra_patients = set(assignments) - expected_patients
+    if missing_patients or (extra_patients and not allow_extra_patients):
         raise ValueError(
             "Split file patients do not match the current dataset: "
-            f"missing={sorted(expected_patients - set(assignments))[:5]}, "
-            f"extra={sorted(set(assignments) - expected_patients)[:5]}"
+            f"missing={sorted(missing_patients)[:5]}, "
+            f"extra={sorted(extra_patients)[:5]}"
         )
-    return assignments
+    if extra_patients:
+        logger.info(
+            "Ignoring %d split-file patients absent from the active dataset",
+            len(extra_patients),
+        )
+    return {
+        patient_id: split
+        for patient_id, split in assignments.items()
+        if patient_id in expected_patients
+    }
 
 
 def patient_level_stratified_split(
@@ -114,8 +132,16 @@ def patient_level_stratified_split(
     seed: int,
     stratum_fn: Callable[[Dataset, int], Any],
     split_file: Optional[Path] = None,
+    use_saved_split_config: bool = True,
+    allow_saved_patient_superset: bool = False,
+    validate_saved_patient_strata: bool = True,
 ) -> Tuple[Subset, Dict[str, Any]]:
-    """Return a train-only subset and the complete patient split metadata."""
+    """Return a train-only subset and the complete patient split metadata.
+
+    ``allow_saved_patient_superset`` permits a saved split file to include
+    patients absent from the current dataset, while still requiring every
+    current patient to have exactly one assignment.
+    """
     fractions = _validate_fractions(train_fraction, val_fraction, test_fraction)
     seed = int(seed)
 
@@ -142,8 +168,10 @@ def patient_level_stratified_split(
                 json.load(handle),
                 dataset_name=dataset_name,
                 patient_strata=patient_strata,
-                fractions=fractions,
-                seed=seed,
+                fractions=fractions if use_saved_split_config else None,
+                seed=seed if use_saved_split_config else None,
+                allow_extra_patients=allow_saved_patient_superset,
+                validate_patient_strata=validate_saved_patient_strata,
             )
     else:
         rng = random.Random(seed)

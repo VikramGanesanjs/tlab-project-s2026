@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms as tv_transforms
 from torchvision.datasets.vision import VisionDataset
@@ -137,27 +138,104 @@ def _z_index_range(n_z: int, z_min: float, z_max: float) -> Tuple[int, int]:
     return start, end
 
 
-SLICE_SAMPLING_CHOICES = ("random", "even")
+def _zscore_normalize_volume(volume: np.ndarray) -> np.ndarray:
+    """Normalize a whole volume using its nonzero voxel intensities."""
+    volume = np.asarray(volume, dtype=np.float32)
+    finite = volume[np.isfinite(volume)]
+    nonzero = volume[(volume > 0) & np.isfinite(volume)]
+    if nonzero.size < 10:
+        nonzero = finite
+    if nonzero.size == 0:
+        raise ValueError("Duke volume contains no finite voxel values")
+
+    low, high = np.percentile(nonzero, (1.0, 99.0))
+    if high <= low:
+        high = low + 1.0
+    volume = np.nan_to_num(volume, nan=0.0, posinf=high, neginf=0.0)
+    volume = np.clip(volume, low, high)
+    nonzero = volume[(volume > 0) & np.isfinite(volume)]
+    if nonzero.size == 0:
+        nonzero = volume.reshape(-1)
+    mean = float(nonzero.mean())
+    std = max(float(nonzero.std()), 1e-6)
+    return ((volume - mean) / std).astype(np.float32, copy=False)
 
 
-def _evenly_spaced_slice_indices(start: int, end: int, n_slices: int) -> Tuple[int, ...]:
-    """Return ``n_slices`` deterministic indices spanning ``[start, end)``."""
-    eligible_slices = end - start
-    if eligible_slices <= 0:
-        raise ValueError(f"Empty z-range [{start}, {end})")
+def _resample_volume(
+    volume: np.ndarray,
+    n_slices: int,
+    image_size: int,
+) -> torch.Tensor:
+    """Return a canonical volume as ``[depth, image_size, image_size]``."""
+    if volume.ndim != 3:
+        raise ValueError(f"Expected a 3D volume, got shape {volume.shape}")
     if n_slices <= 0:
         raise ValueError(f"n_slices must be positive, got {n_slices}")
-    if n_slices > eligible_slices:
-        raise ValueError(
-            f"Cannot place {n_slices} evenly spaced slices in "
-            f"{eligible_slices} eligible slices"
-        )
-    if n_slices == 1:
-        return (start + eligible_slices // 2,)
-    span = eligible_slices - 1
-    return tuple(
-        start + int(round(index * span / (n_slices - 1))) for index in range(n_slices)
+    if image_size <= 0:
+        raise ValueError(f"image_size must be positive, got {image_size}")
+
+    height, width, _ = volume.shape
+    volume_t = torch.from_numpy(
+        np.ascontiguousarray(np.asarray(volume, dtype=np.float32))
+    ).permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+    volume_t = F.interpolate(
+        volume_t,
+        size=(int(n_slices), height, width),
+        mode="trilinear",
+        align_corners=False,
     )
+    volume_t = F.interpolate(
+        volume_t.squeeze(0),
+        size=(int(image_size), int(image_size)),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return volume_t.squeeze(0)
+
+
+def build_duke_volume_transform(*, augment: bool = True) -> Optional[Callable]:
+    """Build a MONAI transform for an entire Duke volume."""
+    if not augment:
+        return None
+
+    try:
+        from monai.transforms import (
+            Compose,
+            RandAdjustContrastd,
+            RandAffined,
+            RandFlipd,
+            RandGaussianNoised,
+            RandGaussianSmoothd,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "MONAI is required for Duke multi-slice augmentation; "
+            "install the project's MONAI dependency or set augment=False"
+        ) from exc
+
+    transform = Compose(
+        [
+            RandAffined(
+                keys=("image",),
+                rotate_range=(0.1, 0.1, 0.1),
+                translate_range=(5, 5, 5),
+                scale_range=(0.1, 0.1, 0.1),
+                prob=0.5,
+                padding_mode="border",
+                mode="trilinear",
+            ),
+            RandFlipd(keys=("image",), spatial_axis=[2], prob=0.5),
+            RandGaussianSmoothd(keys=("image",), prob=0.2),
+            RandGaussianNoised(keys=("image",), prob=0.2, std=0.05),
+            RandAdjustContrastd(keys=("image",), prob=0.2, gamma=(0.7, 1.3)),
+        ]
+    )
+
+    def apply(volume: torch.Tensor) -> torch.Tensor:
+        transformed = transform({"image": volume})
+        return transformed["image"]
+
+    return apply
 
 
 def build_duke_transform(
@@ -467,6 +545,7 @@ class DukeClassificationDataset(VisionDataset):
         root: Union[str, Path] = _DEFAULT_OUT_ROOT,
         *,
         scan: Union[str, int] = "pre",
+        patient_ids: Optional[Sequence[str]] = None,
         z_min: float = 0.0,
         z_max: float = 1.0,
         transforms: Optional[Callable] = None,
@@ -476,9 +555,10 @@ class DukeClassificationDataset(VisionDataset):
         augment: bool = True,
         image_size: int = 224,
         include_bilateral: bool = False,
+        build_default_transform: bool = True,
     ) -> None:
         root = Path(root)
-        if transforms is None and transform is None:
+        if build_default_transform and transforms is None and transform is None:
             transform = build_duke_transform(image_size, augment=augment)
         super().__init__(
             str(root),
@@ -491,6 +571,11 @@ class DukeClassificationDataset(VisionDataset):
         self.z_min = float(z_min)
         self.z_max = float(z_max)
         self.include_bilateral = bool(include_bilateral)
+        self.patient_ids = (
+            {str(patient_id) for patient_id in patient_ids}
+            if patient_ids is not None
+            else None
+        )
         self._volume_cache = _VolumeCache(maxsize=volume_cache_size)
 
         index_path = root / "index" / "series_index.json"
@@ -517,6 +602,8 @@ class DukeClassificationDataset(VisionDataset):
             if series["scan_type"] != self.scan_type:
                 continue
             pid = series["patient_id"]
+            if self.patient_ids is not None and str(pid) not in self.patient_ids:
+                continue
             raw = self._phenotypes.get(pid, {}).get("raw", {})
             if not self.include_bilateral and _is_bilateral(raw.get("bilateral")):
                 n_skipped_bilateral += 1
@@ -638,15 +725,11 @@ class DukeClassificationDataset(VisionDataset):
 
 
 class DukeMultiSliceDataset(DukeClassificationDataset):
-    """Per-breast classification using sampled axial slices.
+    """Per-breast classification using fixed-depth 3-D volumes.
 
-    Each item represents one left or right breast volume from one patient and
-    returns ``n_slices`` z-ordered images from the selected fractional z-range.
-    With ``slice_sampling="random"``, indices are separated by at least
-    ``minimum_z_index_distance`` (defaulting per volume to
-    ``floor(eligible_slices / n_slices) - 1``). With ``slice_sampling="even"``,
-    indices are deterministic and evenly spaced across the eligible range.
-    Tensor-valued transforms are stacked as ``[n_slices, C, H, W]``.
+    Each item represents one left or right breast volume from one patient.
+    The complete volume is resampled to ``n_slices`` depth slices and spatially
+    resized before an optional MONAI 3-D transform is applied.
     """
 
     def __init__(
@@ -655,44 +738,36 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
         *,
         n_slices: int = 8,
         scan: Union[str, int] = "pre",
-        z_min: float = 0.0,
-        z_max: float = 1.0,
+        patient_ids: Optional[Sequence[str]] = None,
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         volume_cache_size: int = 8,
         augment: bool = True,
         image_size: int = 224,
-        minimum_z_index_distance: Optional[int] = None,
         include_bilateral: bool = False,
-        slice_sampling: str = "random",
     ) -> None:
         if n_slices <= 0:
             raise ValueError(f"n_slices must be positive, got {n_slices}")
-        if minimum_z_index_distance is not None and minimum_z_index_distance < 0:
-            raise ValueError(
-                "minimum_z_index_distance must be non-negative or None, "
-                f"got {minimum_z_index_distance}"
-            )
-        if slice_sampling not in SLICE_SAMPLING_CHOICES:
-            raise ValueError(
-                f"slice_sampling must be one of {SLICE_SAMPLING_CHOICES}, "
-                f"got {slice_sampling!r}"
-            )
         self.n_slices = int(n_slices)
-        self.minimum_z_index_distance = minimum_z_index_distance
-        self.slice_sampling = slice_sampling
+        self.image_size = int(image_size)
+        if self.image_size <= 0:
+            raise ValueError(f"image_size must be positive, got {image_size}")
+        if transforms is None and transform is None and augment:
+            transform = build_duke_volume_transform(augment=True)
         super().__init__(
             root=root,
             scan=scan,
-            z_min=z_min,
-            z_max=z_max,
+            patient_ids=patient_ids,
+            z_min=0.0,
+            z_max=1.0,
             transforms=transforms,
             transform=transform,
             target_transform=target_transform,
             volume_cache_size=volume_cache_size,
             augment=augment,
             image_size=image_size,
+            build_default_transform=False,
             include_bilateral=include_bilateral,
         )
 
@@ -707,15 +782,11 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
                 volume_entries.append((pid, side, vol_rel, n_z, label))
         self._entries = volume_entries  # type: ignore[assignment]
         logger.info(
-            "DukeMultiSliceDataset scan=%s breasts=%d n_slices=%d "
-            "slice_sampling=%s minimum_z_index_distance=%s z=[%.3f, %.3f)",
+            "DukeMultiSliceDataset scan=%s breasts=%d n_slices=%d image_size=%d",
             self.scan_type,
             len(self._entries),
             self.n_slices,
-            self.slice_sampling,
-            self.minimum_z_index_distance,
-            self.z_min,
-            self.z_max,
+            self.image_size,
         )
 
     def get_target(self, index: int) -> int:
@@ -727,94 +798,31 @@ class DukeMultiSliceDataset(DukeClassificationDataset):
     def get_patient_id(self, index: int) -> str:
         return self._entries[index][0]
 
-    def get_slice_indices(
-        self,
-        index: int,
-        *,
-        volume_depth: Optional[int] = None,
-    ) -> Tuple[int, ...]:
-        if volume_depth is None:
-            vol_rel = self._entries[index][2]
-            volume = self._volume_cache.get(self.root_path / vol_rel)
-            volume_depth = int(volume.shape[-1])
-        n_z = int(volume_depth)
-        start, end = _z_index_range(n_z, self.z_min, self.z_max)
-        eligible_slices = end - start
-        if eligible_slices <= 0:
-            raise RuntimeError(
-                f"Empty z-range for patient={self.get_patient_id(index)!r}, "
-                f"side={self.get_side(index)!r}"
-            )
-        if self.slice_sampling == "even":
-            try:
-                return _evenly_spaced_slice_indices(start, end, self.n_slices)
-            except ValueError as exc:
-                raise ValueError(
-                    f"{exc} for patient={self.get_patient_id(index)!r}, "
-                    f"side={self.get_side(index)!r}"
-                ) from exc
-
-        distance = self.minimum_z_index_distance
-        if distance is None:
-            distance = max(eligible_slices // self.n_slices - 1, 0)
-
-        # Distinct indices inherently have distance >= 1. A configured value
-        # of zero therefore means no additional spacing beyond uniqueness.
-        effective_distance = max(int(distance), 1)
-        required_span = 1 + (self.n_slices - 1) * effective_distance
-        if required_span > eligible_slices:
-            raise ValueError(
-                f"Cannot sample {self.n_slices} slices with minimum z-index "
-                f"distance {distance} from {eligible_slices} eligible slices "
-                f"for patient={self.get_patient_id(index)!r}, "
-                f"side={self.get_side(index)!r}"
-            )
-
-        # Choose sorted coordinates in a compressed range, then expand the
-        # gaps. This samples valid combinations without rejection loops.
-        compressed_size = eligible_slices - (
-            effective_distance - 1
-        ) * (self.n_slices - 1)
-        compressed = torch.randperm(compressed_size)[: self.n_slices]
-        compressed, _ = torch.sort(compressed)
-        offsets = torch.arange(self.n_slices) * (effective_distance - 1)
-        indices = compressed + offsets + start
-        return tuple(int(z) for z in indices.tolist())
-
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         _pid, _side, vol_rel, _n_z, label = self._entries[index]
         volume = self._volume_cache.get(self.root_path / vol_rel)
-        volume_depth = int(volume.shape[-1])
-        # Random sampling redraws on every access; even sampling is fixed.
-        slice_indices = self.get_slice_indices(index, volume_depth=volume_depth)
-        images: List[Any] = [
-            _slice_to_pil(volume, z)
-            for z in slice_indices
-        ]
+        volume_t = _resample_volume(
+            _zscore_normalize_volume(volume), self.n_slices, self.image_size
+        ).unsqueeze(0)
         target: Any = int(label)
 
-        # Handle separate transforms explicitly so target_transform runs once.
-        if self.transform is not None:
-            # Reuse one random augmentation realization across the stack so
-            # geometry and appearance remain aligned between ordered slices.
-            initial_rng_state = torch.get_rng_state()
-            images[0] = self.transform(images[0])
-            advanced_rng_state = torch.get_rng_state()
-            for image_index in range(1, len(images)):
-                torch.set_rng_state(initial_rng_state)
-                images[image_index] = self.transform(images[image_index])
-            torch.set_rng_state(advanced_rng_state)
+        if self.transforms is not None:
+            volume_t, target = self.transforms(volume_t, target)
+        else:
+            if self.transform is not None:
+                volume_t = self.transform(volume_t)
             if self.target_transform is not None:
                 target = self.target_transform(target)
-        elif self.transforms is not None:
-            transformed = [self.transforms(image, target) for image in images]
-            images = [pair[0] for pair in transformed]
-            target = transformed[0][1]
-        elif self.target_transform is not None:
-            target = self.target_transform(target)
 
-        if images and all(torch.is_tensor(image) for image in images):
-            return torch.stack(images, dim=0), target
+        volume_t = torch.as_tensor(volume_t)
+        if volume_t.ndim == 3:
+            volume_t = volume_t.unsqueeze(0)
+        if volume_t.ndim != 4 or volume_t.shape[0] != 1:
+            raise ValueError(
+                "Duke multi-slice transforms must return [1, depth, height, width], "
+                f"got shape {tuple(volume_t.shape)}"
+            )
+        images = volume_t.permute(1, 0, 2, 3).repeat(1, 3, 1, 1)
         return images, target
 
 

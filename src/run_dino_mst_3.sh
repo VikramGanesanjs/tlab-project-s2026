@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-gpu=2
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=run_dino_mst_ssl_finetune_128slices_noaug.err  ## error log file
-#SBATCH --output=run_dino_mst_ssl_finetune_128slices_noaug.out ## output log file
+#SBATCH --error=run_dino_mst_ssl_8slices_leaktest.err  ## error log file
+#SBATCH --output=run_dino_mst_ssl_8slices_leaktest.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
@@ -17,4 +17,4 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python dino_mst.py --params-file /common/ganesanv/tlab/runs/mst_configs/adni/ssl_finetune_adni_128slices_noaugment.yaml
+python dino_mst.py --params-file /common/ganesanv/tlab/runs/mst_configs/adni/ssl_finetune_adni_8slices.yaml
