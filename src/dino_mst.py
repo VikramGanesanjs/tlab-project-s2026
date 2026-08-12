@@ -600,6 +600,23 @@ def _dataset_patient_ids(dataset: Dataset) -> set[str]:
     return {str(get_patient_id(index)) for index in range(len(dataset))}
 
 
+def _require_dataset_patient_ids(
+    dataset: Dataset,
+    expected_patient_ids: Sequence[str],
+    *,
+    split_name: str,
+) -> None:
+    """Fail loudly if a split dataset contains anything but the requested patients."""
+    actual_patients = _dataset_patient_ids(dataset)
+    expected_patients = {str(patient_id) for patient_id in expected_patient_ids}
+    if actual_patients != expected_patients:
+        raise RuntimeError(
+            f"{split_name} dataset patient IDs do not match requested split: "
+            f"missing={sorted(expected_patients - actual_patients)[:5]}, "
+            f"extra={sorted(actual_patients - expected_patients)[:5]}"
+        )
+
+
 def _assert_loader_patient_disjoint(
     train_loader: DataLoader,
     val_loader: Optional[DataLoader],
@@ -613,18 +630,24 @@ def _assert_loader_patient_disjoint(
     test_patients = (
         _dataset_patient_ids(test_loader.dataset) if test_loader is not None else set()
     )
-    assert train_patients.isdisjoint(val_patients), (
-        "Patient leakage between train and validation loaders: "
-        f"{sorted(train_patients.intersection(val_patients))[:5]}"
-    )
-    assert train_patients.isdisjoint(test_patients), (
-        "Patient leakage between train and test loaders: "
-        f"{sorted(train_patients.intersection(test_patients))[:5]}"
-    )
-    assert val_patients.isdisjoint(test_patients), (
-        "Patient leakage between validation and test loaders: "
-        f"{sorted(val_patients.intersection(test_patients))[:5]}"
-    )
+    train_val_overlap = train_patients.intersection(val_patients)
+    train_test_overlap = train_patients.intersection(test_patients)
+    val_test_overlap = val_patients.intersection(test_patients)
+    if train_val_overlap:
+        raise RuntimeError(
+            "Patient leakage between train and validation loaders: "
+            f"{sorted(train_val_overlap)[:5]}"
+        )
+    if train_test_overlap:
+        raise RuntimeError(
+            "Patient leakage between train and test loaders: "
+            f"{sorted(train_test_overlap)[:5]}"
+        )
+    if val_test_overlap:
+        raise RuntimeError(
+            "Patient leakage between validation and test loaders: "
+            f"{sorted(val_test_overlap)[:5]}"
+        )
     logger.info(
         "Verified mutually exclusive loader patients: train=%d val=%d test=%d",
         len(train_patients),
@@ -881,11 +904,17 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         if test_patient_ids
         else None
     )
-    assert _dataset_patient_ids(train_dataset) == set(train_patient_ids)
+    _require_dataset_patient_ids(
+        train_dataset, train_patient_ids, split_name="train"
+    )
     if val_dataset is not None:
-        assert _dataset_patient_ids(val_dataset) == set(val_patient_ids)
+        _require_dataset_patient_ids(
+            val_dataset, val_patient_ids, split_name="validation"
+        )
     if test_dataset is not None:
-        assert _dataset_patient_ids(test_dataset) == set(test_patient_ids)
+        _require_dataset_patient_ids(
+            test_dataset, test_patient_ids, split_name="test"
+        )
     logger.info(
         "Datasets: train=%d patients/%d %s, val=%d patients/%d %s, "
         "test=%d patients/%d %s",
