@@ -30,6 +30,40 @@ def _split_counts(n_patients: int, fractions: Sequence[float]) -> Tuple[int, int
     return tuple(counts)  # type: ignore[return-value]
 
 
+def _stratified_count_allocation(
+    grouped_patients: Mapping[str, Sequence[str]],
+    n_selected: int,
+) -> Dict[str, int]:
+    """Allocate an exact patient count across strata proportionally.
+
+    Largest-remainder apportionment preserves the overall stratum mix as
+    closely as possible while guaranteeing that the requested total is met.
+    """
+    n_available = sum(len(patients) for patients in grouped_patients.values())
+    if not 0 <= n_selected <= n_available:
+        raise ValueError(
+            f"Requested {n_selected} patients from a population of {n_available}"
+        )
+    if n_available == 0:
+        return {stratum: 0 for stratum in grouped_patients}
+
+    expected = {
+        stratum: n_selected * len(patients) / n_available
+        for stratum, patients in grouped_patients.items()
+    }
+    counts = {
+        stratum: min(len(grouped_patients[stratum]), math.floor(value))
+        for stratum, value in expected.items()
+    }
+    remainder = n_selected - sum(counts.values())
+    for stratum in sorted(
+        grouped_patients,
+        key=lambda item: (-(expected[item] - counts[item]), item),
+    )[:remainder]:
+        counts[stratum] += 1
+    return counts
+
+
 def _validate_fractions(
     train_fraction: float,
     val_fraction: float,
@@ -57,6 +91,7 @@ def _validate_payload(
     dataset_name: str,
     patient_strata: Mapping[str, Any],
     fractions: Optional[Tuple[float, float, float]],
+    train_patient_count: Optional[int],
     seed: Optional[int],
     allow_extra_patients: bool,
     validate_patient_strata: bool,
@@ -77,6 +112,12 @@ def _validate_payload(
         raise ValueError(
             f"Split file seed does not match the current configuration: "
             f"saved={payload.get('seed')}, current={seed}"
+        )
+    saved_train_patient_count = payload.get("train_patient_count")
+    if saved_train_patient_count != train_patient_count:
+        raise ValueError(
+            "Split file train_patient_count does not match the current configuration: "
+            f"saved={saved_train_patient_count}, current={train_patient_count}"
         )
 
     saved_strata = payload.get("patient_strata", {})
@@ -131,6 +172,7 @@ def patient_level_stratified_split(
     test_fraction: float,
     seed: int,
     stratum_fn: Callable[[Dataset, int], Any],
+    train_patient_count: Optional[int] = None,
     split_file: Optional[Path] = None,
     use_saved_split_config: bool = True,
     allow_saved_patient_superset: bool = False,
@@ -141,9 +183,41 @@ def patient_level_stratified_split(
     ``allow_saved_patient_superset`` permits a saved split file to include
     patients absent from the current dataset, while still requiring every
     current patient to have exactly one assignment.
+
+    When ``train_patient_count`` is supplied, it overrides ``train_fraction``:
+    exactly that many patients are assigned to train, stratified by
+    ``stratum_fn``. The remaining patients are stratified into validation and
+    test according to the relative values of ``val_fraction`` and
+    ``test_fraction``.
     """
     fractions = _validate_fractions(train_fraction, val_fraction, test_fraction)
     seed = int(seed)
+    if train_patient_count is not None:
+        try:
+            normalized_train_patient_count = int(train_patient_count)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "train_patient_count must be a positive integer or None, got "
+                f"{train_patient_count!r}"
+            ) from error
+        if (
+            isinstance(train_patient_count, bool)
+            or normalized_train_patient_count != train_patient_count
+        ):
+            raise ValueError(
+                "train_patient_count must be a positive integer or None, got "
+                f"{train_patient_count!r}"
+            )
+        train_patient_count = normalized_train_patient_count
+        if train_patient_count <= 0:
+            raise ValueError(
+                "train_patient_count must be a positive integer when provided"
+            )
+        if val_fraction + test_fraction <= 0.0:
+            raise ValueError(
+                "val_fraction and test_fraction must have a positive total when "
+                "train_patient_count is provided"
+            )
 
     patient_indices: Dict[str, list[int]] = defaultdict(list)
     patient_strata: Dict[str, Any] = {}
@@ -169,6 +243,7 @@ def patient_level_stratified_split(
                 dataset_name=dataset_name,
                 patient_strata=patient_strata,
                 fractions=fractions if use_saved_split_config else None,
+                train_patient_count=train_patient_count,
                 seed=seed if use_saved_split_config else None,
                 allow_extra_patients=allow_saved_patient_superset,
                 validate_patient_strata=validate_saved_patient_strata,
@@ -180,21 +255,59 @@ def patient_level_stratified_split(
             grouped_patients[_patient_stratum_key(stratum)].append(patient_id)
 
         split_patients: Dict[str, list[str]] = {split: [] for split in _SPLITS}
+        shuffled_patients: Dict[str, list[str]] = {}
         for stratum, patients in sorted(grouped_patients.items()):
             patients = list(patients)
             rng.shuffle(patients)
-            n_train, n_val, n_test = _split_counts(len(patients), fractions)
-            boundaries = (n_train, n_train + n_val)
-            split_patients["train"].extend(patients[: boundaries[0]])
-            split_patients["val"].extend(patients[boundaries[0] : boundaries[1]])
-            split_patients["test"].extend(patients[boundaries[1] : n_train + n_val + n_test])
-            logger.info(
-                "Patient split stratum=%s: train=%d val=%d test=%d",
-                stratum,
-                n_train,
-                n_val,
-                n_test,
+            shuffled_patients[stratum] = patients
+
+        if train_patient_count is None:
+            for stratum, patients in sorted(shuffled_patients.items()):
+                n_train, n_val, n_test = _split_counts(len(patients), fractions)
+                boundaries = (n_train, n_train + n_val)
+                split_patients["train"].extend(patients[: boundaries[0]])
+                split_patients["val"].extend(patients[boundaries[0] : boundaries[1]])
+                split_patients["test"].extend(patients[boundaries[1] : n_train + n_val + n_test])
+                logger.info(
+                    "Patient split stratum=%s: train=%d val=%d test=%d",
+                    stratum,
+                    n_train,
+                    n_val,
+                    n_test,
+                )
+        else:
+            n_available = sum(len(patients) for patients in shuffled_patients.values())
+            if train_patient_count > n_available:
+                raise ValueError(
+                    f"Requested train_patient_count={train_patient_count}, but only "
+                    f"{n_available} patients are available"
+                )
+            train_counts = _stratified_count_allocation(
+                shuffled_patients, train_patient_count
             )
+            remaining_patients = {
+                stratum: patients[train_counts[stratum] :]
+                for stratum, patients in shuffled_patients.items()
+            }
+            n_remaining = n_available - train_patient_count
+            val_weight = val_fraction / (val_fraction + test_fraction)
+            n_val = _split_counts(n_remaining, (val_weight, 1.0 - val_weight, 0.0))[0]
+            val_counts = _stratified_count_allocation(remaining_patients, n_val)
+            for stratum, patients in sorted(shuffled_patients.items()):
+                n_train = train_counts[stratum]
+                n_val_for_stratum = val_counts[stratum]
+                split_patients["train"].extend(patients[:n_train])
+                split_patients["val"].extend(
+                    patients[n_train : n_train + n_val_for_stratum]
+                )
+                split_patients["test"].extend(patients[n_train + n_val_for_stratum :])
+                logger.info(
+                    "Patient split stratum=%s: train=%d val=%d test=%d",
+                    stratum,
+                    n_train,
+                    n_val_for_stratum,
+                    len(patients) - n_train - n_val_for_stratum,
+                )
 
         # Ensure the training split is never empty, even for a very small
         # dataset whose rounded per-stratum allocations are pathological.
@@ -225,10 +338,11 @@ def patient_level_stratified_split(
         raise RuntimeError("Patient leakage detected between validation and test splits")
 
     metadata: Dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "dataset": dataset_name,
         "seed": seed,
         "fractions": fractions,
+        "train_patient_count": train_patient_count,
         "patient_strata": dict(sorted(patient_strata.items())),
         "splits": {
             "train": sorted(train_patients),

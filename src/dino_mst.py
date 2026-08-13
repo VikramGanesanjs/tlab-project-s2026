@@ -222,16 +222,26 @@ class MultiSliceDinoModel(nn.Module):
             token = self.patch_pool(tokens)
         return token.reshape(batch, n_slices, -1)
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def extract_volume_token(self, images: torch.Tensor) -> torch.Tensor:
+        """Return one MST volume representation for each input volume.
+
+        For the transformer aggregator this is the output global token.  The
+        mean-pool variant has no learned global token, so this instead returns
+        its mean-pooled slice representation.  Keeping the aggregation here
+        makes inference code able to use the exact representation consumed by
+        the classifier without duplicating the MST forward pass.
+        """
         slices = self.slice_projection(self.encode_slices(images))
         if self.aggregator == "mean":
-            volume = slices.mean(dim=1)
-        else:
-            assert self.global_token is not None and self.transformer is not None
-            global_token = self.global_token.expand(slices.shape[0], -1, -1)
-            sequence = torch.cat([global_token, slices], dim=1)
-            sequence = sequence + self.position_embedding
-            volume = self.transformer(sequence)[:, 0]
+            return slices.mean(dim=1)
+        assert self.global_token is not None and self.transformer is not None
+        global_token = self.global_token.expand(slices.shape[0], -1, -1)
+        sequence = torch.cat([global_token, slices], dim=1)
+        sequence = sequence + self.position_embedding
+        return self.transformer(sequence)[:, 0]
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        volume = self.extract_volume_token(images)
         logits = self.classifier(self.output_norm(volume))
         if self.num_classes == 1:
             return logits.squeeze(-1)

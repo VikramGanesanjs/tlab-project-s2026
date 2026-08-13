@@ -12,20 +12,28 @@ Example::
 The default ``auto`` encoder detects BrainDINO/DINOv3 ``.pth`` files and sends
 distributed-checkpoint directories through the shared checkpoint loader. The checkpoint
 is used as a DINOv3-compatible backbone; colors come from the dataset labels.
+
+The ``volume`` subcommand extracts trained multi-slice-transformer (MST) volume
+tokens from a saved ``dino_mst.py`` run, for example::
+
+    python src/classification_visualization.py volume \\
+        /path/to/run_summary.json --n-volumes 100
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Subset
 
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
@@ -44,6 +52,7 @@ from datasets.adni import (  # noqa: E402
 from datasets.duke import DukeClassificationDataset, build_duke_transform  # noqa: E402
 from merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from dinov3_baseline import load_braindino_encoder, load_dinov3_encoder  # noqa: E402
+import dino_mst  # noqa: E402
 
 LOGGER = logging.getLogger("classification_visualization")
 ENCODER_CHOICES = ("auto", "custom", "dinov3", "braindino")
@@ -233,7 +242,7 @@ def plot_umap(
     plt.close(fig)
 
 
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--encoder", choices=ENCODER_CHOICES, default="auto")
@@ -254,12 +263,266 @@ def parse_args():
     parser.add_argument("--n-neighbors", type=int, default=15)
     parser.add_argument("--output", type=Path, default=Path("classification_umap.png"))
     parser.add_argument("--device", default=None)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def parse_volume_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Sample multi-slice volumes and save their trained MST global tokens. "
+            "The run summary supplies the dataset, encoder, and MST architecture."
+        )
+    )
+    parser.add_argument(
+        "run_summary",
+        type=Path,
+        help="Path to a dino_mst.py run_summary.json file",
+    )
+    parser.add_argument(
+        "--n-volumes",
+        type=int,
+        default=100,
+        help="Number of distinct dataset volumes to sample (default: 100)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Volumes processed per inference batch (default: 8)",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader workers (default: 0)",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--mst-checkpoint",
+        type=Path,
+        default=None,
+        help="Override the MST checkpoint (defaults to run-summary directory/best_mst.pt)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output .npz file (default: <run-summary directory>/volume_tokens.npz)",
+    )
+    parser.add_argument("--device", default=None)
+    return parser.parse_args(argv)
+
+
+def _read_run_parameters(run_summary: Path) -> Mapping[str, Any]:
+    if not run_summary.is_file():
+        raise FileNotFoundError(f"Run summary not found: {run_summary}")
+    with run_summary.open(encoding="utf-8") as handle:
+        summary = json.load(handle)
+    if not isinstance(summary, dict) or not isinstance(summary.get("parameters"), dict):
+        raise ValueError(f"{run_summary} must contain a mapping under 'parameters'")
+    return summary["parameters"]
+
+
+def _find_mst_checkpoint(run_summary: Path, override: Path | None) -> Path:
+    if override is not None:
+        if not override.is_file():
+            raise FileNotFoundError(f"MST checkpoint not found: {override}")
+        return override
+    # Current dino_mst.py writes .pt.  Retain .py as a fallback for old runs
+    # that may have used that extension.
+    for name in ("best_mst.pt", "best_mst.py"):
+        candidate = run_summary.parent / name
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find MST checkpoint beside the run summary; expected "
+        f"{run_summary.parent / 'best_mst.pt'}"
+    )
+
+
+def _run_value(
+    parameters: Mapping[str, Any],
+    checkpoint: Mapping[str, Any],
+    name: str,
+    default: Any = None,
+) -> Any:
+    """Prefer the run summary, falling back to checkpoint metadata for old runs."""
+    value = parameters.get(name)
+    if value is not None:
+        return value
+    return checkpoint.get(name, default)
+
+
+def _build_volume_dataset(parameters: Mapping[str, Any]):
+    dataset_name = parameters.get("dataset")
+    if dataset_name not in dino_mst.DATASET_CHOICES:
+        raise ValueError(
+            f"Run summary has dataset={dataset_name!r}; expected one of "
+            f"{dino_mst.DATASET_CHOICES}"
+        )
+    values = dict(parameters)
+    values["dataset"] = dataset_name
+    values["n_slices"] = int(values.get("n_slices", 8))
+    values["image_size"] = int(values.get("image_size", 224))
+    values["adni_task"] = values.get("adni_task") or DEFAULT_ADNI_TASK
+    values["scan"] = values.get("scan") or "pre"
+    values["include_bilateral"] = bool(values.get("include_bilateral", False))
+    if values.get("data_root") is None:
+        values["data_root"] = (
+            dino_mst.ADNI_DEFAULT_ROOT
+            if dataset_name == "adni"
+            else dino_mst.DEFAULT_DATA_ROOT
+        )
+    # This mirrors dino_mst.py validation/test inference: samples are resampled
+    # and normalized exactly as training expects, but no random augmentation is
+    # applied while extracting a representation.
+    values["augment"] = False
+    return dino_mst.build_dataset(argparse.Namespace(**values), augment=False)
+
+
+def _load_volume_model(
+    parameters: Mapping[str, Any], checkpoint_path: Path, device: torch.device
+) -> dino_mst.MultiSliceDinoModel:
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
+        raise ValueError(f"{checkpoint_path} is not a dino_mst checkpoint with a 'model' state")
+    checkpoint: Mapping[str, Any] = payload
+    dataset_name = _run_value(parameters, checkpoint, "dataset")
+    adni_task = _run_value(parameters, checkpoint, "adni_task", DEFAULT_ADNI_TASK)
+    num_classes, _, _ = dino_mst.task_config(dataset_name, adni_task=adni_task)
+    num_classes = int(_run_value(parameters, checkpoint, "num_classes", num_classes))
+    encoder_name = str(_run_value(parameters, checkpoint, "encoder", "dinov3"))
+    encoder_training = str(_run_value(parameters, checkpoint, "encoder_training", "frozen"))
+    weights_value = _run_value(parameters, checkpoint, "weights")
+    weights = Path(weights_value) if weights_value is not None else None
+    repo_dir = Path(_run_value(parameters, checkpoint, "dinov3_repo", DINOV3_DEFAULT_REPO))
+    model_name = str(_run_value(parameters, checkpoint, "model_name", "dinov3_vitb16"))
+    lora_rank = int(_run_value(parameters, checkpoint, "lora_r", 16))
+
+    # Keep this loader construction identical to dino_mst.train(), including
+    # the special distributed-checkpoint path and optional LoRA adapters.
+    if weights is not None and encoder_name == "dinov3":
+        encoder = load_custom_dinov3_encoder(
+            checkpoint=weights,
+            repo_dir=repo_dir,
+            device=device,
+            encoder_training=encoder_training,
+            lora_rank=lora_rank,
+        )
+    else:
+        encoder = dino_mst.load_encoder(
+            encoder_name,
+            device=device,
+            weights=weights,
+            repo_dir=repo_dir,
+            model_name=model_name,
+        )
+        if encoder_training == "lora":
+            dino_mst.add_lora_to_vit(encoder, r=lora_rank)
+            dino_mst.freeze_non_lora_parameters(encoder)
+
+    d_model = int(_run_value(parameters, checkpoint, "d_model", 768))
+    hidden_dim = int(_run_value(parameters, checkpoint, "hidden_dim", d_model))
+    model = dino_mst.MultiSliceDinoModel(
+        encoder,
+        n_slices=int(_run_value(parameters, checkpoint, "n_slices", 8)),
+        features=str(_run_value(parameters, checkpoint, "features", "cls")),
+        aggregator=str(_run_value(parameters, checkpoint, "slice_aggregator", "transformer")),
+        d_model=d_model,
+        depth=int(_run_value(parameters, checkpoint, "mst_depth", 2)),
+        n_heads=int(_run_value(parameters, checkpoint, "mst_heads", 12)),
+        ffn_dim=int(_run_value(parameters, checkpoint, "mst_ffn_dim", 3072)),
+        dropout=float(_run_value(parameters, checkpoint, "mst_dropout", 0.1)),
+        hidden_dim=hidden_dim or d_model,
+        num_classes=num_classes,
+        encoder_training=encoder_training,
+    ).to(device)
+    model.load_trainable_state_dict(payload["model"])
+    model.eval()
+    return model
+
+
+@torch.inference_mode()
+def extract_volume_tokens(
+    model: dino_mst.MultiSliceDinoModel,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the MST global tokens and labels in loader order."""
+    tokens, labels = [], []
+    model.eval()
+    for images, targets in loader:
+        volume_tokens = model.extract_volume_token(
+            images.to(device, non_blocking=True)
+        )
+        tokens.append(volume_tokens.float().cpu().numpy())
+        labels.append(torch.as_tensor(targets).cpu().numpy())
+    if not tokens:
+        raise RuntimeError("No volumes were available for token extraction")
+    return np.concatenate(tokens, axis=0), np.concatenate(labels, axis=0)
+
+
+def volume(argv: Sequence[str] | None = None) -> Path:
+    """Run the ``volume`` command and return the saved token archive path."""
+    args = parse_volume_args(argv)
+    if args.n_volumes <= 0:
+        raise ValueError("--n-volumes must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+
+    run_summary = args.run_summary.resolve()
+    parameters = _read_run_parameters(run_summary)
+    checkpoint_path = _find_mst_checkpoint(run_summary, args.mst_checkpoint)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    dataset = _build_volume_dataset(parameters)
+    if len(dataset) == 0:
+        raise RuntimeError("The configured multi-slice dataset contains no volumes")
+    n_volumes = min(args.n_volumes, len(dataset))
+    if n_volumes < args.n_volumes:
+        LOGGER.warning("Requested %d volumes, dataset has %d; using all volumes", args.n_volumes, len(dataset))
+    indices = np.random.default_rng(args.seed).choice(len(dataset), size=n_volumes, replace=False)
+    indices = np.asarray(indices, dtype=np.int64)
+    patient_ids = np.asarray([str(dataset.get_patient_id(int(index))) for index in indices])
+    get_image_id = getattr(dataset, "get_image_id", None)
+    image_ids = np.asarray(
+        [str(get_image_id(int(index))) if get_image_id is not None else "" for index in indices]
+    )
+    loader = DataLoader(
+        Subset(dataset, indices.tolist()),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    LOGGER.info("Loading MST checkpoint %s on %s", checkpoint_path, device)
+    model = _load_volume_model(parameters, checkpoint_path, device)
+    tokens, labels = extract_volume_tokens(model, loader, device)
+    output = args.output or run_summary.parent / "volume_tokens.npz"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output,
+        global_tokens=tokens,
+        labels=labels,
+        indices=indices,
+        patient_ids=patient_ids,
+        image_ids=image_ids,
+        run_summary=str(run_summary),
+        checkpoint=str(checkpoint_path),
+    )
+    LOGGER.info("Saved %d volume tokens with shape %s to %s", len(tokens), tokens.shape, output)
+    return output
+
+
+def main(argv: Sequence[str] | None = None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    if argv and argv[0] == "volume":
+        volume(argv[1:])
+        return
+
+    args = parse_args(argv)
     if args.image_size % 16:
         raise ValueError("--image-size must be divisible by 16")
     if args.n_neighbors < 2:

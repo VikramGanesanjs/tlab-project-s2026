@@ -54,6 +54,21 @@ def _unfreeze_backbone_tail(model: nn.Module, unfreeze_last_layers: int) -> None
         model.blocks[-unfreeze_last_layers:].requires_grad_(True)
 
 
+def _unfreeze_norms_in_lora_blocks(model: nn.Module, unfreeze_last_layers: int) -> int:
+    """Make block normalization parameters trainable wherever LoRA is active."""
+    lora_blocks = model.blocks[:-unfreeze_last_layers] if unfreeze_last_layers else model.blocks
+    unfrozen_parameters = 0
+    for block in lora_blocks:
+        for module_name, module in block.named_modules():
+            if "norm" not in module_name.lower():
+                continue
+            for parameter in module.parameters():
+                if not parameter.requires_grad:
+                    parameter.requires_grad_(True)
+                    unfrozen_parameters += parameter.numel()
+    return unfrozen_parameters
+
+
 class SSLMetaArch(nn.Module):
     """
     Modified version of SSLMetaArchCompilable including gram loss:
@@ -93,10 +108,15 @@ class SSLMetaArch(nn.Module):
             _add_lora_with_unfrozen_tail(teacher_backbone, self.lora_r, self.unfreeze_last_layers)
             freeze_non_lora_parameters(student_backbone)
             freeze_non_lora_parameters(teacher_backbone)
+            unfrozen_norm_parameters = _unfreeze_norms_in_lora_blocks(
+                student_backbone, self.unfreeze_last_layers
+            )
             _unfreeze_backbone_tail(student_backbone, self.unfreeze_last_layers)
             logger.info(
-                "LoRA enabled with rank=%d; fully unfrozen student backbone tail blocks=%d",
+                "LoRA enabled with rank=%d; trainable norm parameters in LoRA blocks=%d; "
+                "fully unfrozen student backbone tail blocks=%d",
                 self.lora_r,
+                unfrozen_norm_parameters,
                 self.unfreeze_last_layers,
             )
         elif self.unfreeze_last_layers:

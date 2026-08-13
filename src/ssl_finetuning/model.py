@@ -42,6 +42,43 @@ logger = logging.getLogger("dinov3")
 _LORA_MARKERS = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
 
+def _add_lora_with_unfrozen_tail(model: nn.Module, rank: int, unfreeze_last_layers: int) -> None:
+    """Attach LoRA except for the fully trainable final backbone blocks."""
+    from vit_lora import LoRA, add_lora_to_vit
+
+    n_blocks = len(model.blocks)
+    if not 0 <= unfreeze_last_layers <= n_blocks:
+        raise ValueError(
+            f"unfreeze_last_layers must be between 0 and {n_blocks}, got {unfreeze_last_layers}"
+        )
+
+    add_lora_to_vit(model, r=rank)
+    for block in model.blocks[-unfreeze_last_layers:] if unfreeze_last_layers else ():
+        if not isinstance(block.attn.qkv, LoRA):
+            raise TypeError("Expected LoRA-wrapped QKV while restoring the unfrozen tail")
+        block.attn.qkv = block.attn.qkv.qkv
+
+
+def _unfreeze_norms_in_lora_blocks(model: nn.Module, unfreeze_last_layers: int) -> int:
+    """Make block normalization parameters trainable wherever LoRA is active."""
+    lora_blocks = model.blocks[:-unfreeze_last_layers] if unfreeze_last_layers else model.blocks
+    unfrozen_parameters = 0
+    for block in lora_blocks:
+        for module_name, module in block.named_modules():
+            if "norm" not in module_name.lower():
+                continue
+            for parameter in module.parameters():
+                if not parameter.requires_grad:
+                    parameter.requires_grad_(True)
+                    unfrozen_parameters += parameter.numel()
+    return unfrozen_parameters
+
+
+def _unfreeze_backbone_tail(model: nn.Module, unfreeze_last_layers: int) -> None:
+    if unfreeze_last_layers:
+        model.blocks[-unfreeze_last_layers:].requires_grad_(True)
+
+
 def _rotate_half(x: Tensor) -> Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -297,17 +334,42 @@ class SSLFineTune(nn.Module):
 
         self.lora_enabled = bool(cfg.lora.enabled)
         self.lora_rank = int(cfg.lora.rank)
+        self.unfreeze_last_layers = int(getattr(cfg, "unfreeze_last_layers", 0))
+        if self.unfreeze_last_layers < 0:
+            raise ValueError(f"unfreeze_last_layers must be non-negative, got {self.unfreeze_last_layers}")
+        if self.unfreeze_last_layers > len(student_backbone.blocks):
+            raise ValueError(
+                f"unfreeze_last_layers must be no greater than the number of backbone blocks "
+                f"({len(student_backbone.blocks)}), got {self.unfreeze_last_layers}"
+            )
         self._lora_attached = False
         # Adapters must exist before FSDP2 wraps the backbone so their
         # parameters are included in the sharded module and optimizer groups.
         if self.lora_enabled:
-            from vit_lora import add_lora_to_vit, freeze_non_lora_parameters
+            from vit_lora import freeze_non_lora_parameters
 
-            add_lora_to_vit(self.student.backbone, r=self.lora_rank)
-            add_lora_to_vit(self.teacher.backbone, r=self.lora_rank)
+            _add_lora_with_unfrozen_tail(
+                self.student.backbone, self.lora_rank, self.unfreeze_last_layers
+            )
+            _add_lora_with_unfrozen_tail(
+                self.teacher.backbone, self.lora_rank, self.unfreeze_last_layers
+            )
             freeze_non_lora_parameters(self.student.backbone)
             freeze_non_lora_parameters(self.teacher.backbone)
+            unfrozen_norm_parameters = _unfreeze_norms_in_lora_blocks(
+                self.student.backbone, self.unfreeze_last_layers
+            )
+            _unfreeze_backbone_tail(self.student.backbone, self.unfreeze_last_layers)
+            logger.info(
+                "LoRA enabled with rank=%d; trainable norm parameters in LoRA blocks=%d; "
+                "fully unfrozen student backbone tail blocks=%d",
+                self.lora_rank,
+                unfrozen_norm_parameters,
+                self.unfreeze_last_layers,
+            )
             self._lora_attached = True
+        elif self.unfreeze_last_layers:
+            _unfreeze_backbone_tail(self.student.backbone, self.unfreeze_last_layers)
 
         self.teacher.requires_grad_(False)
         self.model_ema = self.teacher
@@ -395,18 +457,22 @@ class SSLFineTune(nn.Module):
             for prefix in ("module.", "teacher.", "student.", "backbone."):
                 if name.startswith(prefix):
                     name = name[len(prefix) :]
+            candidates = [name]
             if self._lora_attached:
-                # The released checkpoint stores fused projections as
-                # ``attn.qkv.{weight,bias,bias_mask}``; LoRA wraps that base
-                # layer under ``attn.qkv.qkv``.
-                for suffix in ("weight", "bias", "bias_mask"):
-                    if name.endswith(f".attn.qkv.{suffix}"):
-                        name = name.replace(
-                            f".attn.qkv.{suffix}", f".attn.qkv.qkv.{suffix}"
-                        )
-                        break
-            if name in expected_backbone_keys:
-                backbone_state[name] = value
+                # LoRA blocks store the released fused projection under
+                # ``attn.qkv.qkv``. Fully unfrozen tail blocks retain the
+                # original ``attn.qkv`` name, so choose whichever key exists.
+                candidates.extend(
+                    name.replace(f".attn.qkv.{suffix}", f".attn.qkv.qkv.{suffix}")
+                    for suffix in ("weight", "bias", "bias_mask")
+                    if name.endswith(f".attn.qkv.{suffix}")
+                )
+            matching_name = next(
+                (candidate for candidate in candidates if candidate in expected_backbone_keys),
+                None,
+            )
+            if matching_name is not None:
+                backbone_state[matching_name] = value
 
         if not backbone_state:
             raise ValueError(f"No backbone parameters found in pretrained checkpoint: {checkpoint}")
@@ -990,12 +1056,13 @@ class SSLFineTune(nn.Module):
 
     @torch.no_grad()
     def update_ema(self, momentum: float) -> None:
-        """EMA student heads and LoRA weights using stable parameter names.
+        """EMA trainable student heads/backbone parameters using stable names.
 
-        The pretrained base backbone is frozen when LoRA is enabled and is
-        intentionally excluded. Name matching is required because inserting
-        LoRA wrappers changes the module structure and makes positional
-        parameter pairing unsafe.
+        Frozen base-backbone parameters remain excluded. This includes LoRA
+        parameters, trainable norms in LoRA blocks, and all parameters in an
+        optionally fully unfrozen backbone tail. Name matching is required
+        because inserting LoRA wrappers changes the module structure and
+        makes positional parameter pairing unsafe.
         """
         student_named = dict(self.student.named_parameters())
         teacher_named = dict(self.teacher.named_parameters())
@@ -1005,7 +1072,10 @@ class SSLFineTune(nn.Module):
             for name, student_param in student_named.items():
                 is_head = name.startswith(("dino_head.", "ibot_head."))
                 is_lora = any(marker in name for marker in _LORA_MARKERS)
-                if not (is_head or is_lora):
+                is_trainable_backbone = name.startswith("backbone.") and (
+                    student_param.requires_grad or is_lora
+                )
+                if not (is_head or is_trainable_backbone):
                     continue
                 teacher_param = teacher_named.get(name)
                 if teacher_param is None:

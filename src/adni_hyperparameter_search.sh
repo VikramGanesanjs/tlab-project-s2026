@@ -2,11 +2,11 @@
 
 #SBATCH --job-name=adni_mst_tests
 #SBATCH -p gpu
-#SBATCH --gpus=1
+#SBATCH --gpus=l40s:1
 #SBATCH --cpus-per-gpu=2
 #SBATCH --mem=80G
 #SBATCH --time 72:00:00        
-#SBATCH --array=0-17    
+#SBATCH --array=2,5,11,13  
 #SBATCH --error=adni_gs_tests_%a.err  ## error log file
 #SBATCH --output=adni_gs_tests_%a.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org

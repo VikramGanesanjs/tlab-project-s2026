@@ -23,6 +23,8 @@ train:
   adni_task: cn_mci_ad
   duke_scan: pre
   max_distance: 2
+  # When set, use exactly this many stratified patients for training; all
+  # remaining patients are reserved for validation/test.
   n_patients: null
   output_dir: /common/ganesanv/tlab/runs/ssl_finetuning/adni_vitb16
   seed: 0
@@ -118,6 +120,7 @@ gamma: 1.0
 lora:
   enabled: true
   rank: 8
+unfreeze_last_layers: 0
 decoder:
   n_blocks: 2
   # null uses the encoder embedding dimension.

@@ -554,6 +554,7 @@ def _build_train_patient_subset(cfg, dataset, dataset_name):
         test_fraction=test_fraction,
         seed=split_seed,
         stratum_fn=stratum_fn,
+        train_patient_count=cfg.train.n_patients,
         split_file=split_path,
     )
 
@@ -590,7 +591,10 @@ def build_data_loader_from_cfg(
             root=data_root or ADNI_DEFAULT_ROOT,
             task=cfg.train.adni_task,
             max_distance=cfg.train.max_distance,
-            n_patients=cfg.train.n_patients,
+            # n_patients is applied by the patient-level splitter below.  The
+            # full cohort must be available so the remainder can be reserved
+            # for validation and test.
+            n_patients=None,
             transform=identity_transform,
             image_size=cfg.crops.global_crops_size,
             seed=cfg.train.seed,
@@ -600,7 +604,7 @@ def build_data_loader_from_cfg(
             root=data_root or DUKE_DEFAULT_ROOT,
             scan=cfg.train.duke_scan,
             max_distance=cfg.train.max_distance,
-            n_patients=cfg.train.n_patients,
+            n_patients=None,
             return_pair=True,
             transform=identity_transform,
             image_size=cfg.crops.global_crops_size,
