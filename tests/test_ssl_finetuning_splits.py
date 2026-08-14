@@ -1,4 +1,5 @@
 from collections import Counter
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -130,6 +131,72 @@ class TestExplicitTrainPatientCount(unittest.TestCase):
                     stratum_fn=_stratum,
                     split_file=split_path,
                 )
+
+    def test_saved_split_can_ignore_explicit_train_count_configuration(self):
+        dataset = _ToyPatientDataset()
+        with TemporaryDirectory() as temporary_directory:
+            split_path = Path(temporary_directory) / "toy_splits.json"
+            _, metadata = patient_level_stratified_split(
+                dataset,
+                dataset_name="toy",
+                train_fraction=0.70,
+                val_fraction=0.15,
+                test_fraction=0.15,
+                train_patient_count=12,
+                seed=3,
+                stratum_fn=_stratum,
+            )
+            save_patient_split(split_path, metadata)
+
+            _, loaded_metadata = patient_level_stratified_split(
+                dataset,
+                dataset_name="toy",
+                train_fraction=0.70,
+                val_fraction=0.15,
+                test_fraction=0.15,
+                train_patient_count=None,
+                seed=3,
+                stratum_fn=_stratum,
+                split_file=split_path,
+                use_saved_split_config=False,
+            )
+
+        self.assertEqual(loaded_metadata["splits"], metadata["splits"])
+
+    def test_loads_legacy_continued_pretraining_adni_split(self):
+        dataset = _ToyPatientDataset()
+        _, metadata = patient_level_stratified_split(
+            dataset,
+            dataset_name="adni",
+            train_fraction=0.70,
+            val_fraction=0.15,
+            test_fraction=0.15,
+            seed=3,
+            stratum_fn=_stratum,
+        )
+        legacy_payload = {
+            "seed": 3,
+            "ratios": {"train": 0.70, "val": 0.15, "test": 0.15},
+            "patient_diagnoses": dict(metadata["patient_strata"]),
+            "splits": metadata["splits"],
+        }
+        with TemporaryDirectory() as temporary_directory:
+            split_path = Path(temporary_directory) / "adni_splits.json"
+            split_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+            _, loaded_metadata = patient_level_stratified_split(
+                dataset,
+                dataset_name="adni",
+                train_fraction=0.70,
+                val_fraction=0.15,
+                test_fraction=0.15,
+                seed=3,
+                stratum_fn=_stratum,
+                split_file=split_path,
+                use_saved_split_config=False,
+                validate_saved_patient_strata=False,
+            )
+
+        self.assertEqual(loaded_metadata["splits"], metadata["splits"])
 
 
 if __name__ == "__main__":

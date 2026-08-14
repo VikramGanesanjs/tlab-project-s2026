@@ -93,13 +93,26 @@ def _validate_payload(
     fractions: Optional[Tuple[float, float, float]],
     train_patient_count: Optional[int],
     seed: Optional[int],
+    validate_saved_config: bool,
     allow_extra_patients: bool,
     validate_patient_strata: bool,
 ) -> Dict[str, str]:
-    if str(payload.get("dataset", "")).lower() != dataset_name.lower():
+    saved_dataset = str(payload.get("dataset", "")).lower()
+    legacy_adni_payload = (
+        dataset_name.lower() == "adni"
+        and not saved_dataset
+        and isinstance(payload.get("patient_diagnoses"), Mapping)
+        and isinstance(payload.get("ratios"), Mapping)
+    )
+    if saved_dataset != dataset_name.lower() and not legacy_adni_payload:
         raise ValueError(
             f"Split file dataset does not match: expected {dataset_name!r}, "
             f"got {payload.get('dataset')!r}"
+        )
+    if legacy_adni_payload:
+        logger.warning(
+            "Loading a legacy ADNI continued-pretraining split file without "
+            "shared split metadata"
         )
     if fractions is not None:
         saved_fractions = tuple(float(value) for value in payload.get("fractions", ()))
@@ -113,12 +126,13 @@ def _validate_payload(
             f"Split file seed does not match the current configuration: "
             f"saved={payload.get('seed')}, current={seed}"
         )
-    saved_train_patient_count = payload.get("train_patient_count")
-    if saved_train_patient_count != train_patient_count:
-        raise ValueError(
-            "Split file train_patient_count does not match the current configuration: "
-            f"saved={saved_train_patient_count}, current={train_patient_count}"
-        )
+    if validate_saved_config:
+        saved_train_patient_count = payload.get("train_patient_count")
+        if saved_train_patient_count != train_patient_count:
+            raise ValueError(
+                "Split file train_patient_count does not match the current configuration: "
+                f"saved={saved_train_patient_count}, current={train_patient_count}"
+            )
 
     saved_strata = payload.get("patient_strata", {})
     if (
@@ -188,7 +202,9 @@ def patient_level_stratified_split(
     exactly that many patients are assigned to train, stratified by
     ``stratum_fn``. The remaining patients are stratified into validation and
     test according to the relative values of ``val_fraction`` and
-    ``test_fraction``.
+    ``test_fraction``. When ``use_saved_split_config`` is false, a saved
+    split's fractions, seed, and explicit train-patient count are treated as
+    metadata rather than requirements for loading it.
     """
     fractions = _validate_fractions(train_fraction, val_fraction, test_fraction)
     seed = int(seed)
@@ -245,6 +261,7 @@ def patient_level_stratified_split(
                 fractions=fractions if use_saved_split_config else None,
                 train_patient_count=train_patient_count,
                 seed=seed if use_saved_split_config else None,
+                validate_saved_config=use_saved_split_config,
                 allow_extra_patients=allow_saved_patient_superset,
                 validate_patient_strata=validate_saved_patient_strata,
             )

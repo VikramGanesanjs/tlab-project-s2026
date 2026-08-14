@@ -121,8 +121,25 @@ def _patient_split_payload(
     patient_diagnoses: Mapping[str, str],
     seed: int,
 ) -> Dict[str, Any]:
+    patient_strata = {
+        patient: _DIAGNOSIS_TO_LABEL[diagnosis]
+        for patient, diagnosis in sorted(patient_diagnoses.items())
+    }
     return {
+        # Keep this common subset of the fine-tuning split schema so the
+        # resulting assignments can be consumed directly by dino_mst.py.
+        "version": 2,
+        "dataset": "adni",
         "seed": int(seed),
+        "fractions": [
+            _SPLIT_RATIOS["train"],
+            _SPLIT_RATIOS["val"],
+            _SPLIT_RATIOS["test"],
+        ],
+        "train_patient_count": None,
+        "patient_strata": patient_strata,
+        # Retain these fields so continued pretraining can validate split
+        # assignments against the original ADNI diagnoses.
         "ratios": dict(_SPLIT_RATIOS),
         "splits": {
             split: sorted(patient for patient, assigned_split in split_assignments.items() if assigned_split == split)
