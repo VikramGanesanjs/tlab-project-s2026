@@ -10,13 +10,21 @@ train:
   num_workers: 8
   cache_dataset: false
 
+
+data_split:
+  train_fraction: 0.70
+  val_fraction: 0.15
+  test_fraction: 0.15
+  seed: null  # Defaults to train.seed.
+  file: /common/ganesanv/tlab/runs/ssl_finetuning/adni_vitb16_r_32/adni_patient_splits.json
+
 optim:
   warmup_iterations: 800
   lr: 0.001
 checkpointing:
   period: 500  # Save a checkpoint every N training iterations.
   loss_window_iterations: 100  # Only save when this window's mean loss improves.
-  max_to_keep: 10
+  max_to_keep: 20
 
 student:
   arch: vit_base
@@ -25,6 +33,6 @@ student:
   freeze_last_layer_epochs: 0
   resume_from_teacher_chkpt: /common/ganesanv/tlab/opt/dinov3-weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
 
-lora_r: 32
-unfreeze_last_layers: 2
+lora_r: 16
+unfreeze_last_layers: 0
 freeze_iterations: 1600  # LoRA remains frozen for the first N training iterations.
