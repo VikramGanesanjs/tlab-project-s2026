@@ -209,6 +209,21 @@ def discover_distributed_checkpoints(parent: Path):
     return checkpoints
 
 
+def select_checkpoint_stride(checkpoints: list[Path], stride: int) -> list[Path]:
+    """Keep every ``stride``-th discovered checkpoint.
+
+    The first checkpoint is retained, so ``stride=3`` selects entries 0, 3,
+    6, and so on.  The final partial stride is intentionally retained; the
+    number of checkpoints need not be divisible by ``stride``.
+    """
+    if stride <= 0:
+        raise ValueError("--checkpoint-stride must be positive")
+    if stride == 1:
+        return checkpoints
+
+    return checkpoints[::stride]
+
+
 def _batched_patch_features(model, images, grid, device, batch_size):
     batches = []
     for start in range(0, len(images), batch_size):
@@ -259,7 +274,15 @@ def plot_checkpoint_evolution(args):
     images, image_names = _sample_evolution_images(
         dataset, args.n_images, args.seed
     )
-    checkpoints = discover_distributed_checkpoints(args.checkpoint_parent)
+    checkpoints = select_checkpoint_stride(
+        discover_distributed_checkpoints(args.checkpoint_parent),
+        args.checkpoint_stride,
+    )
+    LOGGER.info(
+        "Selected %d checkpoint(s) with stride=%d",
+        len(checkpoints),
+        args.checkpoint_stride,
+    )
     grid = (args.image_size // 16, args.image_size // 16)
     LOGGER.info("Evolution image size=%dx%d, patch grid=%s", args.image_size, args.image_size, grid)
     pca_maps = np.empty(
@@ -301,6 +324,18 @@ def parse_evolution_args(argv=None):
         description="Plot patch-feature PCA evolution across distributed checkpoints.",
     )
     parser.add_argument("--checkpoint-parent", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint-stride",
+        "--checkpoint-modulo",
+        "--every-nth-checkpoint",
+        dest="checkpoint_stride",
+        type=int,
+        default=1,
+        help=(
+            "Keep every Nth checkpoint in discovery order, starting with the "
+            "first (default: 1)."
+        ),
+    )
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--dataset", choices=("adni", "duke"), default="adni")
     parser.add_argument("--csv-path", type=Path, default=None)
@@ -321,6 +356,8 @@ def parse_evolution_args(argv=None):
         parser.error("--image-size must be positive and divisible by 16")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.checkpoint_stride <= 0:
+        parser.error("--checkpoint-stride must be positive")
     return args
 
 

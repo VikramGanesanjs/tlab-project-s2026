@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-gpu=2
 #SBATCH --mem=80G
 #SBATCH --time 72:00:00        
-#SBATCH --array=0-5 
+#SBATCH --array=1-5 
 #SBATCH --error=adni_best_ckpt_%a.err  ## error log file
 #SBATCH --output=adni_best_ckpt_%a.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
@@ -19,7 +19,7 @@ conda activate dinov3
 cd /common/ganesanv/tlab/src
 
 
-TASK=ssl_finetune_best_ckpt
+TASK=25patients_braindino
 BASE_CONFIG_PATH=/common/ganesanv/tlab/runs/adni_benchmark/$TASK.yaml
 RUNS_DIR=/common/ganesanv/tlab/runs/adni_benchmark/$TASK
 

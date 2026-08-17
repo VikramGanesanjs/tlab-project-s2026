@@ -45,6 +45,24 @@ BrainDINO and DINOv3 `.pth` files; use `--encoder custom` for a regular custom
 checkpoint or `--encoder dinov3` / `--encoder braindino` to force a format.
 Use `--seed` for reproducible sampling.
 
+### Four-backbone feature comparison
+
+`src/features_comparison.py` samples the same patient-diverse ADNI slices for
+DINOv3, BrainDINO, extended pretraining, and 3-D-aware fine tuning. The
+DINOv3 and BrainDINO paths are fixed to the repository defaults; supply only
+the two adapted checkpoints. Both adapted-checkpoint arguments accept a
+distributed checkpoint directory or a merged teacher `.pth` export.
+
+```bash
+python src/features_comparison.py \
+  --data-root /path/to/data/ADNI \
+  --extended-pretraining-checkpoint /path/to/extended-pretraining-checkpoint \
+  --three-d-aware-finetuning-checkpoint /path/to/3d-aware-finetuning-checkpoint \
+  --n-images 5 \
+  --image-size 512 \
+  --output features_comparison.png
+```
+
 To compare a parent folder of distributed checkpoints, use the `evolution`
 subcommand. It defaults to five sampled images and lays out images as rows and
 checkpoints as columns, with the original image in the leftmost column:
@@ -54,9 +72,14 @@ python src/pca_dino_backbones.py evolution \
   --checkpoint-parent /path/to/checkpoint_parent \
   --data-root /common/ganesanv/tlab/data/ADNI \
   --n-images 5 \
+  --checkpoint-stride 3 \
   --image-size 512 \
   --output pca_checkpoint_evolution.png
 ```
+
+`--checkpoint-stride N` keeps every Nth checkpoint in discovery order,
+starting with the first; `--checkpoint-stride 3` therefore retains entries 0,
+3, 6, and so on. The final partial stride is valid.
 
 ### Training curves
 
