@@ -35,7 +35,7 @@ from dinov3.models import build_model_from_cfg
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
 
-from utils import DecoderBlock
+from .utils import DecoderBlock
 
 logger = logging.getLogger("dinov3")
 
@@ -44,7 +44,7 @@ _LORA_MARKERS = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
 def _add_lora_with_unfrozen_tail(model: nn.Module, rank: int, unfreeze_last_layers: int) -> None:
     """Attach LoRA except for the fully trainable final backbone blocks."""
-    from vit_lora import LoRA, add_lora_to_vit
+    from utils.vit_lora import LoRA, add_lora_to_vit
 
     n_blocks = len(model.blocks)
     if not 0 <= unfreeze_last_layers <= n_blocks:
@@ -346,7 +346,7 @@ class SSLFineTune(nn.Module):
         # Adapters must exist before FSDP2 wraps the backbone so their
         # parameters are included in the sharded module and optimizer groups.
         if self.lora_enabled:
-            from vit_lora import freeze_non_lora_parameters
+            from utils.vit_lora import freeze_non_lora_parameters
 
             _add_lora_with_unfrozen_tail(
                 self.student.backbone, self.lora_rank, self.unfreeze_last_layers
@@ -534,7 +534,7 @@ class SSLFineTune(nn.Module):
         """
         self.student.backbone.init_weights()
         if self.lora_enabled:
-            from vit_lora import init_lora_parameters
+            from utils.vit_lora import init_lora_parameters
 
             init_lora_parameters(self.student.backbone)
         self.student.dino_head.init_weights()

@@ -23,7 +23,7 @@ from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
 
-from vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters, init_lora_parameters
+from utils.vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters, init_lora_parameters
 
 LORA_MARKERS = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
