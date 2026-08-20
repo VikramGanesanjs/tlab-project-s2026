@@ -3,8 +3,8 @@ opt/*
 *.out
 *.err
 
-src/__pycache__/*
-
-src/datasets/**/__pycache__/*
-
 runs/*
+
+src/*/__pycache__/*
+
+src/datasets/*/__pycache__/*
