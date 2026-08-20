@@ -67,6 +67,7 @@ DATASET_CHOICES = ("duke", "adni")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
+EARLY_STOPPING_MIN_IMPROVEMENT = 0.005
 MultiSliceDataset = Union[DukeMultiSliceDataset, ADNIMultiSliceDataset]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
@@ -106,6 +107,7 @@ class MultiSliceDinoModel(nn.Module):
         *,
         n_slices: int,
         features: str = "cls",
+        n_cls_tokens: int = 1,
         aggregator: str = "transformer",
         d_model: int = 768,
         depth: int = 2,
@@ -125,6 +127,8 @@ class MultiSliceDinoModel(nn.Module):
             )
         if n_slices <= 0:
             raise ValueError("n_slices must be positive")
+        if n_cls_tokens <= 0:
+            raise ValueError("n_cls_tokens must be positive")
         if d_model <= 0:
             raise ValueError("d_model must be positive")
         if aggregator == "transformer":
@@ -143,6 +147,8 @@ class MultiSliceDinoModel(nn.Module):
         self.encoder = encoder
         self.n_slices = int(n_slices)
         self.features = features
+        # Intermediate CLS tokens are meaningful only for the CLS feature mode.
+        self.n_cls_tokens = int(n_cls_tokens) if features == "cls" else 1
         self.aggregator = aggregator
         self.d_model = int(d_model)
         self.num_classes = int(num_classes)
@@ -158,8 +164,11 @@ class MultiSliceDinoModel(nn.Module):
             if features != "cls"
             else None
         )
+        slice_feature_dim = embed_dim * self.n_cls_tokens
         self.slice_projection = (
-            nn.Identity() if embed_dim == d_model else nn.Linear(embed_dim, d_model)
+            nn.Identity()
+            if slice_feature_dim == d_model
+            else nn.Linear(slice_feature_dim, d_model)
         )
         if aggregator == "transformer":
             self.global_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -207,19 +216,35 @@ class MultiSliceDinoModel(nn.Module):
             else torch.no_grad()
         )
         with context:
-            output = self.encoder.forward_features(flat)
-        cls = F.normalize(output["x_norm_clstoken"].float(), p=2, dim=-1)
-        if self.features == "cls":
-            token = cls
-        else:
-            assert self.patch_pool is not None
-            patches = F.normalize(output["x_norm_patchtokens"].float(), p=2, dim=-1)
-            if self.features == "both":
-                # Attend over CLS + patch tokens together → single embed_dim vector.
-                tokens = torch.cat([cls.unsqueeze(1), patches], dim=1)
+            if self.features == "cls" and self.n_cls_tokens > 1:
+                intermediate = self.encoder.get_intermediate_layers(
+                    flat,
+                    n=self.n_cls_tokens,
+                    return_class_token=True,
+                )
             else:
-                tokens = patches
-            token = self.patch_pool(tokens)
+                output = self.encoder.forward_features(flat)
+        if self.features == "cls" and self.n_cls_tokens > 1:
+            token = torch.cat(
+                [
+                    F.normalize(cls_token.float(), p=2, dim=-1)
+                    for _, cls_token in intermediate
+                ],
+                dim=-1,
+            )
+        else:
+            cls = F.normalize(output["x_norm_clstoken"].float(), p=2, dim=-1)
+            if self.features == "cls":
+                token = cls
+            else:
+                assert self.patch_pool is not None
+                patches = F.normalize(output["x_norm_patchtokens"].float(), p=2, dim=-1)
+                if self.features == "both":
+                    # Attend over CLS + patch tokens together → single embed_dim vector.
+                    tokens = torch.cat([cls.unsqueeze(1), patches], dim=1)
+                else:
+                    tokens = patches
+                token = self.patch_pool(tokens)
         return token.reshape(batch, n_slices, -1)
 
     def extract_volume_token(self, images: torch.Tensor) -> torch.Tensor:
@@ -779,8 +804,10 @@ def _checkpoint_payload(
         "model_name": args.model_name,
         "weights": str(args.weights) if args.weights is not None else None,
         "features": args.features,
+        "n_cls_tokens": args.n_cls_tokens,
         "slice_aggregator": args.slice_aggregator,
         "weight_ce_loss": args.weight_ce_loss,
+        "early_stopping": args.early_stopping,
         "early_stopping_metric": args.early_stopping_metric,
         "n_slices": args.n_slices,
         "include_bilateral": args.include_bilateral,
@@ -1045,6 +1072,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         encoder,
         n_slices=args.n_slices,
         features=args.features,
+        n_cls_tokens=args.n_cls_tokens,
         aggregator=args.slice_aggregator,
         d_model=args.d_model,
         depth=args.mst_depth,
@@ -1087,7 +1115,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     )
 
     logger.info(
-        "dataset=%s adni_task=%s encoder=%s features=%s aggregator=%s "
+        "dataset=%s adni_task=%s encoder=%s features=%s n_cls_tokens=%d aggregator=%s "
         "n_slices=%d "
         "encoder_training=%s lora_r=%s freeze_epochs=%d num_classes=%d "
         "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
@@ -1095,6 +1123,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         args.adni_task if args.dataset == "adni" else None,
         args.encoder,
         args.features,
+        args.n_cls_tokens,
         args.slice_aggregator,
         args.n_slices,
         args.encoder_training,
@@ -1183,9 +1212,15 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         if math.isnan(current_metric_value):
             improved = False
         elif args.early_stopping_metric == "bce_loss":
-            improved = current_metric_value < best_metric_value
+            improved = (
+                current_metric_value
+                < best_metric_value - EARLY_STOPPING_MIN_IMPROVEMENT
+            )
         else:
-            improved = current_metric_value > best_metric_value
+            improved = (
+                current_metric_value
+                > best_metric_value + EARLY_STOPPING_MIN_IMPROVEMENT
+            )
         if improved:
             best_metric_value = current_metric_value
             best_checkpoint_val_loss = val_loss
@@ -1229,7 +1264,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             " *" if improved else "",
         )
         epochs_without_improvement = epoch - best_epoch
-        if should_early_stop(
+        if args.early_stopping and should_early_stop(
             epoch=epoch,
             best_epoch=best_epoch,
             min_epochs=args.min_epochs,
@@ -1492,6 +1527,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Minimum epochs before validation-loss early stopping",
     )
     parser.add_argument(
+        "--early-stopping",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable validation-metric early stopping (default); use "
+            "--no-early-stopping to train for all epochs"
+        ),
+    )
+    parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=10,
@@ -1607,6 +1651,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "Per-slice token: cls (CLS only), patch (attention-pooled patches), "
             "or both (attention pool over CLS + patch tokens together)"
+        ),
+    )
+    parser.add_argument(
+        "--n-cls-tokens",
+        type=int,
+        default=1,
+        help=(
+            "Number of final encoder-layer CLS tokens to concatenate per slice; "
+            "used only when --features=cls"
         ),
     )
     parser.add_argument("--model-name", default="dinov3_vitb16")

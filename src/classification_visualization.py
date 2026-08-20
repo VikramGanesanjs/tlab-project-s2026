@@ -427,6 +427,7 @@ def _load_volume_model(
         encoder,
         n_slices=int(_run_value(parameters, checkpoint, "n_slices", 8)),
         features=str(_run_value(parameters, checkpoint, "features", "cls")),
+        n_cls_tokens=int(_run_value(parameters, checkpoint, "n_cls_tokens", 1)),
         aggregator=str(_run_value(parameters, checkpoint, "slice_aggregator", "transformer")),
         d_model=d_model,
         depth=int(_run_value(parameters, checkpoint, "mst_depth", 2)),
