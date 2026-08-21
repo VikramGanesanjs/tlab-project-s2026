@@ -21,7 +21,6 @@ for _path in (_SRC_DIR, _MODULE_DIR, _DINOV3_DIR):
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import Tensor, nn
 
 import dinov3.distributed as distributed
@@ -35,7 +34,9 @@ from dinov3.models import build_model_from_cfg
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
 
-from .utils import DecoderBlock
+from .cvd import CrossViewDecoder, _patch_positions
+from .losses import croco_ibot_loss as compute_croco_ibot_loss
+from .losses import uwsd_loss as compute_uwsd_loss
 
 logger = logging.getLogger("dinov3")
 
@@ -79,200 +80,12 @@ def _unfreeze_backbone_tail(model: nn.Module, unfreeze_last_layers: int) -> None
         model.blocks[-unfreeze_last_layers:].requires_grad_(True)
 
 
-def _rotate_half(x: Tensor) -> Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-class _DecoderRoPE(nn.Module):
-    """Axial 2-D rotary position encoding for the CroCo-style decoder.
-
-    ``DecoderBlock`` calls the rotary module with tensors shaped
-    ``[B, heads, tokens, head_dim]`` and integer patch coordinates shaped
-    ``[B, tokens, 2]``. The coordinate layout mirrors DINOv3's axial RoPE:
-    half of the frequencies encode height and half encode width.
-    """
-
-    def __init__(self, embed_dim: int, num_heads: int, base: float = 100.0) -> None:
-        super().__init__()
-        if embed_dim % num_heads != 0:
-            raise ValueError("decoder embed_dim must be divisible by decoder n_heads")
-        head_dim = embed_dim // num_heads
-        if head_dim % 4 != 0:
-            raise ValueError("decoder head dimension must be divisible by 4 for 2-D RoPE")
-        self.head_dim = head_dim
-        self.base = float(base)
-        periods = base ** (
-            2
-            * torch.arange(head_dim // 4, dtype=torch.float32)
-            / (head_dim // 2)
-        )
-        self.register_buffer("periods", periods, persistent=False)
-
-    @torch.no_grad()
-    def reset_parameters(self) -> None:
-        periods = self.base ** (
-            2
-            * torch.arange(
-                self.head_dim // 4,
-                device=self.periods.device,
-                dtype=self.periods.dtype,
-            )
-            / (self.head_dim // 2)
-        )
-        self.periods.copy_(periods)
-
-    def forward(self, x: Tensor, positions: Tensor) -> Tensor:
-        if positions.ndim == 2:
-            positions = positions.unsqueeze(0)
-        if positions.shape[0] == 1 and x.shape[0] != 1:
-            positions = positions.expand(x.shape[0], -1, -1)
-        if positions.shape[0] != x.shape[0] or positions.shape[1] != x.shape[2]:
-            raise ValueError(
-                "RoPE positions must match decoder input: "
-                f"x={tuple(x.shape)}, positions={tuple(positions.shape)}"
-            )
-
-        pos = positions.to(device=x.device, dtype=self.periods.dtype)
-        periods = self.periods.to(device=x.device)
-        angles = 2.0 * math.pi * pos[..., :, None] / periods[None, None, None, :]
-        # [B, N, 2, D/4] -> [B, N, D/2], then duplicate for rotate_half.
-        angles = angles.flatten(-2, -1)
-        angles = torch.cat((angles, angles), dim=-1)
-        sin = angles.sin().unsqueeze(1)
-        cos = angles.cos().unsqueeze(1)
-        dtype = x.dtype
-        x_float = x.float()
-        rotated = (x_float * cos) + (_rotate_half(x_float) * sin)
-        return rotated.to(dtype=dtype)
-
-
-def _patch_positions(batch_size: int, num_patches: int, device: torch.device) -> Tensor:
-    """Return row-major ``[B, num_patches, 2]`` patch coordinates."""
-    height = int(math.sqrt(num_patches))
-    while height > 1 and num_patches % height:
-        height -= 1
-    width = num_patches // height
-    rows = torch.arange(height, device=device)
-    cols = torch.arange(width, device=device)
-    row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
-    positions = torch.stack((row_grid.flatten(), col_grid.flatten()), dim=-1)
-    return positions.unsqueeze(0).expand(batch_size, -1, -1)
-
-
-class CrossViewDecoder(nn.Module):
-    """CroCo-style decoder for cross-slice masked-patch completion."""
-
-    def __init__(self, cfg: Any, enc_embed_dim: Optional[int] = None) -> None:
-        super().__init__()
-        self.n_blocks = int(cfg.decoder.n_blocks)
-        self.embed_dim = int(cfg.decoder.embed_dim or enc_embed_dim)
-        self.enc_embed_dim = int(enc_embed_dim)
-        self.n_heads = int(cfg.decoder.n_heads)
-        self.mlp_ratio = float(cfg.decoder.mlp_ratio)
-        rope_base = float(cfg.decoder.rope_base)
-        self.context_mode = str(cfg.decoder.context_mode).lower()
-        if self.context_mode not in {"masked", "full"}:
-            raise ValueError(
-                "decoder.context_mode must be 'masked' or 'full', "
-                f"got {self.context_mode!r}"
-            )
-
-        self.decoder_embed = nn.Linear(self.enc_embed_dim, self.embed_dim)
-        self.context_embed = nn.Linear(self.enc_embed_dim, self.embed_dim)
-        self.rope = _DecoderRoPE(self.embed_dim, self.n_heads, base=rope_base)
-        self.decoder = nn.ModuleList(
-            [
-                DecoderBlock(
-                    self.embed_dim,
-                    self.n_heads,
-                    mlp_ratio=self.mlp_ratio,
-                    qkv_bias=True,
-                    rope=self.rope,
-                )
-                for _ in range(self.n_blocks)
-            ]
-        )
-        self.dec_norm = nn.LayerNorm(self.embed_dim)
-        self.output_proj = (
-            nn.Identity()
-            if self.embed_dim == self.enc_embed_dim
-            else nn.Linear(self.embed_dim, self.enc_embed_dim)
-        )
-
-    @torch.no_grad()
-    def init_weights(self) -> None:
-        """Initialize the decoder after meta-device materialization."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.trunc_normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-        self.rope.reset_parameters()
-
-    def forward(
-        self,
-        query_tokens: Tensor,
-        context_tokens: Tensor,
-        query_pos: Optional[Tensor] = None,
-        context_pos: Optional[Tensor] = None,
-    ) -> Tensor:
-        if query_tokens.ndim != 3 or context_tokens.ndim != 3:
-            raise ValueError("CVD expects query/context tokens shaped [B, patches, dim]")
-        if query_tokens.shape[0] != context_tokens.shape[0]:
-            raise ValueError(
-                "CVD query/context batches must align: "
-                f"query={tuple(query_tokens.shape)}, context={tuple(context_tokens.shape)}"
-            )
-        batch_size, query_patches, _ = query_tokens.shape
-        context_patches = context_tokens.shape[1]
-        if query_pos is None:
-            query_pos = _patch_positions(batch_size, query_patches, query_tokens.device)
-        if context_pos is None:
-            context_pos = _patch_positions(batch_size, context_patches, context_tokens.device)
-
-        query = self.decoder_embed(query_tokens)
-        context = self.context_embed(context_tokens.detach())
-        for block in self.decoder:
-            query, _ = block(query, context, query_pos, context_pos)
-        return self.output_proj(self.dec_norm(query))
-
-
-def _sinkhorn_knopp(teacher_output: Tensor, temperature: float, iterations: int = 3) -> Tensor:
-    """DINO-style Sinkhorn assignments using the active DINO process subgroup."""
-    output = teacher_output.float()
-    if output.ndim != 2 or output.shape[0] == 0:
-        raise ValueError("Sinkhorn expects non-empty [samples, prototypes] logits")
-    assignments = torch.exp(output / temperature).t()
-    prototypes = assignments.shape[0]
-
-    if dist.is_initialized():
-        process_group = distributed.get_process_subgroup()
-        global_batch = torch.tensor(
-            assignments.shape[1], device=assignments.device, dtype=assignments.dtype
-        )
-        dist.all_reduce(global_batch, group=process_group)
-    else:
-        global_batch = torch.tensor(
-            assignments.shape[1], device=assignments.device, dtype=assignments.dtype
-        )
-
-    total = assignments.sum()
-    if dist.is_initialized():
-        dist.all_reduce(total, group=process_group)
-    assignments /= total.clamp_min(torch.finfo(assignments.dtype).tiny)
-    for _ in range(iterations):
-        row_sum = assignments.sum(dim=1, keepdim=True)
-        if dist.is_initialized():
-            dist.all_reduce(row_sum, group=process_group)
-        assignments /= row_sum.clamp_min(torch.finfo(assignments.dtype).tiny)
-        assignments /= prototypes
-        assignments /= assignments.sum(dim=0, keepdim=True).clamp_min(torch.finfo(assignments.dtype).tiny)
-        assignments /= global_batch
-    return (assignments * global_batch).t()
+def _set_patch_embeddings_trainable(model: nn.Module, trainable: bool) -> int:
+    """Set the trainability of every parameter in a ViT patch embedder."""
+    if not hasattr(model, "patch_embed"):
+        raise AttributeError(f"{type(model).__name__} has no patch_embed module")
+    model.patch_embed.requires_grad_(trainable)
+    return sum(parameter.numel() for parameter in model.patch_embed.parameters())
 
 
 class SSLFineTune(nn.Module):
@@ -335,6 +148,7 @@ class SSLFineTune(nn.Module):
         self.lora_enabled = bool(cfg.lora.enabled)
         self.lora_rank = int(cfg.lora.rank)
         self.unfreeze_last_layers = int(getattr(cfg, "unfreeze_last_layers", 0))
+        self.unfreeze_patch_embeddings = bool(getattr(cfg, "unfreeze_patch_embeddings", False))
         if self.unfreeze_last_layers < 0:
             raise ValueError(f"unfreeze_last_layers must be non-negative, got {self.unfreeze_last_layers}")
         if self.unfreeze_last_layers > len(student_backbone.blocks):
@@ -373,6 +187,18 @@ class SSLFineTune(nn.Module):
 
         self.teacher.requires_grad_(False)
         self.model_ema = self.teacher
+        student_patch_embed_parameters = _set_patch_embeddings_trainable(
+            self.student.backbone, self.unfreeze_patch_embeddings
+        )
+        teacher_patch_embed_parameters = _set_patch_embeddings_trainable(
+            self.teacher.backbone, self.unfreeze_patch_embeddings
+        )
+        logger.info(
+            "Patch embeddings trainable=%s; student parameters=%d; teacher parameters=%d",
+            self.unfreeze_patch_embeddings,
+            student_patch_embed_parameters,
+            teacher_patch_embed_parameters,
+        )
 
         self.dino_loss = DINOLoss(self.dino_out_dim)
         self.ibot_patch_loss = iBOTPatchLoss(ibot_out_dim)
@@ -775,63 +601,6 @@ class SSLFineTune(nn.Module):
             masks[0, 0] = True
         return masks
 
-    def _weighted_ce(self, student_logits: Tensor, teacher_probs: Tensor, weights: Tensor) -> Tuple[Tensor, Tensor]:
-        student_temp = float(getattr(self.dino_loss, "student_temp", 0.1))
-        log_probs = F.log_softmax(student_logits.float() / student_temp, dim=-1)
-        ce = -(teacher_probs.float() * log_probs).sum(dim=-1)
-        weights = weights.to(device=ce.device, dtype=ce.dtype)
-        return (ce * weights).sum(), weights.sum()
-
-    def _uncertainty_weight(self, teacher_probs: Tensor) -> Tensor:
-        probs = teacher_probs.float().clamp_min(1e-8)
-        entropy = -(probs * probs.log()).sum(dim=-1)
-        return 1.0 + self.gamma * entropy
-
-    def uwsd_loss(
-        self,
-        teacher1: Dict[str, Tensor],
-        teacher2: Dict[str, Tensor],
-        student1: Dict[str, Tensor],
-        student2: Dict[str, Tensor],
-        local_logits1: Optional[Tensor] = None,
-        local_logits2: Optional[Tensor] = None,
-        teacher_temp: Optional[float] = None,
-    ) -> Tensor:
-        """UWSD multi-crop DINO loss with slice-aware pair routing."""
-        temperature = float(teacher_temp or self.teacher_temp)
-        teacher_logits = torch.cat((teacher1["cls_logits"], teacher2["cls_logits"]), dim=0)
-        teacher_probs = _sinkhorn_knopp(teacher_logits, temperature)
-        batch_size = teacher1["cls_logits"].shape[0]
-        teacher_probs1, teacher_probs2 = teacher_probs.split(batch_size, dim=0)
-
-        terms: list[Tuple[Tensor, Tensor, Tensor]] = []
-        weight1 = self._uncertainty_weight(teacher_probs1)
-        weight2 = self._uncertainty_weight(teacher_probs2)
-
-        if local_logits1 is not None:
-            for logits in local_logits1:
-                terms.append((logits, teacher_probs1, weight1))
-        if local_logits2 is not None:
-            for logits in local_logits2:
-                terms.append((logits, teacher_probs2, weight2))
-
-        # Cross-slice global-to-global terms are the only global comparison.
-        terms.append((student1["cls_logits"], teacher_probs2, self.lam_cross * weight2))
-        terms.append((student2["cls_logits"], teacher_probs1, self.lam_cross * weight1))
-
-        numerator: Optional[Tensor] = None
-        denominator: Optional[Tensor] = None
-        for student_logits, target_probs, weights in terms:
-            term_num, term_den = self._weighted_ce(student_logits, target_probs, weights)
-            numerator = term_num if numerator is None else numerator + term_num
-            denominator = term_den if denominator is None else denominator + term_den
-        assert numerator is not None and denominator is not None
-        return numerator / denominator.clamp_min(1e-8)
-
-    @staticmethod
-    def _masked_values(values: Tensor, masks: Tensor) -> Tensor:
-        return values[masks]
-
     def _decode_masked_queries(
         self,
         query_tokens: Tensor,
@@ -873,50 +642,6 @@ class SSLFineTune(nn.Module):
             return query_tokens.new_empty((0, query_tokens.shape[-1]))
         return torch.cat(decoded, dim=0)
 
-    def croco_ibot_loss(
-        self,
-        teacher1: Dict[str, Tensor],
-        teacher2: Dict[str, Tensor],
-        student1: Dict[str, Tensor],
-        student2: Dict[str, Tensor],
-        masks1: Tensor,
-        masks2: Tensor,
-        teacher_temp: Optional[float] = None,
-    ) -> Tensor:
-        """Cross-view masked-patch completion with same-slice targets."""
-        batch_size, num_patches, _ = teacher1["patch_pre_head"].shape
-        positions = _patch_positions(batch_size, num_patches, teacher1["patch_pre_head"].device)
-        refined1 = self._decode_masked_queries(
-            student1["patch_pre_head"],
-            teacher2["patch_pre_head"],
-            masks1,
-            positions,
-        )
-        refined2 = self._decode_masked_queries(
-            student2["patch_pre_head"],
-            teacher1["patch_pre_head"],
-            masks2,
-            positions,
-        )
-
-        teacher_selected1 = self._masked_values(teacher1["ibot_logits"], masks1)
-        teacher_selected2 = self._masked_values(teacher2["ibot_logits"], masks2)
-        teacher_selected = torch.cat((teacher_selected1, teacher_selected2), dim=0)
-        teacher_probs = _sinkhorn_knopp(teacher_selected, float(teacher_temp or self.teacher_temp))
-        count1 = teacher_selected1.shape[0]
-        teacher_probs1, teacher_probs2 = teacher_probs.split((count1, teacher_selected2.shape[0]), dim=0)
-
-        student_logits1 = self.student.ibot_head(refined1)
-        student_logits2 = self.student.ibot_head(refined2)
-        student_temp = float(getattr(self.ibot_patch_loss, "student_temp", 0.1))
-
-        def patch_ce(student_logits: Tensor, target: Tensor) -> Tensor:
-            if student_logits.numel() == 0:
-                return student_logits.sum() * 0.0
-            return -(target.float() * F.log_softmax(student_logits.float() / student_temp, dim=-1)).sum(-1).mean()
-
-        return 0.5 * (patch_ce(student_logits1, teacher_probs1) + patch_ce(student_logits2, teacher_probs2))
-
     def compute_losses(
         self,
         *,
@@ -956,25 +681,39 @@ class SSLFineTune(nn.Module):
             if local_logits2.shape[0] == 0:
                 local_logits2 = None
 
-        uwsd_loss = self.uwsd_loss(
-            teacher1,
-            teacher2,
-            student1,
-            student2,
+        effective_teacher_temp = float(teacher_temp or self.teacher_temp)
+        uwsd_loss = compute_uwsd_loss(
+            teacher_logits1=teacher1["cls_logits"],
+            teacher_logits2=teacher2["cls_logits"],
+            student_logits1=student1["cls_logits"],
+            student_logits2=student2["cls_logits"],
             local_logits1=local_logits1,
             local_logits2=local_logits2,
-            teacher_temp=teacher_temp,
+            teacher_temp=effective_teacher_temp,
+            student_temp=float(getattr(self.dino_loss, "student_temp", 0.1)),
+            gamma=self.gamma,
+            lam_cross=self.lam_cross,
         )
         batch_size = student_global["cls_after_head"].shape[1]
         masks = masks.reshape(2, batch_size, -1)
-        croco_ibot_loss = self.croco_ibot_loss(
-            teacher1,
-            teacher2,
-            student1,
-            student2,
-            masks[0],
-            masks[1],
-            teacher_temp=teacher_temp,
+        _, num_patches, _ = teacher1["patch_pre_head"].shape
+        positions = _patch_positions(batch_size, num_patches, teacher1["patch_pre_head"].device)
+        decoded_tokens1 = self._decode_masked_queries(
+            student1["patch_pre_head"], teacher2["patch_pre_head"], masks[0], positions
+        )
+        decoded_tokens2 = self._decode_masked_queries(
+            student2["patch_pre_head"], teacher1["patch_pre_head"], masks[1], positions
+        )
+        croco_ibot_loss = compute_croco_ibot_loss(
+            teacher_logits1=teacher1["ibot_logits"],
+            teacher_logits2=teacher2["ibot_logits"],
+            decoded_tokens1=decoded_tokens1,
+            decoded_tokens2=decoded_tokens2,
+            masks1=masks[0],
+            masks2=masks[1],
+            ibot_head=self.student.ibot_head,
+            teacher_temp=effective_teacher_temp,
+            student_temp=float(getattr(self.ibot_patch_loss, "student_temp", 0.1)),
         )
         total = self.lambda1 * uwsd_loss + self.lambda2 * croco_ibot_loss
         return total, {
@@ -1106,6 +845,24 @@ class SSLFineTune(nn.Module):
         for teacher_param, student_param in zip(teacher_params, student_params):
             teacher_param.mul_(momentum).add_(student_param, alpha=1.0 - momentum)
 
+    def is_lora_warmup_backbone_parameter(self, name: str, parameter: nn.Parameter) -> bool:
+        """Whether a student-backbone parameter follows the delayed LoRA schedule."""
+        if not self.lora_enabled:
+            return False
+        if any(marker in name for marker in _LORA_MARKERS):
+            return True
+        if self.unfreeze_patch_embeddings and name.startswith("patch_embed."):
+            return True
+        parts = name.split(".", 2)
+        if len(parts) < 3 or parts[0] != "blocks" or not parts[1].isdigit():
+            return False
+        lora_block_count = len(self.student.backbone.blocks) - self.unfreeze_last_layers
+        return (
+            int(parts[1]) < lora_block_count
+            and "norm" in name.lower()
+            and parameter.requires_grad
+        )
+
     def build_data_augmentation_dino(self, cfg: Any) -> DataAugmentationDINO:
         crops = cfg.crops
         return DataAugmentationDINO(
@@ -1139,10 +896,20 @@ class SSLFineTune(nn.Module):
             # parameter.  Fused groups become lists only after this tagging
             # step, so inspect the parameter directly here.
             group["is_lora"] = id(group["params"]) in lora_param_ids
+            group["is_lora_warmup"] = (
+                module is self.student.backbone
+                and self.is_lora_warmup_backbone_parameter(group["name"], group["params"])
+            )
         if bool(optim_cfg.multi_tensor_optim):
             fused_groups = fuse_params_groups(
                 params_groups,
-                keys=("lr_multiplier", "wd_multiplier", "is_last_layer", "is_lora"),
+                keys=(
+                    "lr_multiplier",
+                    "wd_multiplier",
+                    "is_last_layer",
+                    "is_lora",
+                    "is_lora_warmup",
+                ),
             )
             for group in fused_groups:
                 group["foreach"] = True

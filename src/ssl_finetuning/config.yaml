@@ -121,6 +121,7 @@ lora:
   enabled: true
   rank: 8
 unfreeze_last_layers: 0
+unfreeze_patch_embeddings: false
 decoder:
   n_blocks: 2
   # null uses the encoder embedding dimension.

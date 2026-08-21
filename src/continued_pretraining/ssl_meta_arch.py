@@ -54,6 +54,14 @@ def _unfreeze_backbone_tail(model: nn.Module, unfreeze_last_layers: int) -> None
         model.blocks[-unfreeze_last_layers:].requires_grad_(True)
 
 
+def _set_patch_embeddings_trainable(model: nn.Module, trainable: bool) -> int:
+    """Set the trainability of every parameter in a ViT patch embedder."""
+    if not hasattr(model, "patch_embed"):
+        raise AttributeError(f"{type(model).__name__} has no patch_embed module")
+    model.patch_embed.requires_grad_(trainable)
+    return sum(parameter.numel() for parameter in model.patch_embed.parameters())
+
+
 def _unfreeze_norms_in_lora_blocks(model: nn.Module, unfreeze_last_layers: int) -> int:
     """Make block normalization parameters trainable wherever LoRA is active."""
     lora_blocks = model.blocks[:-unfreeze_last_layers] if unfreeze_last_layers else model.blocks
@@ -96,6 +104,7 @@ class SSLMetaArch(nn.Module):
         self.lora_r = int(getattr(cfg, "lora_r", 0))
         self.lora_enabled = self.lora_r > 0
         self.unfreeze_last_layers = int(getattr(cfg, "unfreeze_last_layers", 0))
+        self.unfreeze_patch_embeddings = bool(getattr(cfg, "unfreeze_patch_embeddings", False))
         if self.unfreeze_last_layers < 0:
             raise ValueError(f"unfreeze_last_layers must be non-negative, got {self.unfreeze_last_layers}")
         if self.unfreeze_last_layers > len(student_backbone.blocks):
@@ -207,6 +216,22 @@ class SSLMetaArch(nn.Module):
         # No grad is needed for these two
         self.teacher.requires_grad_(False)
         self.model_ema.requires_grad_(False)
+        student_patch_embed_parameters = _set_patch_embeddings_trainable(
+            self.student.backbone, self.unfreeze_patch_embeddings
+        )
+        teacher_patch_embed_parameters = _set_patch_embeddings_trainable(
+            self.teacher.backbone, self.unfreeze_patch_embeddings
+        )
+        if self.model_ema is not self.teacher:
+            _set_patch_embeddings_trainable(
+                self.model_ema.backbone, self.unfreeze_patch_embeddings
+            )
+        logger.info(
+            "Patch embeddings trainable=%s; student parameters=%d; teacher parameters=%d",
+            self.unfreeze_patch_embeddings,
+            student_patch_embed_parameters,
+            teacher_patch_embed_parameters,
+        )
         self.ema_params_lists = None
 
         # getting config params fixed:
@@ -851,6 +876,24 @@ class SSLMetaArch(nn.Module):
             torch._foreach_mul_(gramteacher_param_list, m)
             torch._foreach_add_(gramteacher_param_list, teacher_param_list, alpha=1 - m)
 
+    def is_lora_warmup_backbone_parameter(self, name: str, parameter: nn.Parameter) -> bool:
+        """Whether a student-backbone parameter follows the delayed LoRA schedule."""
+        if not self.lora_enabled:
+            return False
+        if any(marker in name for marker in LORA_MARKERS):
+            return True
+        if self.unfreeze_patch_embeddings and name.startswith("patch_embed."):
+            return True
+        parts = name.split(".", 2)
+        if len(parts) < 3 or parts[0] != "blocks" or not parts[1].isdigit():
+            return False
+        lora_block_count = len(self.student.backbone.blocks) - self.unfreeze_last_layers
+        return (
+            int(parts[1]) < lora_block_count
+            and "norm" in name.lower()
+            and parameter.requires_grad
+        )
+
     def build_data_augmentation_dino(self, cfg):
         return DataAugmentationDINO(
             cfg.crops.global_crops_scale,
@@ -876,10 +919,20 @@ class SSLMetaArch(nn.Module):
         )
         for group in params_groups:
             group["is_lora"] = any(marker in group["name"] for marker in LORA_MARKERS)
+            group["is_lora_warmup"] = (
+                m is self.student.backbone
+                and self.is_lora_warmup_backbone_parameter(group["name"], group["params"])
+            )
         if self.cfg.optim.multi_tensor_optim:
             fused_params_groups = fuse_params_groups(
                 params_groups,
-                keys=("lr_multiplier", "wd_multiplier", "is_last_layer", "is_lora"),
+                keys=(
+                    "lr_multiplier",
+                    "wd_multiplier",
+                    "is_last_layer",
+                    "is_lora",
+                    "is_lora_warmup",
+                ),
             )
             logger.info("fusing param groups")
 

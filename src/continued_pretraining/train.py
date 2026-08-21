@@ -51,7 +51,7 @@ from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosi
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from .adni import ADNI
 from .ssl_meta_arch import LORA_MARKERS, SSLMetaArch
-from ssl_finetuning.splits import patient_level_stratified_split, save_patient_split
+from utils.splits import patient_level_stratified_split, save_patient_split
 
 assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
@@ -347,7 +347,7 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr, lora_lr):
         lr_multiplier = param_group["lr_multiplier"]
         wd_multiplier = param_group["wd_multiplier"]
         param_group["weight_decay"] = wd * wd_multiplier
-        if param_group.get("is_lora", False):
+        if param_group.get("is_lora_warmup", False):
             param_group["lr"] = lora_lr * lr_multiplier
         elif is_last_layer:
             param_group["lr"] = last_layer_lr * lr_multiplier
@@ -650,8 +650,8 @@ def do_train(cfg, model, resume=False):
                 )
 
         if it < freeze_iterations:
-            for name, parameter in student.named_parameters():
-                if any(marker in name for marker in LORA_MARKERS):
+            for name, parameter in student.backbone.named_parameters():
+                if model.is_lora_warmup_backbone_parameter(name, parameter):
                     parameter.grad = None
 
         # Reduce total_loss to check for NaNs, reduce metrics for logging

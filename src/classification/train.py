@@ -56,7 +56,7 @@ from datasets.duke import (  # noqa: E402
     DukeMultiSliceDataset,
     build_duke_volume_transform,
 )
-from ssl_finetuning.splits import patient_level_stratified_split  # noqa: E402
+from utils.splits import patient_level_stratified_split  # noqa: E402
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from utils.vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
 from classification.model import MultiSliceDinoModel, set_lora_requires_grad  # noqa: E402

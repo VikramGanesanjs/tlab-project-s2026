@@ -67,7 +67,7 @@ class ADNI(ExtendedVisionDataset):
     """ADNI scans represented as canonical axial-slice images.
 
     Patient splitting is intentionally handled by
-    :mod:`ssl_finetuning.splits`, which provides the shared split-file schema
+    :mod:`utils.splits`, which provides the shared split-file schema
     and validation used by both fine-tuning and continued pretraining.
     """
 

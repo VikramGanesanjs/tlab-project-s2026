@@ -35,4 +35,5 @@ student:
 
 lora_r: 16
 unfreeze_last_layers: 0
+unfreeze_patch_embeddings: false
 freeze_iterations: 1600  # LoRA remains frozen for the first N training iterations.

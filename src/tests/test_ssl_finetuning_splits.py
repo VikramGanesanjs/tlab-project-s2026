@@ -6,7 +6,7 @@ import unittest
 
 from torch.utils.data import Dataset
 
-from ssl_finetuning.splits import patient_level_stratified_split, save_patient_split
+from utils.splits import patient_level_stratified_split, save_patient_split
 
 
 class _ToyPatientDataset(Dataset):

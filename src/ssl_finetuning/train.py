@@ -39,16 +39,13 @@ from dinov3.data import (
     make_data_loader,
 )
 from dinov3.logging import MetricLogger, SmoothedValue, setup_logging
-from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
+from dinov3.train.cosine_lr_scheduler import CosineScheduler
 
 from datasets.adni import ADNIPairedSliceDataset, DEFAULT_ROOT as ADNI_DEFAULT_ROOT
 from datasets.duke import DukeBreastMRIDataset, PairToDinoGlobalCrops
 from datasets.duke.dataset import _DEFAULT_OUT_ROOT as DUKE_DEFAULT_ROOT
 
-try:
-    from .splits import patient_level_stratified_split, save_patient_split
-except ImportError:  # Support direct execution: python src/ssl_finetuning/train.py
-    from splits import patient_level_stratified_split, save_patient_split
+from utils.splits import patient_level_stratified_split, save_patient_split
 
 try:
     from .model import SSLFineTune
@@ -256,10 +253,6 @@ def _epochs_to_iterations(epochs, iterations_per_epoch: int, *, field_name: str)
 
 
 def build_schedulers(cfg, iterations_per_epoch):
-    if "schedules" in cfg:
-        logger.info("Using schedules v2")
-        return build_schedulers_v2(cfg, iterations_per_epoch)
-
     total_iterations = cfg.optim["epochs"] * iterations_per_epoch
     freeze_iterations = _epochs_to_iterations(
         cfg.optim["freeze_backbone_epochs"],
@@ -330,132 +323,13 @@ def build_schedulers(cfg, iterations_per_epoch):
     )
 
 
-def build_schedulers_v2(cfg, iterations_per_epoch):
-    iter_per_epoch = iterations_per_epoch
-    total_iterations = iterations_per_epoch * cfg.optim.epochs
-    freeze_iterations = _epochs_to_iterations(
-        cfg.optim.freeze_backbone_epochs,
-        iterations_per_epoch,
-        field_name="optim.freeze_backbone_epochs",
-    )
-    lora_warmup_iterations = _epochs_to_iterations(
-        cfg.schedules.lr.warmup_epochs,
-        iter_per_epoch,
-        field_name="schedules.lr.warmup_epochs",
-    )
-    weight_decay_warmup_iterations = _epochs_to_iterations(
-        cfg.schedules.weight_decay.warmup_epochs,
-        iter_per_epoch,
-        field_name="schedules.weight_decay.warmup_epochs",
-    )
-    momentum_warmup_iterations = _epochs_to_iterations(
-        cfg.schedules.momentum.warmup_epochs,
-        iter_per_epoch,
-        field_name="schedules.momentum.warmup_epochs",
-    )
-    teacher_temp_warmup_iterations = _epochs_to_iterations(
-        cfg.schedules.teacher_temp.warmup_epochs,
-        iter_per_epoch,
-        field_name="schedules.teacher_temp.warmup_epochs",
-    )
-    if freeze_iterations >= total_iterations:
-        raise ValueError(
-            "freeze_backbone_epochs must be shorter than the total training run"
-        )
-    if lora_warmup_iterations > total_iterations - freeze_iterations:
-        raise ValueError(
-            "LoRA warmup extends beyond the end of training: "
-            f"warmup_iterations={lora_warmup_iterations}, "
-            f"remaining_iterations={total_iterations - freeze_iterations}"
-        )
-    logger.info(f"Total training iterations {total_iterations}")
-
-    # LR scaling rules
-    lr_peak = cfg.schedules.lr.peak
-    lr_end = cfg.schedules.lr.end
-    subgroup_size = distributed.get_subgroup_size()
-    if cfg.optim.scaling_rule == "linear_wrt_256":
-        lr_peak *= cfg.train.batch_size_per_gpu * subgroup_size / 256.0
-        lr_end *= cfg.train.batch_size_per_gpu * subgroup_size / 256.0
-        logger.info(
-            f"Scaling rule {cfg.optim.scaling_rule}, LR peak {cfg.schedules.lr.peak} -> {lr_peak}, LR end {cfg.schedules.lr.end} -> {lr_end}"
-        )
-    elif cfg.optim.scaling_rule == "sqrt_wrt_1024":
-        lr_peak *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * subgroup_size / 1024.0)
-        lr_end *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * subgroup_size / 1024.0)
-        logger.info(
-            f"Scaling rule {cfg.optim.scaling_rule}, LR peak {cfg.schedules.lr.peak} -> {lr_peak}, LR end {cfg.schedules.lr.end} -> {lr_end}"
-        )
-    else:
-        logger.info(f"No scaling rule for {cfg.optim.scaling_rule=}")
-
-    lr = linear_warmup_cosine_decay(
-        start=lr_peak,
-        peak=lr_peak,
-        end=lr_end,
-        warmup_iterations=0,
-        total_iterations=total_iterations,
-        cosine_iterations=(
-            iter_per_epoch * cfg.schedules.lr.cosine_epochs if "cosine_epochs" in cfg.schedules.lr else None
-        ),
-    )
-    lora_lr = linear_warmup_cosine_decay(
-        start=0.0,
-        peak=lr_peak,
-        end=lr_end,
-        warmup_iterations=lora_warmup_iterations,
-        total_iterations=total_iterations - freeze_iterations,
-    )
-    import numpy as np
-
-    lora_lr = np.concatenate((np.zeros(freeze_iterations, dtype=np.float64), lora_lr))
-    # The custom SSL objective trains both heads from the beginning. Keep the
-    # last-layer schedule active during Stage A (heads + CVD only).
-    last_layer_lr = lr.copy()
-    weight_decay = linear_warmup_cosine_decay(
-        start=cfg.schedules.weight_decay.start,
-        peak=cfg.schedules.weight_decay.peak,
-        end=cfg.schedules.weight_decay.end,
-        warmup_iterations=weight_decay_warmup_iterations,
-        total_iterations=total_iterations,
-        cosine_iterations=(
-            iter_per_epoch * cfg.schedules.weight_decay.cosine_epochs
-            if "cosine_epochs" in cfg.schedules.weight_decay
-            else None
-        ),
-    )
-    momentum = linear_warmup_cosine_decay(
-        start=cfg.schedules.momentum.start,
-        peak=cfg.schedules.momentum.peak,
-        end=cfg.schedules.momentum.end,
-        warmup_iterations=momentum_warmup_iterations,
-        total_iterations=total_iterations,
-        cosine_iterations=(
-            iter_per_epoch * cfg.schedules.momentum.cosine_epochs if "cosine_epochs" in cfg.schedules.momentum else None
-        ),
-    )
-    teacher_temp = linear_warmup_cosine_decay(
-        start=cfg.schedules.teacher_temp.start,
-        peak=cfg.schedules.teacher_temp.peak,
-        end=cfg.schedules.teacher_temp.end,
-        warmup_iterations=teacher_temp_warmup_iterations,
-        total_iterations=total_iterations,
-        cosine_iterations=(
-            iter_per_epoch * cfg.schedules.teacher_temp.cosine_epochs
-            if "cosine_epochs" in cfg.schedules.teacher_temp
-            else None
-        ),
-    )
-    return lr, weight_decay, momentum, teacher_temp, last_layer_lr, lora_lr
-
-
 def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr, lora_lr):
     for param_group in optimizer.param_groups:
         is_last_layer = param_group["is_last_layer"]
         lr_multiplier = param_group["lr_multiplier"]
         wd_multiplier = param_group["wd_multiplier"]
         param_group["weight_decay"] = wd * wd_multiplier
-        if param_group.get("is_lora", False):
+        if param_group.get("is_lora_warmup", False):
             param_group["lr"] = lora_lr * lr_multiplier
         elif is_last_layer:
             param_group["lr"] = last_layer_lr * lr_multiplier
@@ -674,11 +548,13 @@ def set_backbone_trainable(model, trainable: bool):
             parameter.requires_grad_(True)
 
 
-def discard_frozen_lora_grads(model) -> None:
-    """Prevent zero-LR LoRA parameters from accumulating optimizer state."""
-    lora_markers = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
+def discard_frozen_lora_warmup_grads(model) -> None:
+    """Prevent delayed LoRA, norm, and patch-embed updates during warm-up."""
     for name, parameter in model.student.backbone.named_parameters():
-        if any(marker in name for marker in lora_markers) and parameter.grad is not None:
+        if (
+            model.is_lora_warmup_backbone_parameter(name, parameter)
+            and parameter.grad is not None
+        ):
             parameter.grad = None
 
 
@@ -893,7 +769,7 @@ def do_train(cfg, model, resume=False):
         # the gradients also prevents AdamW moments from accumulating before
         # the scheduled unfreeze.
         if backbone_frozen:
-            discard_frozen_lora_grads(model)
+            discard_frozen_lora_warmup_grads(model)
 
         # Reduce total_loss to check for NaNs, reduce metrics for logging
         total_loss_all_ranks = total_loss.new_empty(distributed.get_subgroup_size())
