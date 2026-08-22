@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 import math
-import sys
 from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn as nn
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-_SRC_DIR = Path(__file__).resolve().parents[1]
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
-
-from dinov3_baseline import (  # noqa: E402
+from utils.load_dinov3 import (
     DINOV3_REPO,
     DEFAULT_ENCODER_WEIGHTS,
     ENCODER_CHOICES,
@@ -117,7 +111,7 @@ def init_lora_parameters(model: nn.Module) -> nn.Module:
 
 
 def load_vit_with_lora(
-    encoder: str = "braindino",
+    encoder: str = "dinov3",
     *,
     weights: Optional[Path] = None,
     repo_dir: Path = DINOV3_REPO,
@@ -131,7 +125,8 @@ def load_vit_with_lora(
     Parameters
     ----------
     encoder:
-        One of ``dinov3 | meddinov3 | braindino | custom``.
+        One of ``dinov3 | meddinov3 | braindino | custom``. Defaults to
+        the local released DINOv3 ViT-B checkpoint.
     weights:
         Checkpoint path. Defaults to the project encoder weight for ``encoder``.
     r:

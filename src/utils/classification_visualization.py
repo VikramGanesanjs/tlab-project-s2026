@@ -54,7 +54,7 @@ from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from classification import model as classification_model  # noqa: E402
 from classification import run as classification_run  # noqa: E402
 from classification import train as classification_train  # noqa: E402
-from dinov3_baseline import (  # noqa: E402
+from utils.load_dinov3 import (  # noqa: E402
     load_braindino_encoder,
     load_dinov3_encoder,
     load_encoder,

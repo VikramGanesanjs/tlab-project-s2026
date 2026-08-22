@@ -27,7 +27,7 @@ from datasets.adni import (  # noqa: E402
     DEFAULT_ADNI_TASK,
     build_adni_transform,
 )
-from dinov3_baseline import (  # noqa: E402
+from utils.load_dinov3 import (  # noqa: E402
     DEFAULT_BRAINDINO_WEIGHTS,
     DEFAULT_DINOV3_WEIGHTS,
     DINOV3_REPO,

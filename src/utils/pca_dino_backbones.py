@@ -23,7 +23,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
-from dinov3_baseline import load_braindino_encoder, load_dinov3_encoder  # noqa: E402
+from utils.load_dinov3 import load_braindino_encoder, load_dinov3_encoder  # noqa: E402
 from datasets.adni import (  # noqa: E402
     ADNIClassificationDataset,
     DEFAULT_ADNI_TASK,

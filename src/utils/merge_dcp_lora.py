@@ -143,10 +143,16 @@ def _infer_unfrozen_tail(names: Sequence[str]) -> int:
     return tail
 
 
+def _checkpoint_has_qkv_bias_mask(names: Sequence[str]) -> bool:
+    """Return whether a checkpoint persists the QKV key-bias mask buffer."""
+    return any(str(name).endswith("qkv.bias_mask") for name in names)
+
+
 def _build_custom_vit_base(
     *,
     repo_dir: Path,
     ssl_architecture: bool,
+    mask_k_bias: bool,
     with_lora: bool,
     lora_rank: int,
     unfreeze_last_layers: int = 0,
@@ -173,7 +179,7 @@ def _build_custom_vit_base(
             ffn_bias=True,
             proj_bias=True,
             n_storage_tokens=0,
-            mask_k_bias=False,
+            mask_k_bias=mask_k_bias,
         )
     else:
         encoder = vit_base(
@@ -189,7 +195,7 @@ def _build_custom_vit_base(
             ffn_bias=True,
             proj_bias=True,
             n_storage_tokens=4,
-            mask_k_bias=True,
+            mask_k_bias=mask_k_bias,
         )
     if with_lora:
         from utils.vit_lora import add_lora_to_vit
@@ -292,6 +298,7 @@ def load_custom_dinov3_encoder(
         backbone_keys = [key for key in metadata_keys if key.startswith(source_prefix)]
         has_lora = any(".w_a_" in key or ".w_b_" in key for key in backbone_keys)
         has_storage_tokens = any(key.endswith(".storage_tokens") for key in backbone_keys)
+        has_qkv_bias_mask = _checkpoint_has_qkv_bias_mask(backbone_keys)
         unfreeze_last_layers = _infer_unfrozen_tail(backbone_keys)
         checkpoint_lora_rank = next(
             (
@@ -304,6 +311,7 @@ def load_custom_dinov3_encoder(
         encoder = _build_custom_vit_base(
             repo_dir=repo_dir,
             ssl_architecture=not has_storage_tokens,
+            mask_k_bias=has_qkv_bias_mask,
             with_lora=has_lora,
             lora_rank=checkpoint_lora_rank,
             unfreeze_last_layers=unfreeze_last_layers,
@@ -313,10 +321,13 @@ def load_custom_dinov3_encoder(
         )
         LOGGER.info(
             "Loaded ViT-B backbone from distributed checkpoint %s (%d tensors); "
-            "LoRA=%s, unfrozen_tail=%d, rank=%d; discarded decoder, heads, losses, and optimizer",
+            "LoRA=%s, storage_tokens=%s, mask_k_bias=%s, unfrozen_tail=%d, rank=%d; "
+            "discarded decoder, heads, losses, and optimizer",
             checkpoint,
             loaded_count,
             has_lora,
+            has_storage_tokens,
+            has_qkv_bias_mask,
             unfreeze_last_layers,
             checkpoint_lora_rank,
         )
@@ -330,6 +341,7 @@ def load_custom_dinov3_encoder(
         has_storage_tokens = any(
             _canonical_checkpoint_name(key).endswith("storage_tokens") for key in state
         )
+        has_qkv_bias_mask = _checkpoint_has_qkv_bias_mask(tuple(state))
         checkpoint_lora_rank = next(
             (int(value.shape[0]) for key, value in state.items() if key.endswith(".w_a_q.weight")),
             lora_rank,
@@ -337,6 +349,7 @@ def load_custom_dinov3_encoder(
         encoder = _build_custom_vit_base(
             repo_dir=repo_dir,
             ssl_architecture=not has_storage_tokens,
+            mask_k_bias=has_qkv_bias_mask,
             with_lora=has_lora,
             lora_rank=checkpoint_lora_rank,
             unfreeze_last_layers=unfreeze_last_layers,
@@ -353,10 +366,13 @@ def load_custom_dinov3_encoder(
             )
         LOGGER.info(
             "Loaded ViT-B backbone from regular checkpoint %s (%d tensors); "
-            "LoRA=%s, unfrozen_tail=%d, rank=%d; discarded non-backbone entries",
+            "LoRA=%s, storage_tokens=%s, mask_k_bias=%s, unfrozen_tail=%d, rank=%d; "
+            "discarded non-backbone entries",
             checkpoint,
             len(backbone_state),
             has_lora,
+            has_storage_tokens,
+            has_qkv_bias_mask,
             unfreeze_last_layers,
             checkpoint_lora_rank,
         )
@@ -518,12 +534,14 @@ def export_teacher_backbone(
     ]
     has_lora = any(".w_a_" in key or ".w_b_" in key for key in backbone_keys)
     has_storage_tokens = any(key.endswith(".storage_tokens") for key in backbone_keys)
+    has_qkv_bias_mask = _checkpoint_has_qkv_bias_mask(backbone_keys)
     lora_rank = _checkpoint_lora_rank(metadata, backbone_keys, fallback_lora_rank)
     unfrozen_tail = _infer_unfrozen_tail(backbone_keys)
 
     encoder = _build_custom_vit_base(
         repo_dir=Path(repo_dir),
         ssl_architecture=not has_storage_tokens,
+        mask_k_bias=has_qkv_bias_mask,
         with_lora=has_lora,
         lora_rank=lora_rank,
         unfreeze_last_layers=unfrozen_tail,

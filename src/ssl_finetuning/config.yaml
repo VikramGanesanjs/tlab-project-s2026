@@ -113,9 +113,9 @@ checkpointing:
   max_to_keep: 5
 
 # Volumetric-DINO slice-pair fine-tuning options.
-lambda1: 1.0
-lambda2: 1.0
-lam_cross: 1.0
+uwsd_loss_weight: 1.0
+croco_ibot_loss_weight: 1.0
+cross_view_global_loss_weight: 1.0
 gamma: 1.0
 lora:
   enabled: true

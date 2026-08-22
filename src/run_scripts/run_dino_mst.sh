@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=run_classification_3_cls.err  ## error log file
-#SBATCH --output=run_classification_3_cls.out ## output log file
+#SBATCH --error=run_ssl_finetune_full_context.err  ## error log file
+#SBATCH --output=run_ssl_finetune_full_context.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
@@ -17,4 +17,4 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python -m classification.run --params-file /common/ganesanv/tlab/runs/inf_tests/50patients.yaml
+python -m classification.run --params-file /common/ganesanv/tlab/runs/adni_benchmark/ssl_finetune_best_ckpt.yaml

@@ -15,9 +15,11 @@ from typing import Any, Dict, Optional, Tuple
 _MODULE_DIR = Path(__file__).resolve().parent
 _SRC_DIR = _MODULE_DIR.parent
 _DINOV3_DIR = _MODULE_DIR.parents[1] / "opt" / "dinov3"
-for _path in (_SRC_DIR, _MODULE_DIR, _DINOV3_DIR):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
+for _path in (_MODULE_DIR, _SRC_DIR, _DINOV3_DIR):
+    _path_str = str(_path)
+    if _path_str in sys.path:
+        sys.path.remove(_path_str)
+    sys.path.insert(0, _path_str)
 
 import torch
 import torch.distributed as dist
@@ -203,9 +205,9 @@ class SSLFineTune(nn.Module):
         self.dino_loss = DINOLoss(self.dino_out_dim)
         self.ibot_patch_loss = iBOTPatchLoss(ibot_out_dim)
         self._distributed_prepared = False
-        self.lambda1 = float(cfg.lambda1)
-        self.lambda2 = float(cfg.lambda2)
-        self.lam_cross = float(cfg.lam_cross)
+        self.uwsd_loss_weight = float(cfg.uwsd_loss_weight)
+        self.croco_ibot_loss_weight = float(cfg.croco_ibot_loss_weight)
+        self.cross_view_global_loss_weight = float(cfg.cross_view_global_loss_weight)
         self.gamma = float(cfg.gamma)
         self.teacher_temp = float(cfg.teacher.teacher_temp)
         self.mask_ratio_min, self.mask_ratio_max = tuple(cfg.ibot.mask_ratio_min_max)
@@ -214,12 +216,12 @@ class SSLFineTune(nn.Module):
 
         logger.info(
             "Built slice-pair fine-tuner: embed_dim=%d, dino_prototypes=%d, "
-            "ibot_prototypes=%d, gamma=%.3f, lam_cross=%.3f",
+            "ibot_prototypes=%d, gamma=%.3f, cross_view_global_loss_weight=%.3f",
             self.embed_dim,
             self.dino_out_dim,
             ibot_out_dim,
             self.gamma,
-            self.lam_cross,
+            self.cross_view_global_loss_weight,
         )
 
     @property
@@ -692,7 +694,7 @@ class SSLFineTune(nn.Module):
             teacher_temp=effective_teacher_temp,
             student_temp=float(getattr(self.dino_loss, "student_temp", 0.1)),
             gamma=self.gamma,
-            lam_cross=self.lam_cross,
+            cross_view_global_loss_weight=self.cross_view_global_loss_weight,
         )
         batch_size = student_global["cls_after_head"].shape[1]
         masks = masks.reshape(2, batch_size, -1)
@@ -715,7 +717,7 @@ class SSLFineTune(nn.Module):
             teacher_temp=effective_teacher_temp,
             student_temp=float(getattr(self.ibot_patch_loss, "student_temp", 0.1)),
         )
-        total = self.lambda1 * uwsd_loss + self.lambda2 * croco_ibot_loss
+        total = self.uwsd_loss_weight * uwsd_loss + self.croco_ibot_loss_weight * croco_ibot_loss
         return total, {
             "uwsd_loss": uwsd_loss,
             "croco_ibot_loss": croco_ibot_loss,

@@ -14,7 +14,7 @@ _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from dinov3_baseline import FEATURE_CHOICES  # noqa: E402
+from utils.load_dinov3 import FEATURE_CHOICES  # noqa: E402
 
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")

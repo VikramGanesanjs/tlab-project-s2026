@@ -34,7 +34,7 @@ _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from dinov3_baseline import (  # noqa: E402
+from utils.load_dinov3 import (  # noqa: E402
     CLASS_NAMES as DUKE_CLASS_NAMES,
     DINOV3_REPO,
     ENCODER_CHOICES,

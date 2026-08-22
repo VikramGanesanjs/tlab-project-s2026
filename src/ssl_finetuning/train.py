@@ -17,8 +17,10 @@ _MODULE_DIR = Path(__file__).resolve().parent
 _SRC_DIR = _MODULE_DIR.parent
 _DINOV3_DIR = _SRC_DIR.parent / "opt" / "dinov3"
 for _path in (_SRC_DIR, _DINOV3_DIR):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
+    _path_str = str(_path)
+    if _path_str in sys.path:
+        sys.path.remove(_path_str)
+    sys.path.insert(0, _path_str)
 
 import torch
 import torch.distributed
@@ -47,10 +49,10 @@ from datasets.duke.dataset import _DEFAULT_OUT_ROOT as DUKE_DEFAULT_ROOT
 
 from utils.splits import patient_level_stratified_split, save_patient_split
 
-try:
+if __package__:
     from .model import SSLFineTune
-except ImportError:  # Support direct execution: python src/ssl_finetuning/train.py
-    from model import SSLFineTune
+else:  # Support direct execution: python src/ssl_finetuning/train.py
+    from ssl_finetuning.model import SSLFineTune
 
 assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default

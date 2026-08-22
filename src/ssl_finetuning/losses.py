@@ -70,7 +70,7 @@ def uwsd_loss(
     teacher_temp: float,
     student_temp: float,
     gamma: float,
-    lam_cross: float,
+    cross_view_global_loss_weight: float,
 ) -> Tensor:
     """UWSD multi-crop DINO loss with slice-aware pair routing."""
     teacher_logits = torch.cat((teacher_logits1, teacher_logits2), dim=0)
@@ -89,8 +89,8 @@ def uwsd_loss(
         for logits in local_logits2:
             terms.append((logits, teacher_probs2, weight2))
 
-    terms.append((student_logits1, teacher_probs2, lam_cross * weight2))
-    terms.append((student_logits2, teacher_probs1, lam_cross * weight1))
+    terms.append((student_logits1, teacher_probs2, cross_view_global_loss_weight * weight2))
+    terms.append((student_logits2, teacher_probs1, cross_view_global_loss_weight * weight1))
 
     numerator: Optional[Tensor] = None
     denominator: Optional[Tensor] = None
