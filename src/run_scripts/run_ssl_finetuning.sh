@@ -20,6 +20,6 @@ python -m dinov3.run.submit \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \
-  --output-dir "${PROJECT_ROOT}/runs/ssl_finetune_ablations/base_run_no_embed" \
+  --output-dir "${PROJECT_ROOT}/runs/ssl_finetune_ablations/distance/10" \
   "${PROJECT_ROOT}/src/ssl_finetuning/train.py" \
-  --config-file "/common/ganesanv/tlab/runs/ssl_finetune_ablations/base_run_no_embed.yaml"
+  --config-file "/common/ganesanv/tlab/runs/ssl_finetune_ablations/distance_10.yaml"

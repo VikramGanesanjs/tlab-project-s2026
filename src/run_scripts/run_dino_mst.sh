@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=run_ssl_finetune_full_context.err  ## error log file
-#SBATCH --output=run_ssl_finetune_full_context.out ## output log file
+#SBATCH --error=run_ssl_finetune_baserun2999.err  ## error log file
+#SBATCH --output=run_ssl_finetune_baserun2999.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 

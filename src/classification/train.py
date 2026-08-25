@@ -56,6 +56,11 @@ from datasets.duke import (  # noqa: E402
     DukeMultiSliceDataset,
     build_duke_volume_transform,
 )
+from datasets.organmnist3d import (  # noqa: E402
+    ORGANMNIST3D_CLASS_NAMES,
+    OrganMNIST3DMultiSliceDataset,
+    build_organmnist3d_volume_transform,
+)
 from utils.splits import patient_level_stratified_split  # noqa: E402
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from utils.vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
@@ -64,12 +69,16 @@ from classification.model import MultiSliceDinoModel, set_lora_requires_grad  # 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
-DATASET_CHOICES = ("duke", "adni")
+DATASET_CHOICES = ("duke", "adni", "organmnist3d")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
 EARLY_STOPPING_MIN_IMPROVEMENT = 0.005
-MultiSliceDataset = Union[DukeMultiSliceDataset, ADNIMultiSliceDataset]
+MultiSliceDataset = Union[
+    DukeMultiSliceDataset,
+    ADNIMultiSliceDataset,
+    OrganMNIST3DMultiSliceDataset,
+]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
 def is_binary_task(num_classes: int) -> bool:
@@ -90,6 +99,8 @@ def task_config(
         spec = resolve_adni_task(adni_task)
         loss_name = "BCEWithLogitsLoss" if spec.binary else "CrossEntropyLoss"
         return spec.num_logits, spec.class_names, loss_name
+    if dataset_name == "organmnist3d":
+        return len(ORGANMNIST3D_CLASS_NAMES), ORGANMNIST3D_CLASS_NAMES, "CrossEntropyLoss"
     raise ValueError(f"Unknown dataset={dataset_name!r}")
 
 
@@ -608,6 +619,7 @@ def build_dataset(
     *,
     augment: Optional[bool] = None,
     patient_ids: Optional[Sequence[str]] = None,
+    split: Optional[str] = None,
 ) -> MultiSliceDataset:
     use_augment = args.augment if augment is None else bool(augment)
     if args.dataset == "duke":
@@ -632,6 +644,20 @@ def build_dataset(
             image_size=args.image_size,
             transform=build_adni_volume_transform(augment=use_augment),
         )
+    if args.dataset == "organmnist3d":
+        if patient_ids is not None:
+            raise ValueError(
+                "OrganMNIST3D uses its official train/val/test arrays and does not "
+                "support patient-level filtering"
+            )
+        return OrganMNIST3DMultiSliceDataset(
+            root=args.data_root,
+            split=split or "train",
+            n_slices=args.n_slices,
+            augment=use_augment,
+            image_size=args.image_size,
+            transform=build_organmnist3d_volume_transform(augment=use_augment),
+        )
     raise ValueError(f"Unknown dataset={args.dataset!r}")
 
 
@@ -641,98 +667,128 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         args.dataset, adni_task=args.adni_task
     )
     binary = is_binary_task(num_classes)
-    unit_name = "breasts" if args.dataset == "duke" else "scans"
-    # Generate or load patient IDs once, then construct each split directly.
-    split_dataset = build_dataset(args, augment=False)
-    labels = collect_labels(split_dataset)
-    summarize_class_counts(labels, name=f"full dataset ({unit_name})", class_names=class_names)
-
-    get_stratum: Callable[[Any, int], Optional[int]] = (
-        _duke_patient_stratum if args.dataset == "duke" else _adni_patient_stratum
-    )
-    _, split_metadata = patient_level_stratified_split(
-        split_dataset,
-        dataset_name=args.dataset,
-        train_fraction=1.0 - args.val_frac - args.test_frac,
-        val_fraction=args.val_frac,
-        test_fraction=args.test_frac,
-        seed=args.seed,
-        stratum_fn=get_stratum,
-        split_file=args.splits_file,
-        use_saved_split_config=False,
-        # A saved ADNI split can contain all diagnoses. The active task uses
-        # only its allowed diagnoses, so discard the other patient IDs while
-        # still requiring every task-eligible patient to be assigned once.
-        allow_saved_patient_superset=args.dataset == "adni",
-        # ADNI task label IDs depend on the pair of diagnoses, whereas the
-        # patient assignments remain valid across task-specific subsets.
-        validate_saved_patient_strata=args.dataset != "adni",
-    )
-    split_patients = split_metadata["splits"]
-    train_patient_ids = [str(patient_id) for patient_id in split_patients["train"]]
-    val_patient_ids = [str(patient_id) for patient_id in split_patients["val"]]
-    test_patient_ids = [str(patient_id) for patient_id in split_patients["test"]]
-    if args.dataset == "adni":
-        task_patient_ids = _dataset_patient_ids(split_dataset)
-        split_patient_lists = (train_patient_ids, val_patient_ids, test_patient_ids)
-        excluded_patients = sum(
-            patient_id not in task_patient_ids
-            for patient_ids in split_patient_lists
-            for patient_id in patient_ids
+    unit_name = {
+        "duke": "breasts",
+        "adni": "scans",
+        "organmnist3d": "volumes",
+    }[args.dataset]
+    if args.dataset == "organmnist3d":
+        # This archive has fixed, official train/validation/test arrays. Do
+        # not replace them with generated patient-level partitions.
+        train_dataset = build_dataset(args, augment=args.augment, split="train")
+        val_dataset: Optional[MultiSliceDataset] = build_dataset(
+            args, augment=False, split="val"
         )
+        test_dataset: Optional[MultiSliceDataset] = build_dataset(
+            args, augment=False, split="test"
+        )
+        logger.info(
+            "Using supplied OrganMNIST3D splits: train=%d %s, val=%d %s, test=%d %s",
+            len(train_dataset),
+            unit_name,
+            len(val_dataset),
+            unit_name,
+            len(test_dataset),
+            unit_name,
+        )
+    else:
+        # Generate or load patient IDs once, then construct each split directly.
+        split_dataset = build_dataset(args, augment=False)
+        labels = collect_labels(split_dataset)
+        summarize_class_counts(
+            labels, name=f"full dataset ({unit_name})", class_names=class_names
+        )
+
+        get_stratum: Callable[[Any, int], Optional[int]] = (
+            _duke_patient_stratum if args.dataset == "duke" else _adni_patient_stratum
+        )
+        _, split_metadata = patient_level_stratified_split(
+            split_dataset,
+            dataset_name=args.dataset,
+            train_fraction=1.0 - args.val_frac - args.test_frac,
+            val_fraction=args.val_frac,
+            test_fraction=args.test_frac,
+            seed=args.seed,
+            stratum_fn=get_stratum,
+            split_file=args.splits_file,
+            use_saved_split_config=False,
+            # A saved ADNI split can contain all diagnoses. The active task uses
+            # only its allowed diagnoses, so discard the other patient IDs while
+            # still requiring every task-eligible patient to be assigned once.
+            allow_saved_patient_superset=args.dataset == "adni",
+            # ADNI task label IDs depend on the pair of diagnoses, whereas the
+            # patient assignments remain valid across task-specific subsets.
+            validate_saved_patient_strata=args.dataset != "adni",
+        )
+        split_patients = split_metadata["splits"]
         train_patient_ids = [
-            patient_id for patient_id in train_patient_ids if patient_id in task_patient_ids
+            str(patient_id) for patient_id in split_patients["train"]
         ]
-        val_patient_ids = [
-            patient_id for patient_id in val_patient_ids if patient_id in task_patient_ids
-        ]
-        test_patient_ids = [
-            patient_id for patient_id in test_patient_ids if patient_id in task_patient_ids
-        ]
-        if excluded_patients:
-            logger.info(
-                "Excluded %d patients outside ADNI task %s from the saved split",
-                excluded_patients,
-                resolve_adni_task(args.adni_task).name,
+        val_patient_ids = [str(patient_id) for patient_id in split_patients["val"]]
+        test_patient_ids = [str(patient_id) for patient_id in split_patients["test"]]
+        if args.dataset == "adni":
+            task_patient_ids = _dataset_patient_ids(split_dataset)
+            split_patient_lists = (train_patient_ids, val_patient_ids, test_patient_ids)
+            excluded_patients = sum(
+                patient_id not in task_patient_ids
+                for patient_ids in split_patient_lists
+                for patient_id in patient_ids
             )
+            train_patient_ids = [
+                patient_id
+                for patient_id in train_patient_ids
+                if patient_id in task_patient_ids
+            ]
+            val_patient_ids = [
+                patient_id for patient_id in val_patient_ids if patient_id in task_patient_ids
+            ]
+            test_patient_ids = [
+                patient_id for patient_id in test_patient_ids if patient_id in task_patient_ids
+            ]
+            if excluded_patients:
+                logger.info(
+                    "Excluded %d patients outside ADNI task %s from the saved split",
+                    excluded_patients,
+                    resolve_adni_task(args.adni_task).name,
+                )
 
-    train_dataset = build_dataset(
-        args, augment=args.augment, patient_ids=train_patient_ids
-    )
-    val_dataset: Optional[MultiSliceDataset] = (
-        build_dataset(args, augment=False, patient_ids=val_patient_ids)
-        if val_patient_ids
-        else None
-    )
-    test_dataset: Optional[MultiSliceDataset] = (
-        build_dataset(args, augment=False, patient_ids=test_patient_ids)
-        if test_patient_ids
-        else None
-    )
-    _require_dataset_patient_ids(
-        train_dataset, train_patient_ids, split_name="train"
-    )
-    if val_dataset is not None:
-        _require_dataset_patient_ids(
-            val_dataset, val_patient_ids, split_name="validation"
+        train_dataset = build_dataset(
+            args, augment=args.augment, patient_ids=train_patient_ids
         )
-    if test_dataset is not None:
-        _require_dataset_patient_ids(
-            test_dataset, test_patient_ids, split_name="test"
+        val_dataset = (
+            build_dataset(args, augment=False, patient_ids=val_patient_ids)
+            if val_patient_ids
+            else None
         )
-    logger.info(
-        "Datasets: train=%d patients/%d %s, val=%d patients/%d %s, "
-        "test=%d patients/%d %s",
-        len(train_patient_ids),
-        len(train_dataset),
-        unit_name,
-        len(val_patient_ids),
-        len(val_dataset) if val_dataset is not None else 0,
-        unit_name,
-        len(test_patient_ids),
-        len(test_dataset) if test_dataset is not None else 0,
-        unit_name,
-    )
+        test_dataset = (
+            build_dataset(args, augment=False, patient_ids=test_patient_ids)
+            if test_patient_ids
+            else None
+        )
+        _require_dataset_patient_ids(
+            train_dataset, train_patient_ids, split_name="train"
+        )
+        if val_dataset is not None:
+            _require_dataset_patient_ids(
+                val_dataset, val_patient_ids, split_name="validation"
+            )
+        if test_dataset is not None:
+            _require_dataset_patient_ids(
+                test_dataset, test_patient_ids, split_name="test"
+            )
+        logger.info(
+            "Datasets: train=%d patients/%d %s, val=%d patients/%d %s, "
+            "test=%d patients/%d %s",
+            len(train_patient_ids),
+            len(train_dataset),
+            unit_name,
+            len(val_patient_ids),
+            len(val_dataset) if val_dataset is not None else 0,
+            unit_name,
+            len(test_patient_ids),
+            len(test_dataset) if test_dataset is not None else 0,
+            unit_name,
+        )
 
     train_labels = collect_labels(train_dataset)
     train_counts = summarize_class_counts(
@@ -776,7 +832,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             train_counts, num_classes=num_classes
         ).to(device)
         logger.info(
-            "ADNI class weights (inverse frequency): %s",
+            "%s class weights (inverse frequency): %s",
+            args.dataset,
             {
                 class_names[index]: float(class_weights[index])
                 for index in range(num_classes)
@@ -813,7 +870,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         if test_dataset is not None
         else None
     )
-    _assert_loader_patient_disjoint(train_loader, val_loader, test_loader)
+    if args.dataset != "organmnist3d":
+        _assert_loader_patient_disjoint(train_loader, val_loader, test_loader)
 
     if args.weights is not None and args.encoder == "dinov3":
         encoder = load_custom_dinov3_encoder(

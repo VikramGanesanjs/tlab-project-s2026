@@ -26,12 +26,13 @@ from datasets.adni import (  # noqa: E402
     DEFAULT_ADNI_TASK,
     DEFAULT_ROOT as ADNI_DEFAULT_ROOT,
 )
+from datasets.organmnist3d import DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT  # noqa: E402
 from classification.train import train  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
-DATASET_CHOICES = ("duke", "adni")
+DATASET_CHOICES = ("duke", "adni", "organmnist3d")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
@@ -95,7 +96,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--dataset",
         choices=list(DATASET_CHOICES),
         default="duke",
-        help="duke: binary breast cancer; adni: diagnosis task selected by --adni-task",
+        help=(
+            "duke: binary breast cancer; adni: diagnosis task selected by "
+            "--adni-task; organmnist3d: official 11-class volume splits"
+        ),
     )
     parser.add_argument(
         "--adni-task",
@@ -111,13 +115,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--data-root",
         type=Path,
         default=None,
-        help="Dataset root (defaults to the processed Duke or ADNI path)",
+        help="Dataset root (defaults to the selected dataset's standard path)",
     )
     parser.add_argument(
         "--csv-path",
         type=Path,
         default=None,
-        help="ADNI metadata CSV (defaults to the CSV inside --data-root)",
+        help="ADNI metadata CSV (ignored by Duke and OrganMNIST3D)",
     )
     parser.add_argument("--scan", type=str, default="pre")
     parser.add_argument("--n-slices", type=int, default=8)
@@ -125,7 +129,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--include-bilateral",
         action="store_true",
-        help="Include bilateral Duke cases (excluded by default; ignored for ADNI)",
+        help="Include bilateral Duke cases (ignored by ADNI and OrganMNIST3D)",
     )
     augmentation = parser.add_mutually_exclusive_group()
     augmentation.add_argument(
@@ -327,9 +331,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.set_defaults(**_yaml_defaults(config_args.params_file, parser))
     args = parser.parse_args(argv)
     if args.data_root is None:
-        args.data_root = (
-            ADNI_DEFAULT_ROOT if args.dataset == "adni" else DEFAULT_DATA_ROOT
-        )
+        args.data_root = {
+            "duke": DEFAULT_DATA_ROOT,
+            "adni": ADNI_DEFAULT_ROOT,
+            "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
+        }[args.dataset]
     if args.test_frac is None:
         args.test_frac = args.val_frac
     if args.n_slices <= 0:
