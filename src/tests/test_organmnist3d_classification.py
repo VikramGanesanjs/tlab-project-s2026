@@ -13,6 +13,7 @@ from torch import nn
 from classification.model import MultiSliceDinoModel
 from classification.run import parse_args
 from classification.train import build_dataset, task_config, train
+from utils import load_dinov3
 
 
 class _ToyEncoder(nn.Module):
@@ -24,6 +25,31 @@ class _ToyEncoder(nn.Module):
 
 
 class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
+    def test_meddinov3_is_a_selectable_classification_encoder(self) -> None:
+        args = parse_args(["--encoder", "meddinov3"])
+
+        self.assertEqual(args.encoder, "meddinov3")
+        self.assertEqual(
+            load_dinov3.DEFAULT_ENCODER_WEIGHTS["meddinov3"],
+            load_dinov3.REPO_ROOT / "opt" / "meddinov3" / "model.pth",
+        )
+
+    def test_meddinov3_dispatches_to_the_teacher_checkpoint_loader(self) -> None:
+        sentinel = object()
+        with patch.object(
+            load_dinov3,
+            "load_meddinov3_encoder",
+            return_value=sentinel,
+        ) as loader:
+            encoder = load_dinov3.load_encoder("meddinov3", device=torch.device("cpu"))
+
+        self.assertIs(encoder, sentinel)
+        loader.assert_called_once_with(
+            repo_dir=load_dinov3.DINOV3_REPO,
+            weights=load_dinov3.DEFAULT_MEDDINOV3_WEIGHTS,
+            device=torch.device("cpu"),
+        )
+
     def _write_archive(self, root: Path) -> None:
         labels = np.arange(11, dtype=np.uint8).reshape(-1, 1)
 

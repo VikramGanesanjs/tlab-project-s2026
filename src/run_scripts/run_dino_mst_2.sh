@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=80G
 #SBATCH --time 48:00:00        
-#SBATCH --error=run_classification_3-cls-bd.err  ## error log file
-#SBATCH --output=run_classification_3-cls-bd.out ## output log file
+#SBATCH --error=organmnist_dinov3.err  ## error log file
+#SBATCH --output=organmnist_dinov3.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
@@ -17,4 +17,4 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python -m classification.run --params-file /common/ganesanv/tlab/runs/inf_tests/50patients_braindino.yaml
+python -m classification.run --params-file /common/ganesanv/tlab/runs/mst_configs/organmnist3d/dinov3_organmnist3d_cls.yaml
