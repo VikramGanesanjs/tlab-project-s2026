@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=organmnist_meddino.err  ## error log file
-#SBATCH --output=organmnist_meddino.out ## output log file
+#SBATCH --error=adni_highres.err  ## error log file
+#SBATCH --output=adni_highres.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
@@ -17,4 +17,4 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python -m classification.run --params-file /common/ganesanv/tlab/runs/mst_configs/organmnist3d/meddinov3_organmnist3d_cls.yaml
+python -m classification.run --params-file /common/ganesanv/tlab/runs/adni_benchmark/ssl_finetune_highres.yaml

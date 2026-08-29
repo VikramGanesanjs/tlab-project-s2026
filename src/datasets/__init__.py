@@ -1,5 +1,5 @@
-"""Dataset packages for tlab (Duke, ADNI, OrganMNIST3D, etc.)."""
+"""Dataset packages for tlab (Duke, ADNI, OrganMNIST3D, AMOS, etc.)."""
 
 from __future__ import annotations
 
-__all__ = ["adni", "duke", "organmnist3d"]
+__all__ = ["adni", "amos", "duke", "organmnist3d"]
