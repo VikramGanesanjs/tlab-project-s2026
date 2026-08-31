@@ -208,24 +208,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Final learning rate for --cosine-lr (default: 0)",
     )
     parser.add_argument("--hidden-dim", type=int, default=0)
-    parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument(
-        "--test-frac",
-        type=float,
-        default=None,
-        help=(
-            "Patient-level held-out test fraction (never used for training or "
-            "early stopping). Defaults to --val-frac"
-        ),
+        "--n-folds", type=int, default=5,
+        help="Number of deterministic patient-level cross-validation folds",
     )
     parser.add_argument(
-        "--splits-file",
-        type=Path,
-        default=None,
-        help=(
-            "Optional JSON file containing saved patient IDs under train, val, "
-            "and test; patients absent from the current dataset are ignored"
-        ),
+        "--fold", type=int, default=0,
+        help="Zero-based validation-fold index; the next fold is used for test",
+    )
+    parser.add_argument(
+        "--data-seed", type=int, default=0,
+        help="Random seed used to assign patients to cross-validation folds",
+    )
+    parser.add_argument(
+        "--train-ratio", type=float, default=1.0,
+        help="Class-balanced fraction of the selected training patients to use",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -336,8 +333,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "adni": ADNI_DEFAULT_ROOT,
             "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
         }[args.dataset]
-    if args.test_frac is None:
-        args.test_frac = args.val_frac
     if args.n_slices <= 0:
         parser.error("--n-slices must be positive")
     if args.epochs <= 0:
@@ -365,12 +360,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             parser.error("--mst-depth must be positive")
         if args.mst_heads <= 0 or args.d_model % args.mst_heads:
             parser.error("--d-model must be divisible by positive --mst-heads")
-    if not 0.0 <= args.val_frac < 1.0:
-        parser.error("--val-frac must be in [0, 1)")
-    if not 0.0 <= args.test_frac < 1.0:
-        parser.error("--test-frac must be in [0, 1)")
-    if args.val_frac + args.test_frac >= 1.0:
-        parser.error("--val-frac + --test-frac must be < 1")
+    if args.n_folds < 3:
+        parser.error("--n-folds must be at least 3")
+    if not 0 <= args.fold < args.n_folds:
+        parser.error("--fold must be in [0, --n-folds)")
+    if not 0.0 < args.train_ratio <= 1.0:
+        parser.error("--train-ratio must be in (0, 1]")
     return args
 
 

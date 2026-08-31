@@ -381,7 +381,7 @@ def _resample_volume(
 
 
 def _slice_to_imagenet_tensor(image_slice: torch.Tensor) -> torch.Tensor:
-    """Convert one augmented grayscale slice to an ImageNet-normalized RGB tensor."""
+    """Reference single-slice conversion used to validate the batched path."""
     image_array = np.asarray(image_slice.detach().cpu(), dtype=np.float32)
     finite = image_array[np.isfinite(image_array)]
     if finite.size == 0:
@@ -405,6 +405,54 @@ def _slice_to_imagenet_tensor(image_slice: torch.Tensor) -> torch.Tensor:
         mean=IMAGENET_MEAN,
         std=IMAGENET_STD,
     )
+
+
+def _volume_to_imagenet_tensors(volume: torch.Tensor) -> torch.Tensor:
+    """Convert ``[D, H, W]`` grayscale slices into normalized RGB tensors.
+
+    This is the vectorized equivalent of applying
+    :func:`_slice_to_imagenet_tensor` to every slice.  In particular, it keeps
+    the existing per-slice min/max scaling and uint8 quantization before
+    ImageNet normalization.  Keeping the quantization makes the output match
+    the previous PIL-based preprocessing while avoiding one NumPy/PIL round
+    trip per slice.
+    """
+    slices = torch.as_tensor(volume, dtype=torch.float32)
+    if slices.ndim != 3:
+        raise ValueError(
+            "Expected grayscale slices shaped [depth, height, width], "
+            f"got shape {tuple(slices.shape)}"
+        )
+
+    finite = torch.isfinite(slices)
+    if not bool(finite.flatten(1).any(dim=1).all()):
+        raise ValueError("ADNI slice contains no finite values")
+
+    low = torch.where(finite, slices, torch.full_like(slices, float("inf")))
+    low = low.amin(dim=(1, 2), keepdim=True)
+    high = torch.where(finite, slices, torch.full_like(slices, float("-inf")))
+    high = high.amax(dim=(1, 2), keepdim=True)
+    scale = high - low
+    scaled = torch.where(
+        scale > 0,
+        (slices - low) / scale,
+        torch.zeros_like(slices),
+    )
+    scaled = torch.nan_to_num(
+        scaled.clamp(0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0
+    )
+
+    # torchvision's PIL ``to_tensor`` converts uint8 pixels to float / 255.
+    pixels = torch.round(scaled * 255.0).to(torch.uint8)
+    images = (
+        pixels.unsqueeze(1)
+        .repeat(1, 3, 1, 1)
+        .to(torch.float32)
+        .div_(255.0)
+    )
+    mean = images.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = images.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
+    return (images - mean) / std
 
 
 def build_adni_transform(
@@ -753,13 +801,7 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
                 "ADNI multi-slice transforms must return [1, depth, height, width], "
                 f"got shape {tuple(volume_t.shape)}"
             )
-        images = torch.stack(
-            [
-                _slice_to_imagenet_tensor(image_slice)
-                for image_slice in volume_t.squeeze(0)
-            ],
-            dim=0,
-        )
+        images = _volume_to_imagenet_tensors(volume_t.squeeze(0))
         return images, target
 
 

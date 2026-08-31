@@ -66,9 +66,8 @@ def _slice_to_png(volume: np.ndarray, z: int) -> bytes:
 class ADNI(ExtendedVisionDataset):
     """ADNI scans represented as canonical axial-slice images.
 
-    Patient splitting is intentionally handled by
-    :mod:`utils.splits`, which provides the shared split-file schema
-    and validation used by both fine-tuning and continued pretraining.
+    Patient folds are intentionally handled by :mod:`utils.fold_cv`, shared by
+    fine-tuning and continued pretraining.
     """
 
     def __init__(
@@ -157,7 +156,7 @@ class ADNI(ExtendedVisionDataset):
         return self._entries[index][2]
 
     def get_patient_id(self, index: int) -> str:
-        """Return the patient ID required by the shared split utility."""
+        """Return the patient ID required by the shared fold utility."""
         return self._entries[index][3]
 
     def get_image_relpath(self, index: int) -> str:

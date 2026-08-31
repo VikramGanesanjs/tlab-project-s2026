@@ -9,14 +9,11 @@ train:
   batch_size_per_gpu: 64
   num_workers: 8
   cache_dataset: false
-
-
-data_split:
-  train_fraction: 0.70
-  val_fraction: 0.15
-  test_fraction: 0.15
-  seed: null  # Defaults to train.seed.
-  file: /common/ganesanv/tlab/runs/ssl_finetuning/adni_vitb16_r_32/adni_patient_splits.json
+  # ``fold`` is zero-based; the next fold is test and the remainder is train.
+  n_folds: 5
+  fold: 0
+  data_seed: 0
+  train_ratio: 1.0
 
 optim:
   warmup_iterations: 800

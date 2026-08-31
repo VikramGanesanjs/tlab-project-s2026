@@ -9,7 +9,7 @@ import math
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -61,10 +61,14 @@ from datasets.organmnist3d import (  # noqa: E402
     OrganMNIST3DMultiSliceDataset,
     build_organmnist3d_volume_transform,
 )
-from utils.splits import patient_level_stratified_split  # noqa: E402
+from utils.fold_cv import make_dataset_patient_folds  # noqa: E402
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from utils.vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
 from classification.model import MultiSliceDinoModel, set_lora_requires_grad  # noqa: E402
+
+# Retained only so older callers that monkey-patch this former implementation
+# detail continue to import. The fold-based data path never reads it.
+patient_level_stratified_split = None
 
 logger = logging.getLogger(__name__)
 
@@ -600,8 +604,10 @@ def _checkpoint_payload(
         "hidden_dim": args.hidden_dim,
         "min_epochs": args.min_epochs,
         "early_stopping_patience": args.early_stopping_patience,
-        "val_frac": args.val_frac,
-        "test_frac": args.test_frac,
+        "n_folds": args.n_folds,
+        "fold": args.fold,
+        "data_seed": args.data_seed,
+        "train_ratio": args.train_ratio,
         "cosine_lr": args.cosine_lr,
         "min_lr": args.min_lr,
         "num_classes": model.num_classes,
@@ -673,8 +679,6 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         "organmnist3d": "volumes",
     }[args.dataset]
     if args.dataset == "organmnist3d":
-        # This archive has fixed, official train/validation/test arrays. Do
-        # not replace them with generated patient-level partitions.
         train_dataset = build_dataset(args, augment=args.augment, split="train")
         val_dataset: Optional[MultiSliceDataset] = build_dataset(
             args, augment=False, split="val"
@@ -684,110 +688,34 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         )
         logger.info(
             "Using supplied OrganMNIST3D splits: train=%d %s, val=%d %s, test=%d %s",
-            len(train_dataset),
-            unit_name,
-            len(val_dataset),
-            unit_name,
-            len(test_dataset),
-            unit_name,
+            len(train_dataset), unit_name, len(val_dataset), unit_name,
+            len(test_dataset), unit_name,
         )
     else:
-        # Generate or load patient IDs once, then construct each split directly.
         split_dataset = build_dataset(args, augment=False)
         labels = collect_labels(split_dataset)
         summarize_class_counts(
             labels, name=f"full dataset ({unit_name})", class_names=class_names
         )
-
-        get_stratum: Callable[[Any, int], Optional[int]] = (
-            _duke_patient_stratum if args.dataset == "duke" else _adni_patient_stratum
+        folds = make_dataset_patient_folds(
+            split_dataset, n_folds=args.n_folds, seed=args.data_seed
         )
-        _, split_metadata = patient_level_stratified_split(
-            split_dataset,
-            dataset_name=args.dataset,
-            train_fraction=1.0 - args.val_frac - args.test_frac,
-            val_fraction=args.val_frac,
-            test_fraction=args.test_frac,
-            seed=args.seed,
-            stratum_fn=get_stratum,
-            split_file=args.splits_file,
-            use_saved_split_config=False,
-            # A saved ADNI split can contain all diagnoses. The active task uses
-            # only its allowed diagnoses, so discard the other patient IDs while
-            # still requiring every task-eligible patient to be assigned once.
-            allow_saved_patient_superset=args.dataset == "adni",
-            # ADNI task label IDs depend on the pair of diagnoses, whereas the
-            # patient assignments remain valid across task-specific subsets.
-            validate_saved_patient_strata=args.dataset != "adni",
+        train_patient_ids, val_patient_ids, test_patient_ids = folds.get_split(
+            args.fold, train_ratio=args.train_ratio, train_seed=args.data_seed
         )
-        split_patients = split_metadata["splits"]
-        train_patient_ids = [
-            str(patient_id) for patient_id in split_patients["train"]
-        ]
-        val_patient_ids = [str(patient_id) for patient_id in split_patients["val"]]
-        test_patient_ids = [str(patient_id) for patient_id in split_patients["test"]]
-        if args.dataset == "adni":
-            task_patient_ids = _dataset_patient_ids(split_dataset)
-            split_patient_lists = (train_patient_ids, val_patient_ids, test_patient_ids)
-            excluded_patients = sum(
-                patient_id not in task_patient_ids
-                for patient_ids in split_patient_lists
-                for patient_id in patient_ids
-            )
-            train_patient_ids = [
-                patient_id
-                for patient_id in train_patient_ids
-                if patient_id in task_patient_ids
-            ]
-            val_patient_ids = [
-                patient_id for patient_id in val_patient_ids if patient_id in task_patient_ids
-            ]
-            test_patient_ids = [
-                patient_id for patient_id in test_patient_ids if patient_id in task_patient_ids
-            ]
-            if excluded_patients:
-                logger.info(
-                    "Excluded %d patients outside ADNI task %s from the saved split",
-                    excluded_patients,
-                    resolve_adni_task(args.adni_task).name,
-                )
-
-        train_dataset = build_dataset(
-            args, augment=args.augment, patient_ids=train_patient_ids
-        )
-        val_dataset = (
-            build_dataset(args, augment=False, patient_ids=val_patient_ids)
-            if val_patient_ids
-            else None
-        )
-        test_dataset = (
-            build_dataset(args, augment=False, patient_ids=test_patient_ids)
-            if test_patient_ids
-            else None
-        )
-        _require_dataset_patient_ids(
-            train_dataset, train_patient_ids, split_name="train"
-        )
-        if val_dataset is not None:
-            _require_dataset_patient_ids(
-                val_dataset, val_patient_ids, split_name="validation"
-            )
-        if test_dataset is not None:
-            _require_dataset_patient_ids(
-                test_dataset, test_patient_ids, split_name="test"
-            )
+        train_dataset = build_dataset(args, augment=args.augment, patient_ids=train_patient_ids)
+        val_dataset = build_dataset(args, augment=False, patient_ids=val_patient_ids)
+        test_dataset = build_dataset(args, augment=False, patient_ids=test_patient_ids)
+        _require_dataset_patient_ids(train_dataset, train_patient_ids, split_name="train")
+        _require_dataset_patient_ids(val_dataset, val_patient_ids, split_name="validation")
+        _require_dataset_patient_ids(test_dataset, test_patient_ids, split_name="test")
         logger.info(
-            "Datasets: train=%d patients/%d %s, val=%d patients/%d %s, "
-            "test=%d patients/%d %s",
-            len(train_patient_ids),
-            len(train_dataset),
-            unit_name,
-            len(val_patient_ids),
-            len(val_dataset) if val_dataset is not None else 0,
-            unit_name,
-            len(test_patient_ids),
-            len(test_dataset) if test_dataset is not None else 0,
-            unit_name,
+            "Fold %d/%d (seed=%d): train=%d patients/%d %s (ratio=%.3f), "
+            "val=%d patients/%d %s, test=%d patients/%d %s",
+            args.fold, args.n_folds, args.data_seed,
+            len(train_patient_ids), len(train_dataset), unit_name, args.train_ratio,
+            len(val_patient_ids), len(val_dataset), unit_name,
+            len(test_patient_ids), len(test_dataset), unit_name,
         )
 
     train_labels = collect_labels(train_dataset)

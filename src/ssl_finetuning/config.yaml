@@ -23,9 +23,13 @@ train:
   adni_task: cn_mci_ad
   duke_scan: pre
   max_distance: 2
-  # When set, use exactly this many stratified patients for training; all
-  # remaining patients are reserved for validation/test.
-  n_patients: null
+  # Fold assignment is patient-level. ``fold`` is zero-based; the next fold
+  # is held out for test and all other folds form the train pool.
+  n_folds: 5
+  fold: 0
+  data_seed: 0
+  # Class-balanced fraction of the fold's training patients to retain.
+  train_ratio: 1.0
   output_dir: /common/ganesanv/tlab/runs/ssl_finetuning/adni_vitb16
   seed: 0
   num_workers: 10
@@ -35,12 +39,6 @@ train:
   compile: true
   cudagraphs: false
   sharded_eval_checkpoint: false
-data_split:
-  train_fraction: 0.70
-  val_fraction: 0.15
-  test_fraction: 0.15
-  seed: null
-  file: null
 student:
   arch: vit_base
   patch_size: 16

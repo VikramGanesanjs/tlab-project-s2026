@@ -1,10 +1,4 @@
-"""Evaluate a saved classification MST head on the dataset's held-out split.
-
-The checkpoint supplies the model and encoder configuration, so the required
-input is a ``last_mst.pt`` (or ``best_mst.pt``) file. Duke and ADNI also need
-the patient split JSON used for training; OrganMNIST3D uses its official split
-arrays directly. Metrics are written in the same format as ``run_summary.json``.
-"""
+"""Evaluate a saved classification MST head on its deterministic CV folds."""
 
 from __future__ import annotations
 
@@ -23,10 +17,7 @@ if str(_SRC_DIR) not in sys.path:
 
 from classification.model import MultiSliceDinoModel  # noqa: E402
 from classification.train import (  # noqa: E402
-    _adni_patient_stratum,
     _assert_loader_patient_disjoint,
-    _dataset_patient_ids,
-    _duke_patient_stratum,
     _require_dataset_patient_ids,
     build_dataset,
     collect_labels,
@@ -46,7 +37,7 @@ from utils.load_dinov3 import (  # noqa: E402
     load_encoder,
 )
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
-from utils.splits import patient_level_stratified_split  # noqa: E402
+from utils.fold_cv import make_dataset_patient_folds  # noqa: E402
 from utils.vit_lora import add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -56,15 +47,6 @@ DEFAULT_DUKE_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_proce
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("head", type=Path, help="Path to last_mst.pt or best_mst.pt")
-    parser.add_argument(
-        "--splits-file",
-        type=Path,
-        default=None,
-        help=(
-            "Patient split JSON containing train, val, and test assignments. "
-            "Required for Duke/ADNI; unused for OrganMNIST3D."
-        ),
-    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -106,7 +88,6 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         raise ValueError(f"Unsupported dataset in checkpoint: {dataset!r}")
     return argparse.Namespace(
         head=cli_args.head,
-        splits_file=cli_args.splits_file,
         output=cli_args.output,
         data_root=data_root,
         csv_path=cli_args.csv_path,
@@ -140,41 +121,25 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         mst_dropout=float(_value(checkpoint, "mst_dropout")),
         hidden_dim=int(_value(checkpoint, "hidden_dim")),
         weight_ce_loss=bool(checkpoint.get("weight_ce_loss", False)),
-        val_frac=float(checkpoint.get("val_frac", 0.1)),
-        test_frac=float(checkpoint.get("test_frac", checkpoint.get("val_frac", 0.1))),
+        n_folds=int(checkpoint.get("n_folds", 5)),
+        fold=int(checkpoint.get("fold", 0)),
+        data_seed=int(checkpoint.get("data_seed", 0)),
+        train_ratio=float(checkpoint.get("train_ratio", 1.0)),
         seed=0,
     )
 
 
 def _split_patient_ids(args: argparse.Namespace) -> tuple[list[str], list[str], list[str]]:
-    """Load the saved split with the same ADNI compatibility settings as training."""
-    if args.splits_file is None:
-        raise ValueError(f"--splits-file is required for dataset={args.dataset!r}")
-    split_dataset = build_dataset(args, augment=False)
-    stratum_fn = _adni_patient_stratum if args.dataset == "adni" else _duke_patient_stratum
-    _, metadata = patient_level_stratified_split(
-        split_dataset,
-        dataset_name=args.dataset,
-        train_fraction=1.0 - args.val_frac - args.test_frac,
-        val_fraction=args.val_frac,
-        test_fraction=args.test_frac,
-        seed=args.seed,
-        stratum_fn=stratum_fn,
-        split_file=args.splits_file,
-        use_saved_split_config=False,
-        allow_saved_patient_superset=args.dataset == "adni",
-        validate_saved_patient_strata=args.dataset != "adni",
+    """Recreate the checkpoint's patient-level CV assignment."""
+    split_dataset = build_dataset(
+        args, augment=False, split="all" if args.dataset == "organmnist3d" else None
     )
-    splits = metadata["splits"]
-    train_ids = [str(patient_id) for patient_id in splits["train"]]
-    val_ids = [str(patient_id) for patient_id in splits["val"]]
-    test_ids = [str(patient_id) for patient_id in splits["test"]]
-    if args.dataset == "adni":
-        valid_ids = _dataset_patient_ids(split_dataset)
-        train_ids = [patient_id for patient_id in train_ids if patient_id in valid_ids]
-        val_ids = [patient_id for patient_id in val_ids if patient_id in valid_ids]
-        test_ids = [patient_id for patient_id in test_ids if patient_id in valid_ids]
-    return train_ids, val_ids, test_ids
+    folds = make_dataset_patient_folds(
+        split_dataset, n_folds=args.n_folds, seed=args.data_seed
+    )
+    return folds.get_split(
+        args.fold, train_ratio=args.train_ratio, train_seed=args.data_seed
+    )
 
 
 def _load_model(args: argparse.Namespace, checkpoint: dict[str, Any], device: torch.device) -> MultiSliceDinoModel:
@@ -255,19 +220,11 @@ def evaluate_head(cli_args: argparse.Namespace) -> Path:
     else:
         train_ids, val_ids, test_ids = _split_patient_ids(args)
         train_dataset = build_dataset(args, augment=False, patient_ids=train_ids)
-        val_dataset = (
-            build_dataset(args, augment=False, patient_ids=val_ids) if val_ids else None
-        )
-        test_dataset = (
-            build_dataset(args, augment=False, patient_ids=test_ids) if test_ids else None
-        )
+        val_dataset = build_dataset(args, augment=False, patient_ids=val_ids)
+        test_dataset = build_dataset(args, augment=False, patient_ids=test_ids)
         _require_dataset_patient_ids(train_dataset, train_ids, split_name="train")
-        if val_dataset is not None:
-            _require_dataset_patient_ids(
-                val_dataset, val_ids, split_name="validation"
-            )
-        if test_dataset is not None:
-            _require_dataset_patient_ids(test_dataset, test_ids, split_name="test")
+        _require_dataset_patient_ids(val_dataset, val_ids, split_name="validation")
+        _require_dataset_patient_ids(test_dataset, test_ids, split_name="test")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True) if val_dataset is not None else None

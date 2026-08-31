@@ -47,7 +47,7 @@ from datasets.adni import ADNIPairedSliceDataset, DEFAULT_ROOT as ADNI_DEFAULT_R
 from datasets.duke import DukeBreastMRIDataset, PairToDinoGlobalCrops
 from datasets.duke.dataset import _DEFAULT_OUT_ROOT as DUKE_DEFAULT_ROOT
 
-from utils.splits import patient_level_stratified_split, save_patient_split
+from utils.fold_cv import dataset_subset_for_patients, make_dataset_patient_folds
 
 if __package__:
     from .model import SSLFineTune
@@ -402,54 +402,30 @@ def _adni_patient_split_stratum(dataset, index):
 
 
 def _build_train_patient_subset(cfg, dataset, dataset_name):
-    split_cfg = cfg.get("data_split", {})
-    train_fraction = float(split_cfg.get("train_fraction", 0.70))
-    val_fraction = float(split_cfg.get("val_fraction", 0.15))
-    test_fraction = float(split_cfg.get("test_fraction", 0.15))
-    split_seed = split_cfg.get("seed")
-    split_seed = cfg.train.seed if split_seed is None else int(split_seed)
-
-    configured_path = split_cfg.get("file")
-    if configured_path:
-        split_path = Path(configured_path).expanduser()
-        if not split_path.is_absolute():
-            split_path = Path(cfg.train.output_dir).expanduser() / split_path
-    else:
-        split_path = Path(cfg.train.output_dir).expanduser() / f"{dataset_name}_patient_splits.json"
-
     stratum_fn = (
         _adni_patient_split_stratum
         if dataset_name == "adni"
         else _duke_patient_split_stratum
     )
-    train_dataset, metadata = patient_level_stratified_split(
+    folds = make_dataset_patient_folds(
         dataset,
-        dataset_name=dataset_name,
-        train_fraction=train_fraction,
-        val_fraction=val_fraction,
-        test_fraction=test_fraction,
-        seed=split_seed,
-        stratum_fn=stratum_fn,
-        train_patient_count=cfg.train.n_patients,
-        split_file=split_path,
+        n_folds=int(cfg.train.n_folds),
+        seed=int(cfg.train.data_seed),
+        target_fn=stratum_fn,
     )
-
-    # Every rank computes the same split. Only rank 0 writes it, then all
-    # ranks wait so workers cannot observe a partially written split file.
-    is_main_process = (
-        not torch.distributed.is_initialized() or distributed.is_subgroup_main_process()
+    train_patient_ids, val_patient_ids, test_patient_ids = folds.get_split(
+        int(cfg.train.fold),
+        train_ratio=float(cfg.train.train_ratio),
+        train_seed=int(cfg.train.data_seed),
     )
-    if not split_path.is_file() and is_main_process:
-        save_patient_split(split_path, metadata)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier(group=distributed.get_process_subgroup())
+    train_dataset = dataset_subset_for_patients(dataset, train_patient_ids)
 
     logger.info(
-        "Fine-tuning uses only the patient train split: %d samples; "
-        "validation/test samples are reserved (%d/%d samples)",
-        metadata["sample_counts"]["train"],
-        metadata["sample_counts"]["val"],
-        metadata["sample_counts"]["test"],
+        "Fine-tuning fold %d/%d (seed=%d) uses %d class-balanced training "
+        "patients (%d samples, ratio=%.3f); validation/test reserve %d/%d patients",
+        int(cfg.train.fold), int(cfg.train.n_folds), int(cfg.train.data_seed),
+        len(train_patient_ids), len(train_dataset), float(cfg.train.train_ratio),
+        len(val_patient_ids), len(test_patient_ids),
     )
     return train_dataset
 
@@ -467,9 +443,6 @@ def build_data_loader_from_cfg(
             root=data_root or ADNI_DEFAULT_ROOT,
             task=cfg.train.adni_task,
             max_distance=cfg.train.max_distance,
-            # n_patients is applied by the patient-level splitter below.  The
-            # full cohort must be available so the remainder can be reserved
-            # for validation and test.
             n_patients=None,
             transform=identity_transform,
             image_size=cfg.crops.global_crops_size,

@@ -17,7 +17,6 @@ set -euo pipefail
 
 REPO_ROOT=/common/ganesanv/tlab
 RUNS_DIR="$REPO_ROOT/runs/collapse_test"
-SPLITS_FILE="$REPO_ROOT/runs/ssl_finetune_ablations/full_context/adni_patient_splits.json"
 
 module load miniconda3
 . ~/conda_init
@@ -35,7 +34,6 @@ run_evaluation() {
     output="$(dirname "$head")/last_metrics_summary.json"
     echo "Evaluating $head"
     python -m classification.eval "$head" \
-        --splits-file "$SPLITS_FILE" \
         --output "$output" \
         --batch-size 16 \
         --num-workers 2

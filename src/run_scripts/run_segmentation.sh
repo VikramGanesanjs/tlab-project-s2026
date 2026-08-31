@@ -23,4 +23,4 @@ export nnUNet_results="/common/ganesanv/tlab/data/nnUNet_results"
 NUM_GPUS=2
 
 
-nnUNetv2_train 001 2d 1 -tr meddinov3_base_primus_multiscale_Trainer --npz -num_gpus $NUM_GPUS
+nnUNetv2_train 001 2d 2 -tr meddinov3_base_primus_multiscale_Trainer -num_gpus $NUM_GPUS

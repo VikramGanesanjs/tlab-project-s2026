@@ -51,7 +51,7 @@ from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosi
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from .adni import ADNI
 from .ssl_meta_arch import LORA_MARKERS, SSLMetaArch
-from utils.splits import patient_level_stratified_split, save_patient_split
+from utils.fold_cv import dataset_subset_for_patients, make_dataset_patient_folds
 
 assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
@@ -66,58 +66,26 @@ def _adni_patient_split_stratum(dataset, index):
 
 
 def _build_adni_train_subset(cfg, dataset):
-    """Select ADNI train patients using the shared fine-tuning split utility."""
-    split_cfg = cfg.get("data_split", {})
-    train_fraction = float(split_cfg.get("train_fraction", 0.70))
-    val_fraction = float(split_cfg.get("val_fraction", 0.15))
-    test_fraction = float(split_cfg.get("test_fraction", 0.15))
-    configured_seed = split_cfg.get("seed")
-    split_seed = cfg.train.seed if configured_seed is None else int(configured_seed)
-
-    configured_path = split_cfg.get("file")
-    split_file = None
-    if configured_path:
-        split_file = Path(configured_path).expanduser()
-        if not split_file.is_absolute():
-            split_file = Path(cfg.train.output_dir).expanduser() / split_file
-        if not split_file.is_file():
-            raise FileNotFoundError(f"Configured ADNI split file does not exist: {split_file}")
-    generated_split_path = (
-        Path(cfg.train.output_dir).expanduser() / "adni_patient_splits.json"
-    )
-
-    train_dataset, metadata = patient_level_stratified_split(
+    """Select the class-balanced training subset for one ADNI CV fold."""
+    folds = make_dataset_patient_folds(
         dataset,
-        dataset_name="adni",
-        train_fraction=train_fraction,
-        val_fraction=val_fraction,
-        test_fraction=test_fraction,
-        seed=split_seed,
-        stratum_fn=_adni_patient_split_stratum,
-        split_file=split_file,
-        # A supplied file is authoritative: load its assignments without
-        # requiring the current fractions or seed to duplicate its metadata.
-        use_saved_split_config=False,
+        n_folds=int(cfg.train.n_folds),
+        seed=int(cfg.train.data_seed),
+        target_fn=_adni_patient_split_stratum,
     )
-
-    # Every rank derives the same subset. When no file was supplied, only the
-    # main rank persists the freshly generated split, then workers wait before
-    # proceeding. A supplied split file is never modified.
-    is_main_process = (
-        not torch.distributed.is_initialized() or distributed.is_subgroup_main_process()
+    train_patient_ids, val_patient_ids, test_patient_ids = folds.get_split(
+        int(cfg.train.fold),
+        train_ratio=float(cfg.train.train_ratio),
+        train_seed=int(cfg.train.data_seed),
     )
-    if split_file is None and is_main_process:
-        save_patient_split(generated_split_path, metadata)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier(group=distributed.get_process_subgroup())
+    train_dataset = dataset_subset_for_patients(dataset, train_patient_ids)
 
     logger.info(
-        "ADNI continued pretraining uses the train split from %s: %d samples; "
-        "validation/test samples are reserved (%d/%d samples)",
-        split_file or generated_split_path,
-        metadata["sample_counts"]["train"],
-        metadata["sample_counts"]["val"],
-        metadata["sample_counts"]["test"],
+        "ADNI continued pretraining fold %d/%d (seed=%d) uses %d class-balanced "
+        "training patients (%d samples, ratio=%.3f); validation/test reserve %d/%d patients",
+        int(cfg.train.fold), int(cfg.train.n_folds), int(cfg.train.data_seed),
+        len(train_patient_ids), len(train_dataset), float(cfg.train.train_ratio),
+        len(val_patient_ids), len(test_patient_ids),
     )
     return train_dataset
 
