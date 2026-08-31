@@ -49,7 +49,7 @@ from dinov3.data import (
 from dinov3.logging import MetricLogger, setup_logging
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
-from .adni import ADNI
+from .data import build_dataset_from_cfg
 from .ssl_meta_arch import LORA_MARKERS, SSLMetaArch
 from utils.fold_cv import dataset_subset_for_patients, make_dataset_patient_folds
 
@@ -393,7 +393,13 @@ def build_data_loader_from_cfg(
     batch_size = dataloader_batch_size_per_gpu
     num_workers = cfg.train.num_workers
     dataset_path = cfg.train.dataset_path
-    if dataset_path.split(":", 1)[0] == "ADNI":
+    if hasattr(cfg.train, "dataset") and cfg.train.dataset:
+        dataset = build_dataset_from_cfg(
+            cfg,
+            transform=model.build_data_augmentation_dino(cfg),
+            target_transform=lambda _: (),
+        )
+    elif dataset_path.split(":", 1)[0] == "ADNI":
         dataset_kwargs = {}
         for token in dataset_path.split(":")[1:]:
             key, value = token.split("=", 1)
@@ -406,11 +412,11 @@ def build_data_loader_from_cfg(
                 "Continued pretraining only accepts the ADNI train split; "
                 f"received split={requested_split!r}"
             )
-        dataset = ADNI(
-            transform=model.build_data_augmentation_dino(cfg),
-            target_transform=lambda _: (),
-            **dataset_kwargs,
-        )
+        # Legacy ADNI dataset_path support. New configurations should use the
+        # generic ``train.dataset`` fields handled above.
+        from .adni import ADNI
+
+        dataset = ADNI(transform=model.build_data_augmentation_dino(cfg), target_transform=lambda _: (), **dataset_kwargs)
         dataset = _build_adni_train_subset(cfg, dataset)
     else:
         dataset = make_dataset(

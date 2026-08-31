@@ -56,6 +56,11 @@ from datasets.duke import (  # noqa: E402
     DukeMultiSliceDataset,
     build_duke_volume_transform,
 )
+from datasets.cq500 import (  # noqa: E402
+    CQ500MultiSliceDataset,
+    build_cq500_volume_transform,
+    resolve_cq500_task,
+)
 from datasets.organmnist3d import (  # noqa: E402
     ORGANMNIST3D_CLASS_NAMES,
     OrganMNIST3DMultiSliceDataset,
@@ -73,7 +78,7 @@ patient_level_stratified_split = None
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
-DATASET_CHOICES = ("duke", "adni", "organmnist3d")
+DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
@@ -81,6 +86,7 @@ EARLY_STOPPING_MIN_IMPROVEMENT = 0.005
 MultiSliceDataset = Union[
     DukeMultiSliceDataset,
     ADNIMultiSliceDataset,
+    CQ500MultiSliceDataset,
     OrganMNIST3DMultiSliceDataset,
 ]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
@@ -94,6 +100,7 @@ def task_config(
     dataset_name: str,
     *,
     adni_task: str = DEFAULT_ADNI_TASK,
+    cq500_task: str = "ich",
 ) -> Tuple[int, Tuple[str, ...], str]:
     """Return ``(num_logits, class_names, loss_name)`` for a dataset/task."""
     if dataset_name == "duke":
@@ -103,16 +110,21 @@ def task_config(
         spec = resolve_adni_task(adni_task)
         loss_name = "BCEWithLogitsLoss" if spec.binary else "CrossEntropyLoss"
         return spec.num_logits, spec.class_names, loss_name
+    if dataset_name == "cq500":
+        spec = resolve_cq500_task(cq500_task)
+        return spec.num_logits, spec.class_names, "BCEWithLogitsLoss"
     if dataset_name == "organmnist3d":
         return len(ORGANMNIST3D_CLASS_NAMES), ORGANMNIST3D_CLASS_NAMES, "CrossEntropyLoss"
     raise ValueError(f"Unknown dataset={dataset_name!r}")
 
 
+def is_multilabel_task(dataset_name: str, *, cq500_task: str = "ich") -> bool:
+    """Return whether a task has independent binary labels per output logit."""
+    return dataset_name == "cq500" and resolve_cq500_task(cq500_task).multi_label
+
+
 def collect_labels(dataset: Dataset) -> np.ndarray:
-    return np.asarray(
-        [int(dataset.get_target(index)) for index in range(len(dataset))],  # type: ignore[attr-defined]
-        dtype=np.int64,
-    )
+    return np.asarray([dataset.get_target(index) for index in range(len(dataset))])  # type: ignore[attr-defined]
 
 
 def summarize_class_counts(
@@ -141,7 +153,14 @@ def compute_auroc(
     y_probability: np.ndarray,
     *,
     num_classes: int,
+    multi_label: bool = False,
 ) -> float:
+    if multi_label:
+        try:
+            return float(roc_auc_score(y_true, y_probability, average="macro"))
+        except ValueError as exc:
+            logger.warning("AUROC undefined: %s", exc)
+            return float("nan")
     if is_binary_task(num_classes):
         if np.unique(y_true).size < 2:
             return float("nan")
@@ -197,9 +216,12 @@ def classification_f1(
     y_pred: np.ndarray,
     *,
     num_classes: int,
+    multi_label: bool = False,
 ) -> float:
     if len(y_true) == 0:
         return float("nan")
+    if multi_label:
+        return float(f1_score(y_true, y_pred, average="macro", zero_division=0))
     if is_binary_task(num_classes):
         return float(
             f1_score(y_true, y_pred, average="binary", pos_label=1, zero_division=0)
@@ -221,6 +243,7 @@ def compute_classification_metrics(
     y_probability: np.ndarray,
     *,
     num_classes: int,
+    multi_label: bool = False,
 ) -> Dict[str, float]:
     """Compute scalar classification metrics for a held-out split."""
     if len(y_true) == 0:
@@ -230,6 +253,14 @@ def compute_classification_metrics(
             "accuracy": float("nan"),
             "precision": float("nan"),
             "recall": float("nan"),
+        }
+    if multi_label:
+        return {
+            "f1": classification_f1(y_true, y_pred, num_classes=num_classes, multi_label=True),
+            "auroc": compute_auroc(y_true, y_probability, num_classes=num_classes, multi_label=True),
+            "accuracy": float((y_true == y_pred).mean()),
+            "precision": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
+            "recall": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
         }
     labels = list(range(num_classes if not is_binary_task(num_classes) else 2))
     if is_binary_task(num_classes):
@@ -407,6 +438,14 @@ def _adni_patient_stratum(dataset: ADNIMultiSliceDataset, index: int) -> int:
     return int(dataset.get_target(index))
 
 
+def _cq500_patient_stratum(dataset: CQ500MultiSliceDataset, index: int) -> Union[int, Tuple[int, ...]]:
+    """Return a hashable CQ500 label for patient-level fold stratification."""
+    target = dataset.get_target(index)
+    if isinstance(target, np.ndarray):
+        return tuple(int(value) for value in target.tolist())
+    return int(target)
+
+
 
 def _dataset_patient_ids(dataset: Dataset) -> set[str]:
     """Return the patient IDs represented by a dataset."""
@@ -482,6 +521,7 @@ def evaluate(
     *,
     class_weights: Optional[torch.Tensor] = None,
     bce_pos_weight: Optional[torch.Tensor] = None,
+    multi_label: bool = False,
 ) -> Tuple[float, float, float]:
     """Return mean validation loss, F1, and AUROC."""
     model.eval()
@@ -494,7 +534,7 @@ def evaluate(
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         logits = model(images)
-        if binary:
+        if binary or multi_label:
             targets = targets.to(device, non_blocking=True).float()
             if bce_pos_weight is None:
                 loss = F.binary_cross_entropy_with_logits(logits, targets)
@@ -525,8 +565,8 @@ def evaluate(
     y_probability = np.concatenate(probabilities_all)
     return (
         total_loss / total,
-        classification_f1(y_true, y_pred, num_classes=model.num_classes),
-        compute_auroc(y_true, y_probability, num_classes=model.num_classes),
+        classification_f1(y_true, y_pred, num_classes=model.num_classes, multi_label=multi_label),
+        compute_auroc(y_true, y_probability, num_classes=model.num_classes, multi_label=multi_label),
     )
 
 
@@ -535,6 +575,8 @@ def collect_predictions(
     model: MultiSliceDinoModel,
     loader: DataLoader,
     device: torch.device,
+    *,
+    multi_label: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return targets, predictions, and class probabilities."""
     model.eval()
@@ -545,7 +587,7 @@ def collect_predictions(
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         logits = model(images)
-        if binary:
+        if binary or multi_label:
             probabilities = torch.sigmoid(logits)
             predictions = (probabilities >= 0.5).long()
         else:
@@ -580,6 +622,7 @@ def _checkpoint_payload(
         "model": model.trainable_state_dict(),
         "dataset": args.dataset,
         "adni_task": args.adni_task if args.dataset == "adni" else None,
+        "cq500_task": args.cq500_task if args.dataset == "cq500" else None,
         "encoder": args.encoder,
         "encoder_training": args.encoder_training,
         "lora_r": args.lora_r if args.encoder_training == "lora" else None,
@@ -650,6 +693,17 @@ def build_dataset(
             image_size=args.image_size,
             transform=build_adni_volume_transform(augment=use_augment),
         )
+    if args.dataset == "cq500":
+        return CQ500MultiSliceDataset(
+            root=args.data_root,
+            csv_path=args.csv_path,
+            task=args.cq500_task,
+            n_slices=args.n_slices,
+            patient_ids=patient_ids,
+            augment=use_augment,
+            image_size=args.image_size,
+            transform=build_cq500_volume_transform(augment=use_augment),
+        )
     if args.dataset == "organmnist3d":
         if patient_ids is not None:
             raise ValueError(
@@ -669,13 +723,16 @@ def build_dataset(
 
 def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) -> None:
     torch.manual_seed(args.seed)
+    cq500_task = getattr(args, "cq500_task", "ich")
     num_classes, class_names, loss_name = task_config(
-        args.dataset, adni_task=args.adni_task
+        args.dataset, adni_task=args.adni_task, cq500_task=cq500_task
     )
     binary = is_binary_task(num_classes)
+    multi_label = is_multilabel_task(args.dataset, cq500_task=cq500_task)
     unit_name = {
         "duke": "breasts",
         "adni": "scans",
+        "cq500": "volumes",
         "organmnist3d": "volumes",
     }[args.dataset]
     if args.dataset == "organmnist3d":
@@ -698,7 +755,10 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             labels, name=f"full dataset ({unit_name})", class_names=class_names
         )
         folds = make_dataset_patient_folds(
-            split_dataset, n_folds=args.n_folds, seed=args.data_seed
+            split_dataset,
+            n_folds=args.n_folds,
+            seed=args.data_seed,
+            target_fn=_cq500_patient_stratum if args.dataset == "cq500" else None,
         )
         train_patient_ids, val_patient_ids, test_patient_ids = folds.get_split(
             args.fold, train_ratio=args.train_ratio, train_seed=args.data_seed
@@ -719,25 +779,35 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         )
 
     train_labels = collect_labels(train_dataset)
-    train_counts = summarize_class_counts(
-        train_labels, name=f"train ({unit_name})", class_names=class_names
-    )
-    if val_dataset is not None:
-        summarize_class_counts(
-            collect_labels(val_dataset),
-            name=f"val ({unit_name})",
-            class_names=class_names,
+    if multi_label:
+        train_counts = {}
+        logger.info(
+            "train (%s) subtype positives: %s",
+            unit_name,
+            dict(zip(class_names, train_labels.sum(axis=0).astype(int).tolist())),
         )
-    if test_dataset is not None:
-        summarize_class_counts(
-            collect_labels(test_dataset),
-            name=f"test ({unit_name})",
-            class_names=class_names,
+    else:
+        train_counts = summarize_class_counts(
+            train_labels, name=f"train ({unit_name})", class_names=class_names
         )
+        if val_dataset is not None:
+            summarize_class_counts(
+                collect_labels(val_dataset), name=f"val ({unit_name})", class_names=class_names
+            )
+        if test_dataset is not None:
+            summarize_class_counts(
+                collect_labels(test_dataset), name=f"test ({unit_name})", class_names=class_names
+            )
 
     class_weights: Optional[torch.Tensor] = None
     bce_pos_weight: Optional[torch.Tensor] = None
-    if binary and args.weight_ce_loss:
+    if multi_label and args.weight_ce_loss:
+        positives = train_labels.sum(axis=0)
+        negatives = len(train_labels) - positives
+        if np.any(positives == 0) or np.any(negatives == 0):
+            raise ValueError("Cannot compute weighted multi-label BCE without both values per subtype")
+        bce_pos_weight = torch.tensor(negatives / positives, dtype=torch.float32, device=device)
+    elif binary and args.weight_ce_loss:
         negative_count = train_counts.get(0, 0)
         positive_count = train_counts.get(1, 0)
         if negative_count <= 0 or positive_count <= 0:
@@ -755,7 +825,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             negative_count,
             positive_count,
         )
-    if not binary:
+    if not binary and not multi_label:
         class_weights = inverse_frequency_weights(
             train_counts, num_classes=num_classes
         ).to(device)
@@ -863,7 +933,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     best_path = checkpoint_dir / "best_mst.pt"
     epochs_trained = 0
     stopped_early = False
-    loss_tag = "bce" if binary else "ce"
+    loss_tag = "bce" if binary or multi_label else "ce"
     lora_unfrozen = not (
         args.encoder_training == "lora" and args.freeze_epochs > 0
     )
@@ -874,7 +944,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         "encoder_training=%s lora_r=%s freeze_epochs=%d num_classes=%d "
         "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
         args.dataset,
-        args.adni_task if args.dataset == "adni" else None,
+        args.adni_task if args.dataset == "adni" else cq500_task if args.dataset == "cq500" else None,
         args.encoder,
         args.features,
         args.n_cls_tokens,
@@ -913,7 +983,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         for images, targets in train_loader:
             images = images.to(device, non_blocking=True)
             logits = model(images)
-            if binary:
+            if binary or multi_label:
                 targets = targets.to(device, non_blocking=True).float()
                 if bce_pos_weight is None:
                     loss = F.binary_cross_entropy_with_logits(logits, targets)
@@ -956,6 +1026,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             device,
             class_weights=class_weights,
             bce_pos_weight=bce_pos_weight,
+            multi_label=multi_label,
         )
         validation_metrics = {
             "bce_loss": val_loss,
@@ -1075,23 +1146,23 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             best = torch.load(best_path, map_location=device, weights_only=False)
             model.load_trainable_state_dict(best["model"])
             logger.info("Evaluating final validation metrics from best epoch %d", best["epoch"])
-        y_true, y_pred, y_probability = collect_predictions(model, val_loader, device)
+        y_true, y_pred, y_probability = collect_predictions(
+            model, val_loader, device, multi_label=multi_label
+        )
         final_val_loss, _, _ = evaluate(
             model,
             val_loader,
             device,
             class_weights=class_weights,
             bce_pos_weight=bce_pos_weight,
+            multi_label=multi_label,
         )
         val_metrics = compute_classification_metrics(
-            y_true, y_pred, y_probability, num_classes=num_classes
+            y_true, y_pred, y_probability, num_classes=num_classes, multi_label=multi_label
         )
-        confusion = save_confusion_matrix(
-            y_true,
-            y_pred,
-            checkpoint_dir / "val_confusion_matrix.png",
-            class_names=class_names,
-            title="Validation confusion matrix",
+        confusion = None if multi_label else save_confusion_matrix(
+            y_true, y_pred, checkpoint_dir / "val_confusion_matrix.png",
+            class_names=class_names, title="Validation confusion matrix",
         )
         metrics_by_split["val"] = {
             "n": int(len(y_true)),
@@ -1115,32 +1186,29 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         if best_path.is_file():
             best = torch.load(best_path, map_location=device, weights_only=False)
             model.load_trainable_state_dict(best["model"])
-        y_true, y_pred, y_probability = collect_predictions(model, test_loader, device)
+        y_true, y_pred, y_probability = collect_predictions(
+            model, test_loader, device, multi_label=multi_label
+        )
         final_test_loss, _, _ = evaluate(
             model,
             test_loader,
             device,
             class_weights=class_weights,
             bce_pos_weight=bce_pos_weight,
+            multi_label=multi_label,
         )
         test_metrics = compute_classification_metrics(
-            y_true, y_pred, y_probability, num_classes=num_classes
+            y_true, y_pred, y_probability, num_classes=num_classes, multi_label=multi_label
         )
-        confusion = save_confusion_matrix(
-            y_true,
-            y_pred,
-            checkpoint_dir / "test_confusion_matrix.png",
-            class_names=class_names,
-            title="Test confusion matrix",
+        confusion = None if multi_label else save_confusion_matrix(
+            y_true, y_pred, checkpoint_dir / "test_confusion_matrix.png",
+            class_names=class_names, title="Test confusion matrix",
         )
-        save_auroc_plot(
-            y_true,
-            y_probability,
-            checkpoint_dir / "test_auroc.png",
-            num_classes=num_classes,
-            class_names=class_names,
-            title="Test ROC curve",
-        )
+        if not multi_label:
+            save_auroc_plot(
+                y_true, y_probability, checkpoint_dir / "test_auroc.png",
+                num_classes=num_classes, class_names=class_names, title="Test ROC curve",
+            )
         metrics_by_split["test"] = {
             "n": int(len(y_true)),
             "loss": final_test_loss,

@@ -4,6 +4,12 @@ MODEL:
   DEVICE: cuda
 
 train:
+  # Generic tlab dataset configuration. ``dataset_path`` is retained below for
+  # compatibility with unmodified DINOv3 configs and legacy launch commands.
+  dataset: adni
+  data_root: /common/ganesanv/tlab/data/ADNI
+  task: cn_mci_ad
+  csv_path: null
   dataset_path: ADNI:root=/common/ganesanv/tlab/data/ADNI
   output_dir: /common/ganesanv/tlab/runs/continued_pretraining/adni
   batch_size_per_gpu: 64

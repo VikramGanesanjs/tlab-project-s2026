@@ -26,13 +26,17 @@ from datasets.adni import (  # noqa: E402
     DEFAULT_ADNI_TASK,
     DEFAULT_ROOT as ADNI_DEFAULT_ROOT,
 )
+from datasets.cq500 import (  # noqa: E402
+    CQ500_TASK_CHOICES,
+    DEFAULT_ROOT as CQ500_DEFAULT_ROOT,
+)
 from datasets.organmnist3d import DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT  # noqa: E402
 from classification.train import train  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
-DATASET_CHOICES = ("duke", "adni", "organmnist3d")
+DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
@@ -98,7 +102,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="duke",
         help=(
             "duke: binary breast cancer; adni: diagnosis task selected by "
-            "--adni-task; organmnist3d: official 11-class volume splits"
+            "--adni-task; cq500: task selected by --cq500-task; "
+            "organmnist3d: official 11-class volume splits"
         ),
     )
     parser.add_argument(
@@ -112,6 +117,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cq500-task",
+        choices=list(CQ500_TASK_CHOICES),
+        default="ich",
+        help="CQ500 task: ich is binary BCE; subtype is five-logit multi-label BCE",
+    )
+    parser.add_argument(
         "--data-root",
         type=Path,
         default=None,
@@ -121,7 +132,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--csv-path",
         type=Path,
         default=None,
-        help="ADNI metadata CSV (ignored by Duke and OrganMNIST3D)",
+        help="Metadata CSV (ADNI or CQ500 reads.csv; ignored by Duke and OrganMNIST3D)",
     )
     parser.add_argument("--scan", type=str, default="pre")
     parser.add_argument("--n-slices", type=int, default=8)
@@ -129,7 +140,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--include-bilateral",
         action="store_true",
-        help="Include bilateral Duke cases (ignored by ADNI and OrganMNIST3D)",
+        help="Include bilateral Duke cases (ignored by ADNI, CQ500, and OrganMNIST3D)",
     )
     augmentation = parser.add_mutually_exclusive_group()
     augmentation.add_argument(
@@ -331,6 +342,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.data_root = {
             "duke": DEFAULT_DATA_ROOT,
             "adni": ADNI_DEFAULT_ROOT,
+            "cq500": CQ500_DEFAULT_ROOT,
             "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
         }[args.dataset]
     if args.n_slices <= 0:

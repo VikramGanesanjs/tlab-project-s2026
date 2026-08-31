@@ -18,17 +18,20 @@ if str(_SRC_DIR) not in sys.path:
 from classification.model import MultiSliceDinoModel  # noqa: E402
 from classification.train import (  # noqa: E402
     _assert_loader_patient_disjoint,
+    _cq500_patient_stratum,
     _require_dataset_patient_ids,
     build_dataset,
     collect_labels,
     collect_predictions,
     compute_classification_metrics,
     evaluate,
+    is_multilabel_task,
     is_binary_task,
     save_run_summary,
     task_config,
 )
 from datasets.adni import DEFAULT_ROOT as ADNI_DEFAULT_ROOT  # noqa: E402
+from datasets.cq500 import DEFAULT_ROOT as CQ500_DEFAULT_ROOT  # noqa: E402
 from datasets.organmnist3d import DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT  # noqa: E402
 from utils.load_dinov3 import (  # noqa: E402
     DINOV3_REPO,
@@ -82,6 +85,7 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
     data_root = cli_args.data_root or {
         "duke": DEFAULT_DUKE_DATA_ROOT,
         "adni": ADNI_DEFAULT_ROOT,
+        "cq500": CQ500_DEFAULT_ROOT,
         "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
     }.get(dataset)
     if data_root is None:
@@ -98,6 +102,7 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         device=cli_args.device,
         dataset=dataset,
         adni_task=checkpoint.get("adni_task") or "cn_ad",
+        cq500_task=checkpoint.get("cq500_task") or "ich",
         n_slices=int(_value(checkpoint, "n_slices")),
         image_size=int(_value(checkpoint, "image_size")),
         include_bilateral=bool(checkpoint.get("include_bilateral", False)),
@@ -135,7 +140,10 @@ def _split_patient_ids(args: argparse.Namespace) -> tuple[list[str], list[str], 
         args, augment=False, split="all" if args.dataset == "organmnist3d" else None
     )
     folds = make_dataset_patient_folds(
-        split_dataset, n_folds=args.n_folds, seed=args.data_seed
+        split_dataset,
+        n_folds=args.n_folds,
+        seed=args.data_seed,
+        target_fn=_cq500_patient_stratum if args.dataset == "cq500" else None,
     )
     return folds.get_split(
         args.fold, train_ratio=args.train_ratio, train_seed=args.data_seed
@@ -162,7 +170,9 @@ def _load_model(args: argparse.Namespace, checkpoint: dict[str, Any], device: to
         if args.encoder_training == "lora":
             add_lora_to_vit(encoder, r=args.lora_r)
             freeze_non_lora_parameters(encoder)
-    num_classes, _, _ = task_config(args.dataset, adni_task=args.adni_task)
+    num_classes, _, _ = task_config(
+        args.dataset, adni_task=args.adni_task, cq500_task=args.cq500_task
+    )
     model = MultiSliceDinoModel(
         encoder,
         n_slices=args.n_slices,
@@ -189,20 +199,24 @@ def _metrics_for_loader(
     *,
     class_weights: Optional[torch.Tensor],
     bce_pos_weight: Optional[torch.Tensor],
+    multi_label: bool = False,
 ) -> dict[str, object]:
-    y_true, y_pred, y_probability = collect_predictions(model, loader, device)
+    y_true, y_pred, y_probability = collect_predictions(
+        model, loader, device, multi_label=multi_label
+    )
     loss, _, _ = evaluate(
         model,
         loader,
         device,
         class_weights=class_weights,
         bce_pos_weight=bce_pos_weight,
+        multi_label=multi_label,
     )
     return {
         "n": int(len(y_true)),
         "loss": loss,
         **compute_classification_metrics(
-            y_true, y_pred, y_probability, num_classes=model.num_classes
+            y_true, y_pred, y_probability, num_classes=model.num_classes, multi_label=multi_label
         ),
     }
 
@@ -232,17 +246,25 @@ def evaluate_head(cli_args: argparse.Namespace) -> Path:
     if args.dataset != "organmnist3d":
         _assert_loader_patient_disjoint(train_loader, val_loader, test_loader)
 
-    num_classes, _, _ = task_config(args.dataset, adni_task=args.adni_task)
+    num_classes, _, _ = task_config(
+        args.dataset, adni_task=args.adni_task, cq500_task=args.cq500_task
+    )
     class_weights: Optional[torch.Tensor] = None
     bce_pos_weight: Optional[torch.Tensor] = None
-    if args.weight_ce_loss and is_binary_task(num_classes):
+    multi_label = is_multilabel_task(args.dataset, cq500_task=args.cq500_task)
+    if args.weight_ce_loss and multi_label:
+        labels = collect_labels(train_dataset)
+        positives = labels.sum(axis=0)
+        negatives = len(labels) - positives
+        bce_pos_weight = torch.tensor(negatives / positives, dtype=torch.float32, device=device)
+    elif args.weight_ce_loss and is_binary_task(num_classes):
         labels = collect_labels(train_dataset)
         negative_count = int((labels == 0).sum())
         positive_count = int((labels == 1).sum())
         if not negative_count or not positive_count:
             raise ValueError("Cannot compute weighted BCE loss without both classes")
         bce_pos_weight = torch.tensor([negative_count / positive_count], device=device)
-    elif not is_binary_task(num_classes):
+    elif not is_binary_task(num_classes) and not multi_label:
         labels = collect_labels(train_dataset)
         counts = {index: int((labels == index).sum()) for index in range(num_classes)}
         class_weights = inverse_frequency_weights(counts, num_classes=num_classes).to(device)
@@ -250,9 +272,9 @@ def evaluate_head(cli_args: argparse.Namespace) -> Path:
     model = _load_model(args, checkpoint, device)
     metrics: dict[str, dict[str, object]] = {}
     if val_loader is not None:
-        metrics["val"] = _metrics_for_loader(model, val_loader, device, class_weights=class_weights, bce_pos_weight=bce_pos_weight)
+        metrics["val"] = _metrics_for_loader(model, val_loader, device, class_weights=class_weights, bce_pos_weight=bce_pos_weight, multi_label=multi_label)
     if test_loader is not None:
-        metrics["test"] = _metrics_for_loader(model, test_loader, device, class_weights=class_weights, bce_pos_weight=bce_pos_weight)
+        metrics["test"] = _metrics_for_loader(model, test_loader, device, class_weights=class_weights, bce_pos_weight=bce_pos_weight, multi_label=multi_label)
 
     output = cli_args.output or cli_args.head.parent / "metrics_summary.json"
     save_run_summary(output, args=args, metrics_by_split=metrics)
