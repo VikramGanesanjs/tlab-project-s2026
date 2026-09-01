@@ -9,7 +9,7 @@ import math
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,7 +28,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, default_collate
 
 _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
@@ -67,13 +67,10 @@ from datasets.organmnist3d import (  # noqa: E402
     build_organmnist3d_volume_transform,
 )
 from utils.fold_cv import make_dataset_patient_folds  # noqa: E402
+from utils.splits import patient_level_stratified_split  # noqa: E402
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from utils.vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
 from classification.model import MultiSliceDinoModel, set_lora_requires_grad  # noqa: E402
-
-# Retained only so older callers that monkey-patch this former implementation
-# detail continue to import. The fold-based data path never reads it.
-patient_level_stratified_split = None
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +122,42 @@ def is_multilabel_task(dataset_name: str, *, cq500_task: str = "ich") -> bool:
 
 def collect_labels(dataset: Dataset) -> np.ndarray:
     return np.asarray([dataset.get_target(index) for index in range(len(dataset))])  # type: ignore[attr-defined]
+
+
+def collate_variable_depth_volumes(
+    batch: Sequence[Tuple[torch.Tensor, Any]],
+) -> Tuple[torch.Tensor, Any, torch.Tensor]:
+    """Pad ``[D,C,H,W]`` volumes and return a mask for valid depth entries."""
+    images, targets = zip(*batch)
+    if not images:
+        raise ValueError("Cannot collate an empty batch")
+    if any(image.ndim != 4 for image in images):
+        raise ValueError("Expected each variable-depth image to have shape [D,C,H,W]")
+    channels_and_size = images[0].shape[1:]
+    if any(image.shape[1:] != channels_and_size for image in images):
+        raise ValueError("All variable-depth volumes must have matching [C,H,W]")
+    depths = [int(image.shape[0]) for image in images]
+    if min(depths) <= 0:
+        raise ValueError("Every volume must contain at least one slice")
+    padded = images[0].new_zeros((len(images), max(depths), *channels_and_size))
+    slice_mask = torch.zeros((len(images), max(depths)), dtype=torch.bool)
+    for index, image in enumerate(images):
+        padded[index, : image.shape[0]] = image
+        slice_mask[index, : image.shape[0]] = True
+    return padded, default_collate(list(targets)), slice_mask
+
+
+def _unpack_volume_batch(
+    batch: Sequence[Any],
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Accept the regular two-item batch or variable-depth three-item batch."""
+    if len(batch) == 2:
+        images, targets = batch
+        return images, targets, None
+    if len(batch) == 3:
+        images, targets, slice_mask = batch
+        return images, targets, slice_mask
+    raise ValueError(f"Expected a 2- or 3-item batch, got {len(batch)} items")
 
 
 def summarize_class_counts(
@@ -446,6 +479,47 @@ def _cq500_patient_stratum(dataset: CQ500MultiSliceDataset, index: int) -> Union
     return int(target)
 
 
+def saved_split_patient_ids(
+    args: argparse.Namespace, dataset: Dataset
+) -> Tuple[list[str], list[str], list[str]]:
+    """Load legacy explicit patient splits for a classification dataset."""
+    splits_file = getattr(args, "splits_file", None)
+    if splits_file is None:
+        raise ValueError("saved_split_patient_ids requires args.splits_file")
+    splits_file = Path(splits_file)
+    if not splits_file.is_file():
+        raise FileNotFoundError(f"Saved split file does not exist: {splits_file}")
+    get_stratum = (
+        _cq500_patient_stratum
+        if args.dataset == "cq500"
+        else _adni_patient_stratum
+        if args.dataset == "adni"
+        else _duke_patient_stratum
+    )
+    _, metadata = patient_level_stratified_split(
+        dataset,
+        dataset_name=args.dataset,
+        # These fields are required by the legacy loader but are ignored when
+        # loading the explicit patient assignments below.
+        train_fraction=0.8,
+        val_fraction=0.1,
+        test_fraction=0.1,
+        seed=args.data_seed,
+        stratum_fn=get_stratum,
+        split_file=splits_file,
+        use_saved_split_config=False,
+        # A saved ADNI split may include diagnoses excluded by the active task.
+        allow_saved_patient_superset=args.dataset == "adni",
+        validate_saved_patient_strata=args.dataset != "adni",
+    )
+    splits = metadata["splits"]
+    return (
+        [str(patient_id) for patient_id in splits["train"]],
+        [str(patient_id) for patient_id in splits["val"]],
+        [str(patient_id) for patient_id in splits["test"]],
+    )
+
+
 
 def _dataset_patient_ids(dataset: Dataset) -> set[str]:
     """Return the patient IDs represented by a dataset."""
@@ -531,9 +605,17 @@ def evaluate(
     predictions_all: List[np.ndarray] = []
     probabilities_all: List[np.ndarray] = []
     binary = is_binary_task(model.num_classes)
-    for images, targets in loader:
+    for batch in loader:
+        images, targets, slice_mask = _unpack_volume_batch(batch)
         images = images.to(device, non_blocking=True)
-        logits = model(images)
+        logits = model(
+            images,
+            slice_mask=(
+                slice_mask.to(device, non_blocking=True)
+                if slice_mask is not None
+                else None
+            ),
+        )
         if binary or multi_label:
             targets = targets.to(device, non_blocking=True).float()
             if bce_pos_weight is None:
@@ -584,9 +666,17 @@ def collect_predictions(
     predictions_all: List[np.ndarray] = []
     probabilities_all: List[np.ndarray] = []
     binary = is_binary_task(model.num_classes)
-    for images, targets in loader:
+    for batch in loader:
+        images, targets, slice_mask = _unpack_volume_batch(batch)
         images = images.to(device, non_blocking=True)
-        logits = model(images)
+        logits = model(
+            images,
+            slice_mask=(
+                slice_mask.to(device, non_blocking=True)
+                if slice_mask is not None
+                else None
+            ),
+        )
         if binary or multi_label:
             probabilities = torch.sigmoid(logits)
             predictions = (probabilities >= 0.5).long()
@@ -636,6 +726,7 @@ def _checkpoint_payload(
         "early_stopping": args.early_stopping,
         "early_stopping_metric": args.early_stopping_metric,
         "n_slices": args.n_slices,
+        "cq500_max_slices": getattr(args, "cq500_max_slices", 128),
         "include_bilateral": args.include_bilateral,
         "image_size": args.image_size,
         "augment": args.augment,
@@ -651,8 +742,22 @@ def _checkpoint_payload(
         "fold": args.fold,
         "data_seed": args.data_seed,
         "train_ratio": args.train_ratio,
+        "splits_file": (
+            str(args.splits_file)
+            if getattr(args, "splits_file", None) is not None
+            else None
+        ),
         "cosine_lr": args.cosine_lr,
         "min_lr": args.min_lr,
+        "lr_scheduler": (
+            "reduce_on_plateau"
+            if getattr(args, "reduce_lr_on_plateau", True)
+            else "none"
+        ),
+        "reduce_lr_on_plateau": getattr(args, "reduce_lr_on_plateau", True),
+        "lr_plateau_factor": getattr(args, "lr_plateau_factor", 0.1),
+        "lr_plateau_patience": getattr(args, "lr_plateau_patience", 3),
+        "lr_plateau_threshold": getattr(args, "lr_plateau_threshold", 0.005),
         "num_classes": model.num_classes,
         "class_names": list(class_names),
         "loss": loss_name,
@@ -699,6 +804,7 @@ def build_dataset(
             csv_path=args.csv_path,
             task=args.cq500_task,
             n_slices=args.n_slices,
+            cq500_max_slices=getattr(args, "cq500_max_slices", 128),
             patient_ids=patient_ids,
             augment=use_augment,
             image_size=args.image_size,
@@ -724,6 +830,9 @@ def build_dataset(
 def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) -> None:
     torch.manual_seed(args.seed)
     cq500_task = getattr(args, "cq500_task", "ich")
+    splits_file = getattr(args, "splits_file", None)
+    if args.n_slices is None and args.dataset != "cq500":
+        raise ValueError("n_slices=None is supported only for CQ500")
     num_classes, class_names, loss_name = task_config(
         args.dataset, adni_task=args.adni_task, cq500_task=cq500_task
     )
@@ -754,29 +863,44 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         summarize_class_counts(
             labels, name=f"full dataset ({unit_name})", class_names=class_names
         )
-        folds = make_dataset_patient_folds(
-            split_dataset,
-            n_folds=args.n_folds,
-            seed=args.data_seed,
-            target_fn=_cq500_patient_stratum if args.dataset == "cq500" else None,
-        )
-        train_patient_ids, val_patient_ids, test_patient_ids = folds.get_split(
-            args.fold, train_ratio=args.train_ratio, train_seed=args.data_seed
-        )
+        if splits_file is not None:
+            train_patient_ids, val_patient_ids, test_patient_ids = saved_split_patient_ids(
+                args, split_dataset
+            )
+        else:
+            folds = make_dataset_patient_folds(
+                split_dataset,
+                n_folds=args.n_folds,
+                seed=args.data_seed,
+                target_fn=_cq500_patient_stratum if args.dataset == "cq500" else None,
+            )
+            train_patient_ids, val_patient_ids, test_patient_ids = folds.get_split(
+                args.fold, train_ratio=args.train_ratio, train_seed=args.data_seed
+            )
         train_dataset = build_dataset(args, augment=args.augment, patient_ids=train_patient_ids)
         val_dataset = build_dataset(args, augment=False, patient_ids=val_patient_ids)
         test_dataset = build_dataset(args, augment=False, patient_ids=test_patient_ids)
         _require_dataset_patient_ids(train_dataset, train_patient_ids, split_name="train")
         _require_dataset_patient_ids(val_dataset, val_patient_ids, split_name="validation")
         _require_dataset_patient_ids(test_dataset, test_patient_ids, split_name="test")
-        logger.info(
-            "Fold %d/%d (seed=%d): train=%d patients/%d %s (ratio=%.3f), "
-            "val=%d patients/%d %s, test=%d patients/%d %s",
-            args.fold, args.n_folds, args.data_seed,
-            len(train_patient_ids), len(train_dataset), unit_name, args.train_ratio,
-            len(val_patient_ids), len(val_dataset), unit_name,
-            len(test_patient_ids), len(test_dataset), unit_name,
-        )
+        if splits_file is not None:
+            logger.info(
+                "Saved split %s: train=%d patients/%d %s, val=%d patients/%d %s, "
+                "test=%d patients/%d %s",
+                splits_file,
+                len(train_patient_ids), len(train_dataset), unit_name,
+                len(val_patient_ids), len(val_dataset), unit_name,
+                len(test_patient_ids), len(test_dataset), unit_name,
+            )
+        else:
+            logger.info(
+                "Fold %d/%d (seed=%d): train=%d patients/%d %s (ratio=%.3f), "
+                "val=%d patients/%d %s, test=%d patients/%d %s",
+                args.fold, args.n_folds, args.data_seed,
+                len(train_patient_ids), len(train_dataset), unit_name, args.train_ratio,
+                len(val_patient_ids), len(val_dataset), unit_name,
+                len(test_patient_ids), len(test_dataset), unit_name,
+            )
 
     train_labels = collect_labels(train_dataset)
     if multi_label:
@@ -838,6 +962,11 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             },
         )
 
+    collate_fn = (
+        collate_variable_depth_volumes
+        if args.dataset == "cq500" and args.n_slices is None
+        else None
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -845,6 +974,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=collate_fn,
     )
     val_loader = (
         DataLoader(
@@ -853,6 +983,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
+            collate_fn=collate_fn,
         )
         if val_dataset is not None
         else None
@@ -864,6 +995,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
+            collate_fn=collate_fn,
         )
         if test_dataset is not None
         else None
@@ -915,11 +1047,19 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     optimizer = torch.optim.AdamW(
         trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
     )
+    use_plateau_scheduler = bool(getattr(args, "reduce_lr_on_plateau", True))
+    scheduler_metric = args.early_stopping_metric
     scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=args.min_lr
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min" if scheduler_metric == "bce_loss" else "max",
+            factor=getattr(args, "lr_plateau_factor", 0.1),
+            patience=getattr(args, "lr_plateau_patience", 3),
+            threshold=getattr(args, "lr_plateau_threshold", 0.005),
+            threshold_mode="abs",
+            min_lr=args.min_lr,
         )
-        if args.cosine_lr
+        if use_plateau_scheduler
         else None
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -940,7 +1080,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
 
     logger.info(
         "dataset=%s adni_task=%s encoder=%s features=%s n_cls_tokens=%d aggregator=%s "
-        "n_slices=%d "
+        "n_slices=%s "
         "encoder_training=%s lora_r=%s freeze_epochs=%d num_classes=%d "
         "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
         args.dataset,
@@ -964,6 +1104,16 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         args.d_model,
         loss_name,
     )
+    if scheduler is not None:
+        logger.info(
+            "LR scheduler=ReduceLROnPlateau metric=%s factor=%.3g patience=%d "
+            "threshold=%.3g min_lr=%.3g",
+            scheduler_metric,
+            getattr(args, "lr_plateau_factor", 0.1),
+            getattr(args, "lr_plateau_patience", 3),
+            getattr(args, "lr_plateau_threshold", 0.005),
+            args.min_lr,
+        )
     for epoch in range(1, args.epochs + 1):
         epochs_trained = epoch
         if (
@@ -980,9 +1130,17 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         running_loss = 0.0
         correct = 0
         seen = 0
-        for images, targets in train_loader:
+        for batch in train_loader:
+            images, targets, slice_mask = _unpack_volume_batch(batch)
             images = images.to(device, non_blocking=True)
-            logits = model(images)
+            logits = model(
+                images,
+                slice_mask=(
+                    slice_mask.to(device, non_blocking=True)
+                    if slice_mask is not None
+                    else None
+                ),
+            )
             if binary or multi_label:
                 targets = targets.to(device, non_blocking=True).float()
                 if bce_pos_weight is None:
@@ -1016,8 +1174,6 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
                 train_loss,
                 train_accuracy,
             )
-            if scheduler is not None:
-                scheduler.step()
             continue
 
         val_loss, val_f1, val_auroc = evaluate(
@@ -1107,7 +1263,23 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             )
             break
         if scheduler is not None:
-            scheduler.step()
+            scheduler_value = validation_metrics[scheduler_metric]
+            if math.isfinite(scheduler_value):
+                lr_before_step = optimizer.param_groups[0]["lr"]
+                scheduler.step(scheduler_value)
+                lr_after_step = optimizer.param_groups[0]["lr"]
+                if lr_after_step < lr_before_step:
+                    logger.info(
+                        "Reduced learning rate after validation %s plateau: %.6g → %.6g",
+                        scheduler_metric,
+                        lr_before_step,
+                        lr_after_step,
+                    )
+            else:
+                logger.warning(
+                    "Skipping ReduceLROnPlateau step because validation %s is NaN",
+                    scheduler_metric,
+                )
 
     if stopped_early:
         best = torch.load(best_path, map_location=device, weights_only=False)

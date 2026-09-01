@@ -41,6 +41,15 @@ AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
 
+
+def _optional_n_slices(value: object) -> Optional[int]:
+    """Parse a positive slice count or the explicit ``null``/``none`` value."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"null", "none"}:
+        return None
+    return int(value)
+
 def _yaml_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict[str, object]:
     """Load and type-check parser defaults from a YAML mapping."""
     try:
@@ -135,7 +144,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Metadata CSV (ADNI or CQ500 reads.csv; ignored by Duke and OrganMNIST3D)",
     )
     parser.add_argument("--scan", type=str, default="pre")
-    parser.add_argument("--n-slices", type=int, default=8)
+    parser.add_argument(
+        "--n-slices",
+        type=_optional_n_slices,
+        default=8,
+        help=(
+            "Number of depth slices after resampling; use null only for CQ500 "
+            "to retain native depth (capped at 128)"
+        ),
+    )
+    parser.add_argument(
+        "--cq500-max-slices",
+        type=int,
+        default=128,
+        help=(
+            "Resampling target for native-depth CQ500 volumes longer than this "
+            "limit when --n-slices is null (default: 128)"
+        ),
+    )
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument(
         "--include-bilateral",
@@ -208,15 +234,45 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
+        "--reduce-lr-on-plateau",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reduce the learning rate when the selected validation metric plateaus "
+            "(default; use --no-reduce-lr-on-plateau for a fixed learning rate)"
+        ),
+    )
+    parser.add_argument(
+        "--lr-plateau-factor",
+        type=float,
+        default=0.1,
+        help="Factor applied when ReduceLROnPlateau triggers (default: 0.1)",
+    )
+    parser.add_argument(
+        "--lr-plateau-patience",
+        type=int,
+        default=3,
+        help="Validation epochs without improvement before reducing LR (default: 3)",
+    )
+    parser.add_argument(
+        "--lr-plateau-threshold",
+        type=float,
+        default=0.005,
+        help="Absolute validation-metric improvement required to reset LR patience",
+    )
+    parser.add_argument(
         "--cosine-lr",
         action="store_true",
-        help="Anneal the learning rate with a cosine schedule (disabled by default)",
+        help=(
+            "Deprecated compatibility alias for --reduce-lr-on-plateau; "
+            "cosine annealing is no longer used"
+        ),
     )
     parser.add_argument(
         "--min-lr",
         type=float,
         default=0.0,
-        help="Final learning rate for --cosine-lr (default: 0)",
+        help="Minimum learning rate allowed by ReduceLROnPlateau (default: 0)",
     )
     parser.add_argument("--hidden-dim", type=int, default=0)
     parser.add_argument(
@@ -234,6 +290,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--train-ratio", type=float, default=1.0,
         help="Class-balanced fraction of the selected training patients to use",
+    )
+    parser.add_argument(
+        "--splits-file",
+        type=Path,
+        default=None,
+        help=(
+            "Legacy JSON patient split with train, val, and test lists. When "
+            "provided, it takes precedence over --n-folds/--fold."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -345,8 +410,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "cq500": CQ500_DEFAULT_ROOT,
             "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
         }[args.dataset]
-    if args.n_slices <= 0:
+    if args.n_slices is not None and args.n_slices <= 0:
         parser.error("--n-slices must be positive")
+    if args.n_slices is None:
+        if args.dataset != "cq500":
+            parser.error("--n-slices null is supported only for CQ500")
+    if args.cq500_max_slices <= 0:
+        parser.error("--cq500-max-slices must be positive")
     if args.epochs <= 0:
         parser.error("--epochs must be positive")
     if args.min_epochs < 0:
@@ -357,8 +427,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--lr must be non-negative")
     if args.min_lr < 0:
         parser.error("--min-lr must be non-negative")
-    if args.cosine_lr and args.min_lr > args.lr:
-        parser.error("--min-lr cannot exceed --lr when --cosine-lr is enabled")
+    if args.min_lr > args.lr:
+        parser.error("--min-lr cannot exceed --lr")
+    if not 0.0 < args.lr_plateau_factor < 1.0:
+        parser.error("--lr-plateau-factor must be in (0, 1)")
+    if args.lr_plateau_patience < 0:
+        parser.error("--lr-plateau-patience must be non-negative")
+    if args.lr_plateau_threshold < 0:
+        parser.error("--lr-plateau-threshold must be non-negative")
     if args.d_model <= 0:
         parser.error("--d-model must be positive")
     if args.lora_r <= 0:
@@ -378,6 +454,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--fold must be in [0, --n-folds)")
     if not 0.0 < args.train_ratio <= 1.0:
         parser.error("--train-ratio must be in (0, 1]")
+    if args.splits_file is not None and not args.splits_file.is_file():
+        parser.error(f"--splits-file does not exist or is not a file: {args.splits_file}")
     return args
 
 

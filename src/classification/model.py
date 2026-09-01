@@ -54,7 +54,7 @@ class MultiSliceDinoModel(nn.Module):
         self,
         encoder: nn.Module,
         *,
-        n_slices: int,
+        n_slices: Optional[int],
         features: str = "cls",
         n_cls_tokens: int = 1,
         aggregator: str = "transformer",
@@ -74,8 +74,8 @@ class MultiSliceDinoModel(nn.Module):
             raise ValueError(
                 f"Unknown aggregator={aggregator!r}; choose from {AGGREGATOR_CHOICES}"
             )
-        if n_slices <= 0:
-            raise ValueError("n_slices must be positive")
+        if n_slices is not None and n_slices <= 0:
+            raise ValueError("n_slices must be positive when provided")
         if n_cls_tokens <= 0:
             raise ValueError("n_cls_tokens must be positive")
         if d_model <= 0:
@@ -94,7 +94,7 @@ class MultiSliceDinoModel(nn.Module):
             )
 
         self.encoder = encoder
-        self.n_slices = int(n_slices)
+        self.n_slices = int(n_slices) if n_slices is not None else None
         self.features = features
         # Intermediate CLS tokens are meaningful only for the CLS feature mode.
         self.n_cls_tokens = int(n_cls_tokens) if features == "cls" else 1
@@ -121,8 +121,14 @@ class MultiSliceDinoModel(nn.Module):
         )
         if aggregator == "transformer":
             self.global_token = nn.Parameter(torch.zeros(1, 1, d_model))
-            self.position_embedding = nn.Parameter(
-                torch.zeros(1, self.n_slices + 1, d_model)
+            # Fixed-depth runs retain their learned per-slice positional
+            # embeddings.  Native-depth CQ500 runs intentionally omit them:
+            # this lets the same transformer process any padded sequence
+            # length, with ``slice_mask`` determining which slices exist.
+            self.position_embedding = (
+                nn.Parameter(torch.zeros(1, self.n_slices + 1, d_model))
+                if self.n_slices is not None
+                else None
             )
             layer = nn.TransformerEncoderLayer(
                 d_model=d_model,
@@ -151,14 +157,32 @@ class MultiSliceDinoModel(nn.Module):
         if self.position_embedding is not None:
             nn.init.trunc_normal_(self.position_embedding, std=0.02)
 
-    def encode_slices(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode ``[B, S, C, H, W]`` into ``[B, S, feature_dim]``."""
+    def encode_slices(
+        self, images: torch.Tensor, *, slice_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Encode ``[B, S, C, H, W]`` into ``[B, S, feature_dim]``.
+
+        When a mask is supplied, only valid slices are sent through the
+        encoder.  The returned tensor retains its padded shape so downstream
+        aggregation can use the same mask, but its padded embeddings are zero.
+        """
         if images.ndim != 5:
             raise ValueError(f"Expected [B, S, C, H, W], got {tuple(images.shape)}")
         batch, n_slices = images.shape[:2]
-        if n_slices != self.n_slices:
+        if self.n_slices is not None and n_slices != self.n_slices:
             raise ValueError(f"Expected {self.n_slices} slices, got {n_slices}")
         flat = images.reshape(batch * n_slices, *images.shape[2:])
+        valid_mask: Optional[torch.Tensor] = None
+        if slice_mask is not None:
+            if slice_mask.shape != (batch, n_slices):
+                raise ValueError(
+                    "slice_mask must have shape [B, S], got "
+                    f"{tuple(slice_mask.shape)} for images {tuple(images.shape)}"
+                )
+            valid_mask = slice_mask.to(device=images.device, dtype=torch.bool).reshape(-1)
+            if not bool(valid_mask.any()):
+                raise ValueError("At least one valid slice is required")
+            flat = flat[valid_mask]
         context = (
             torch.enable_grad()
             if self.encoder_training == "lora" and self.training
@@ -194,9 +218,17 @@ class MultiSliceDinoModel(nn.Module):
                 else:
                     tokens = patches
                 token = self.patch_pool(tokens)
+        if valid_mask is not None:
+            # Scatter only embeddings back into the padded layout; the DINO
+            # forward pass above received ``valid_mask.sum()`` images, not B*S.
+            padded_token = token.new_zeros((batch * n_slices, token.shape[-1]))
+            padded_token[valid_mask] = token
+            token = padded_token
         return token.reshape(batch, n_slices, -1)
 
-    def extract_volume_token(self, images: torch.Tensor) -> torch.Tensor:
+    def extract_volume_token(
+        self, images: torch.Tensor, *, slice_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Return one MST volume representation for each input volume.
 
         For the transformer aggregator this is the output global token.  The
@@ -205,17 +237,55 @@ class MultiSliceDinoModel(nn.Module):
         makes inference code able to use the exact representation consumed by
         the classifier without duplicating the MST forward pass.
         """
-        slices = self.slice_projection(self.encode_slices(images))
+        slices = self.slice_projection(self.encode_slices(images, slice_mask=slice_mask))
         if self.aggregator == "mean":
+            if slice_mask is not None:
+                if slice_mask.shape != slices.shape[:2]:
+                    raise ValueError(
+                        "slice_mask must have shape [B, S], got "
+                        f"{tuple(slice_mask.shape)} for slice tokens {tuple(slices.shape)}"
+                    )
+                weights = slice_mask.to(dtype=slices.dtype, device=slices.device)
+                if not bool(weights.any(dim=1).all()):
+                    raise ValueError("Every volume must contain at least one valid slice")
+                return (slices * weights.unsqueeze(-1)).sum(dim=1) / weights.sum(
+                    dim=1, keepdim=True
+                )
             return slices.mean(dim=1)
-        assert self.global_token is not None and self.transformer is not None
+        if self.global_token is None or self.transformer is None:
+            raise RuntimeError("Transformer aggregator was not initialized")
         global_token = self.global_token.expand(slices.shape[0], -1, -1)
         sequence = torch.cat([global_token, slices], dim=1)
-        sequence = sequence + self.position_embedding
-        return self.transformer(sequence)[:, 0]
+        if self.position_embedding is not None:
+            sequence = sequence + self.position_embedding
+        padding_mask = None
+        if slice_mask is not None:
+            if slice_mask.shape != slices.shape[:2]:
+                raise ValueError(
+                    "slice_mask must have shape [B, S], got "
+                    f"{tuple(slice_mask.shape)} for slice tokens {tuple(slices.shape)}"
+                )
+            valid_slices = slice_mask.to(device=slices.device, dtype=torch.bool)
+            if not bool(valid_slices.any(dim=1).all()):
+                raise ValueError("Every volume must contain at least one valid slice")
+            # The prepended global token is never padding.  Masking is
+            # essential for native-depth batches, whose shorter volumes are
+            # zero-padded by the collate function.
+            padding_mask = torch.cat(
+                [
+                    torch.zeros(
+                        (slices.shape[0], 1), dtype=torch.bool, device=slices.device
+                    ),
+                    ~valid_slices,
+                ],
+                dim=1,
+            )
+        return self.transformer(sequence, src_key_padding_mask=padding_mask)[:, 0]
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        volume = self.extract_volume_token(images)
+    def forward(
+        self, images: torch.Tensor, *, slice_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        volume = self.extract_volume_token(images, slice_mask=slice_mask)
         logits = self.classifier(self.output_norm(volume))
         if self.num_classes == 1:
             return logits.squeeze(-1)

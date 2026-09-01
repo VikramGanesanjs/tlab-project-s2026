@@ -77,6 +77,33 @@ class TestPatientStratifiedFolds(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least 3"):
             make_patient_stratified_folds({"a": 0, "b": 1}, n_folds=2)
 
+    def test_optional_group_balancing_preserves_label_and_fold_counts(self):
+        labels = {f"patient-{index:02d}": index % 2 for index in range(30)}
+        groups = {
+            patient_id: f"site-{index % 5}"
+            for index, patient_id in enumerate(labels)
+        }
+        plain = make_patient_stratified_folds(labels, n_folds=5, seed=0)
+        balanced = make_patient_stratified_folds(
+            labels, n_folds=5, seed=0, patient_groups=groups
+        )
+
+        self.assertEqual(
+            [len(fold) for fold in balanced.folds],
+            [len(fold) for fold in plain.folds],
+        )
+        for label in (0, 1):
+            self.assertEqual(
+                [sum(labels[patient] == label for patient in fold) for fold in balanced.folds],
+                [sum(labels[patient] == label for patient in fold) for fold in plain.folds],
+            )
+        self.assertEqual(
+            balanced,
+            make_patient_stratified_folds(
+                labels, n_folds=5, seed=0, patient_groups=groups
+            ),
+        )
+
     def test_train_ratio_selects_an_exact_class_balanced_subset(self):
         labels = {
             **{f"negative-{index}": 0 for index in range(9)},

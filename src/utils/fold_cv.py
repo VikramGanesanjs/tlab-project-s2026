@@ -42,6 +42,94 @@ def _validate_fold_count(n_folds: int, n_patients: int) -> int:
     return n_folds
 
 
+def _balance_patient_groups(
+    folds: list[list[str]],
+    patient_labels: Mapping[str, Hashable],
+    patient_groups: Mapping[str, Hashable],
+) -> None:
+    """Improve group balance with swaps that preserve label and fold counts."""
+    n_folds = len(folds)
+    group_totals: dict[Hashable, int] = defaultdict(int)
+    group_counts: dict[Hashable, list[int]] = defaultdict(lambda: [0] * n_folds)
+    for fold_index, fold in enumerate(folds):
+        for patient_id in fold:
+            group = patient_groups[patient_id]
+            group_totals[group] += 1
+            group_counts[group][fold_index] += 1
+    group_targets = {group: total / n_folds for group, total in group_totals.items()}
+
+    def swap_delta(
+        first_fold: int,
+        second_fold: int,
+        first_group: Hashable,
+        second_group: Hashable,
+    ) -> float:
+        if first_group == second_group:
+            return 0.0
+        delta = 0.0
+        for group, first_change, second_change in (
+            (first_group, -1, 1),
+            (second_group, 1, -1),
+        ):
+            counts = group_counts[group]
+            target = group_targets[group]
+            before = (counts[first_fold] - target) ** 2 + (
+                counts[second_fold] - target
+            ) ** 2
+            after = (counts[first_fold] + first_change - target) ** 2 + (
+                counts[second_fold] + second_change - target
+            ) ** 2
+            delta += after - before
+        return delta
+
+    labels = _sorted_labels(set(patient_labels.values()))
+    for _ in range(max(len(patient_labels) * 10, 1)):
+        best: Optional[tuple[float, int, int, str, str]] = None
+        for label in labels:
+            for first_fold in range(n_folds):
+                first_patients = sorted(
+                    patient_id
+                    for patient_id in folds[first_fold]
+                    if patient_labels[patient_id] == label
+                )
+                for second_fold in range(first_fold + 1, n_folds):
+                    second_patients = sorted(
+                        patient_id
+                        for patient_id in folds[second_fold]
+                        if patient_labels[patient_id] == label
+                    )
+                    for first_patient in first_patients:
+                        for second_patient in second_patients:
+                            delta = swap_delta(
+                                first_fold,
+                                second_fold,
+                                patient_groups[first_patient],
+                                patient_groups[second_patient],
+                            )
+                            candidate = (
+                                delta,
+                                first_fold,
+                                second_fold,
+                                first_patient,
+                                second_patient,
+                            )
+                            if delta < 0 and (best is None or candidate < best):
+                                best = candidate
+        if best is None:
+            return
+        _, first_fold, second_fold, first_patient, second_patient = best
+        first_group = patient_groups[first_patient]
+        second_group = patient_groups[second_patient]
+        folds[first_fold].remove(first_patient)
+        folds[first_fold].append(second_patient)
+        folds[second_fold].remove(second_patient)
+        folds[second_fold].append(first_patient)
+        group_counts[first_group][first_fold] -= 1
+        group_counts[first_group][second_fold] += 1
+        group_counts[second_group][first_fold] += 1
+        group_counts[second_group][second_fold] -= 1
+
+
 @dataclass(frozen=True)
 class PatientStratifiedFolds:
     """A reusable assignment of patients to stratified cross-validation folds.
@@ -119,6 +207,7 @@ def make_patient_stratified_folds(
     *,
     n_folds: int,
     seed: int = 0,
+    patient_groups: Optional[Mapping[str, Hashable]] = None,
 ) -> PatientStratifiedFolds:
     """Create patient-level folds with per-class counts differing by at most one.
 
@@ -131,6 +220,9 @@ def make_patient_stratified_folds(
         one fold for validation and another for testing.
     seed:
         Seed controlling the assignment of patients within each class.
+    patient_groups:
+        Optional secondary groups (for example, collection sites) balanced via
+        within-class swaps after the primary label-stratified assignment.
     """
     normalized_labels = {str(patient_id): label for patient_id, label in patient_labels.items()}
     if len(normalized_labels) != len(patient_labels):
@@ -138,6 +230,20 @@ def make_patient_stratified_folds(
     if not normalized_labels:
         raise ValueError("Cannot create folds for an empty patient set")
     n_folds = _validate_fold_count(n_folds, len(normalized_labels))
+    normalized_groups: Optional[dict[str, Hashable]] = None
+    if patient_groups is not None:
+        normalized_groups = {
+            str(patient_id): group for patient_id, group in patient_groups.items()
+        }
+        if set(normalized_groups) != set(normalized_labels):
+            raise ValueError("patient_groups must contain exactly the patient_labels IDs")
+        for patient_id, group in normalized_groups.items():
+            try:
+                hash(group)
+            except TypeError as error:
+                raise ValueError(
+                    f"Group for patient {patient_id!r} must be hashable, got {group!r}"
+                ) from error
 
     patients_by_label: dict[Hashable, list[str]] = defaultdict(list)
     for patient_id, label in normalized_labels.items():
@@ -160,6 +266,9 @@ def make_patient_stratified_folds(
         for offset, patient_id in enumerate(patients):
             folds[(start + offset) % n_folds].append(patient_id)
 
+    if normalized_groups is not None:
+        _balance_patient_groups(folds, normalized_labels, normalized_groups)
+
     return PatientStratifiedFolds(
         folds=tuple(tuple(sorted(fold)) for fold in folds),
         patient_labels=dict(sorted(normalized_labels.items())),
@@ -174,12 +283,13 @@ def make_dataset_patient_folds(
     seed: int = 0,
     patient_ids: Optional[Sequence[str]] = None,
     target_fn: Optional[Callable[[Any, int], Hashable]] = None,
+    group_fn: Optional[Callable[[Any, int], Hashable]] = None,
 ) -> PatientStratifiedFolds:
     """Create folds for a classification dataset or a selected patient subset.
 
-    Each patient's target must be consistent across all its samples.  Pass
-    ``patient_ids`` to make folds from one pre-existing classification split
-    rather than from every patient represented in ``dataset``.
+    Each patient's target (and optional group) must be consistent across all
+    its samples.  Pass ``patient_ids`` to make folds from one pre-existing
+    classification split rather than from every patient in ``dataset``.
     """
     get_patient_id = getattr(dataset, "get_patient_id", None)
     get_target = getattr(dataset, "get_target", None)
@@ -195,6 +305,7 @@ def make_dataset_patient_folds(
         else None
     )
     patient_labels: dict[str, Hashable] = {}
+    patient_groups: dict[str, Hashable] = {}
     for index in range(len(dataset)):
         patient_id = str(get_patient_id(index))
         if selected_patients is not None and patient_id not in selected_patients:
@@ -212,6 +323,20 @@ def make_dataset_patient_folds(
                 f"Patient {patient_id!r} has inconsistent class labels: "
                 f"{previous_label!r} and {label!r}"
             )
+        if group_fn is not None:
+            group = group_fn(dataset, index)
+            try:
+                hash(group)
+            except TypeError as error:
+                raise ValueError(
+                    f"Group for patient {patient_id!r} must be hashable, got {group!r}"
+                ) from error
+            previous_group = patient_groups.setdefault(patient_id, group)
+            if previous_group != group:
+                raise ValueError(
+                    f"Patient {patient_id!r} has inconsistent groups: "
+                    f"{previous_group!r} and {group!r}"
+                )
 
     if selected_patients is not None:
         missing_patients = selected_patients - set(patient_labels)
@@ -220,7 +345,12 @@ def make_dataset_patient_folds(
                 "Some requested patient IDs are absent from the dataset: "
                 f"{sorted(missing_patients)[:5]}"
             )
-    return make_patient_stratified_folds(patient_labels, n_folds=n_folds, seed=seed)
+    return make_patient_stratified_folds(
+        patient_labels,
+        n_folds=n_folds,
+        seed=seed,
+        patient_groups=patient_groups if group_fn is not None else None,
+    )
 
 
 def _validate_train_ratio(train_ratio: float) -> float:

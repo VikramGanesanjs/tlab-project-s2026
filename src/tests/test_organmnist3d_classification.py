@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -12,7 +13,7 @@ from torch import nn
 
 from classification.model import MultiSliceDinoModel
 from classification.run import parse_args
-from classification.train import build_dataset, task_config, train
+from classification.train import build_dataset, saved_split_patient_ids, task_config, train
 from utils import load_dinov3
 
 
@@ -22,6 +23,20 @@ class _ToyEncoder(nn.Module):
     def forward_features(self, images: torch.Tensor):
         pooled = images.mean(dim=(1, 2, 3), keepdim=False).unsqueeze(1)
         return {"x_norm_clstoken": pooled.repeat(1, self.embed_dim)}
+
+
+class _ToyPatientDataset:
+    def __init__(self, patient_ids: list[str]) -> None:
+        self.patient_ids = patient_ids
+
+    def __len__(self) -> int:
+        return len(self.patient_ids)
+
+    def get_patient_id(self, index: int) -> str:
+        return self.patient_ids[index]
+
+    def get_target(self, index: int) -> int:
+        return index % 2
 
 
 class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
@@ -105,6 +120,72 @@ class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
                 num_classes=num_classes,
             )
             self.assertEqual(tuple(model(images.unsqueeze(0)).shape), (1, 11))
+
+    def test_native_depth_transformer_ignores_padded_slices(self) -> None:
+        """A native-depth CQ500 batch can use the transformer aggregator."""
+        model = MultiSliceDinoModel(
+            _ToyEncoder(),
+            n_slices=None,
+            features="cls",
+            aggregator="transformer",
+            d_model=8,
+            depth=1,
+            n_heads=2,
+            ffn_dim=16,
+            dropout=0.0,
+            hidden_dim=8,
+        ).eval()
+        short_volume = torch.randn(2, 3, 4, 4)
+        long_volume = torch.randn(4, 3, 4, 4)
+        padded_batch = torch.zeros(2, 4, 3, 4, 4)
+        padded_batch[0, :2] = short_volume
+        padded_batch[1] = long_volume
+        slice_mask = torch.tensor([[True, True, False, False], [True, True, True, True]])
+
+        with torch.no_grad():
+            standalone = model(short_volume.unsqueeze(0))
+            batched = model(padded_batch, slice_mask=slice_mask)
+
+        self.assertIsNone(model.position_embedding)
+        torch.testing.assert_close(batched[0], standalone[0])
+
+    def test_cq500_null_depth_accepts_transformer_aggregator(self) -> None:
+        args = parse_args(["--dataset", "cq500", "--n-slices", "null"])
+
+        self.assertIsNone(args.n_slices)
+        self.assertEqual(args.slice_aggregator, "transformer")
+
+    def test_legacy_splits_file_overrides_fold_assignment(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            split_file = Path(temporary_directory) / "splits.json"
+            split_file.write_text(
+                json.dumps(
+                    {
+                        "dataset": "cq500",
+                        "splits": {
+                            "train": ["patient-b", "patient-a"],
+                            "val": ["patient-c"],
+                            "test": ["patient-d"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parse_args(
+                ["--dataset", "cq500", "--splits-file", str(split_file)]
+            )
+
+            patient_ids = saved_split_patient_ids(
+                args,
+                _ToyPatientDataset(
+                    ["patient-a", "patient-b", "patient-c", "patient-d"]
+                ),
+            )
+
+        self.assertEqual(
+            patient_ids,
+            (["patient-a", "patient-b"], ["patient-c"], ["patient-d"]),
+        )
 
     def test_training_uses_official_splits_without_patient_partitioning(self) -> None:
         with TemporaryDirectory() as temporary_directory:

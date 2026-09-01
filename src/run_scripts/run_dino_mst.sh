@@ -1,13 +1,13 @@
 #!/bin/bash
 
-#SBATCH --job-name=dinov3_mst_ssl_finetune
+#SBATCH --job-name=cq500_cls_transformer
 #SBATCH -p gpu
 #SBATCH --gpus=l40s:1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=adni_highres.err  ## error log file
-#SBATCH --output=adni_highres.out ## output log file
+#SBATCH --error=cq500_cls_transformer.err  ## error log file
+#SBATCH --output=cq500_cls_transformer.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
@@ -17,4 +17,4 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python -m classification.run --params-file /common/ganesanv/tlab/runs/adni_benchmark/ssl_finetune_highres.yaml
+python -m classification.run --params-file /common/ganesanv/tlab/runs/cq500/transformer.yaml

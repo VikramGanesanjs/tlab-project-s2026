@@ -29,6 +29,9 @@ _REQUIRED_LABEL_COLUMNS = ("name", "R1:ICH", *ICH_SUBTYPE_COLUMNS)
 CQ500_TASK_CHOICES = ("ich", "subtype")
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+# Native-depth batches are padded to their longest volume.  Cap unusually long
+# acquisitions so one outlier cannot inflate every tensor in the batch.
+MAX_NATIVE_SLICES = 128
 
 
 @dataclass(frozen=True)
@@ -232,13 +235,45 @@ def _zscore_normalize(volume: np.ndarray) -> np.ndarray:
     return ((normalized - float(normalized.mean())) / max(float(normalized.std()), 1e-6)).astype(np.float32)
 
 
-def _resample_volume(volume: np.ndarray, n_slices: int, image_size: int) -> torch.Tensor:
-    if n_slices <= 0 or image_size <= 0:
-        raise ValueError("n_slices and image_size must be positive")
+def _resample_volume(
+    volume: np.ndarray,
+    n_slices: Optional[int],
+    image_size: int,
+    cq500_max_slices: int = MAX_NATIVE_SLICES,
+) -> torch.Tensor:
+    """Resize in-plane and, when requested, resample the depth dimension.
+
+    Native-depth mode retains all depths up to ``cq500_max_slices`` and uses
+    ADNI-style trilinear interpolation only for longer volumes.
+    """
+    if n_slices is not None and n_slices <= 0:
+        raise ValueError("n_slices must be positive when provided")
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
+    if cq500_max_slices <= 0:
+        raise ValueError("cq500_max_slices must be positive")
     tensor = torch.from_numpy(np.ascontiguousarray(volume)).permute(2, 0, 1)
-    tensor = tensor.unsqueeze(0).unsqueeze(0)
-    tensor = F.interpolate(tensor, size=(n_slices, volume.shape[0], volume.shape[1]), mode="trilinear", align_corners=False)
-    tensor = F.interpolate(tensor.squeeze(0), size=(image_size, image_size), mode="bilinear", align_corners=False)
+    output_depth = (
+        int(n_slices)
+        if n_slices is not None
+        else min(int(tensor.shape[0]), int(cq500_max_slices))
+    )
+    if output_depth != tensor.shape[0]:
+        tensor = F.interpolate(
+            tensor.unsqueeze(0).unsqueeze(0),
+            size=(output_depth, volume.shape[0], volume.shape[1]),
+            mode="trilinear",
+            align_corners=False,
+        ).squeeze(0)
+    else:
+        tensor = tensor.unsqueeze(0)
+    # In native-depth mode this preserves z exactly unless it exceeds the cap.
+    tensor = F.interpolate(
+        tensor,
+        size=(image_size, image_size),
+        mode="bilinear",
+        align_corners=False,
+    )
     return tensor.squeeze(0)
 
 
@@ -506,7 +541,10 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
 
     ``task='ich'`` returns an integer binary target from ``R1:ICH``.  For
     ``task='subtype'`` only ICH-positive patients are retained and the target is
-    a five-element float32 multi-hot vector in ``ICH_SUBTYPES`` order.
+    a five-element float32 multi-hot vector in ``ICH_SUBTYPES`` order.  Set
+    ``n_slices=None`` to preserve each volume's native depth up to
+    ``cq500_max_slices`` while still resizing its in-plane dimensions.  Longer
+    volumes are resampled to that limit.
     """
 
     def __init__(
@@ -515,7 +553,8 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
         *,
         task: str = "ich",
         patient_ids: Optional[Sequence[str]] = None,
-        n_slices: int = 32,
+        n_slices: Optional[int] = 32,
+        cq500_max_slices: int = MAX_NATIVE_SLICES,
         image_size: int = 224,
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
@@ -524,11 +563,17 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
         augment: bool = True,
         csv_path: Optional[Union[str, Path]] = None,
     ) -> None:
-        if n_slices <= 0 or image_size <= 0:
-            raise ValueError("n_slices and image_size must be positive")
+        if n_slices is not None and n_slices <= 0:
+            raise ValueError("n_slices must be positive when provided")
+        if image_size <= 0:
+            raise ValueError("image_size must be positive")
+        if cq500_max_slices <= 0:
+            raise ValueError("cq500_max_slices must be positive")
         self.task_spec = resolve_cq500_task(task)
         self.task, self.class_names = self.task_spec.name, self.task_spec.class_names
-        self.n_slices, self.image_size = int(n_slices), int(image_size)
+        self.n_slices = int(n_slices) if n_slices is not None else None
+        self.cq500_max_slices = int(cq500_max_slices)
+        self.image_size = int(image_size)
         if transforms is None and transform is None and augment:
             transform = build_cq500_volume_transform(augment=True)
         super().__init__(root, csv_path=csv_path, patient_ids=patient_ids, transforms=transforms, transform=transform, target_transform=target_transform, volume_cache_size=volume_cache_size)
@@ -547,7 +592,12 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, Any]:
         record = self._records[index]
         volume = self._volume_cache.get(record.volume_path)
-        image = _resample_volume(_zscore_normalize(volume), self.n_slices, self.image_size).unsqueeze(0)
+        image = _resample_volume(
+            _zscore_normalize(volume),
+            self.n_slices,
+            self.image_size,
+            self.cq500_max_slices,
+        ).unsqueeze(0)
         target: Any = self.get_target(index)
         if self.transforms is not None:
             image, target = self.transforms(image, target)

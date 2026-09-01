@@ -21,6 +21,7 @@ from classification.train import (  # noqa: E402
     _cq500_patient_stratum,
     _require_dataset_patient_ids,
     build_dataset,
+    collate_variable_depth_volumes,
     collect_labels,
     collect_predictions,
     compute_classification_metrics,
@@ -28,6 +29,7 @@ from classification.train import (  # noqa: E402
     is_multilabel_task,
     is_binary_task,
     save_run_summary,
+    saved_split_patient_ids,
     task_config,
 )
 from datasets.adni import DEFAULT_ROOT as ADNI_DEFAULT_ROOT  # noqa: E402
@@ -58,6 +60,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--csv-path", type=Path, default=None)
+    parser.add_argument(
+        "--splits-file",
+        type=Path,
+        default=None,
+        help="Override the checkpoint's legacy JSON patient split file",
+    )
     parser.add_argument("--scan", default="pre")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -68,6 +76,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--batch-size must be positive")
     if args.num_workers < 0:
         parser.error("--num-workers must be non-negative")
+    if args.splits_file is not None and not args.splits_file.is_file():
+        parser.error(f"--splits-file does not exist or is not a file: {args.splits_file}")
     return args
 
 
@@ -90,6 +100,13 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
     }.get(dataset)
     if data_root is None:
         raise ValueError(f"Unsupported dataset in checkpoint: {dataset!r}")
+    if "n_slices" not in checkpoint:
+        raise ValueError("Checkpoint does not contain required setting 'n_slices'")
+    n_slices = checkpoint["n_slices"]
+    if n_slices is not None:
+        n_slices = int(n_slices)
+    if n_slices is None and dataset != "cq500":
+        raise ValueError("n_slices=None checkpoints are supported only for CQ500")
     return argparse.Namespace(
         head=cli_args.head,
         output=cli_args.output,
@@ -103,7 +120,8 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         dataset=dataset,
         adni_task=checkpoint.get("adni_task") or "cn_ad",
         cq500_task=checkpoint.get("cq500_task") or "ich",
-        n_slices=int(_value(checkpoint, "n_slices")),
+        n_slices=n_slices,
+        cq500_max_slices=int(checkpoint.get("cq500_max_slices", 128)),
         image_size=int(_value(checkpoint, "image_size")),
         include_bilateral=bool(checkpoint.get("include_bilateral", False)),
         augment=False,
@@ -130,15 +148,24 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         fold=int(checkpoint.get("fold", 0)),
         data_seed=int(checkpoint.get("data_seed", 0)),
         train_ratio=float(checkpoint.get("train_ratio", 1.0)),
+        splits_file=(
+            cli_args.splits_file
+            if cli_args.splits_file is not None
+            else Path(checkpoint["splits_file"])
+            if checkpoint.get("splits_file") is not None
+            else None
+        ),
         seed=0,
     )
 
 
 def _split_patient_ids(args: argparse.Namespace) -> tuple[list[str], list[str], list[str]]:
-    """Recreate the checkpoint's patient-level CV assignment."""
+    """Recreate the checkpoint's saved split or patient-level CV assignment."""
     split_dataset = build_dataset(
         args, augment=False, split="all" if args.dataset == "organmnist3d" else None
     )
+    if args.splits_file is not None:
+        return saved_split_patient_ids(args, split_dataset)
     folds = make_dataset_patient_folds(
         split_dataset,
         n_folds=args.n_folds,
@@ -240,9 +267,14 @@ def evaluate_head(cli_args: argparse.Namespace) -> Path:
         _require_dataset_patient_ids(val_dataset, val_ids, split_name="validation")
         _require_dataset_patient_ids(test_dataset, test_ids, split_name="test")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True) if val_dataset is not None else None
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True) if test_dataset is not None else None
+    collate_fn = (
+        collate_variable_depth_volumes
+        if args.dataset == "cq500" and args.n_slices is None
+        else None
+    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn) if val_dataset is not None else None
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn) if test_dataset is not None else None
     if args.dataset != "organmnist3d":
         _assert_loader_patient_disjoint(train_loader, val_loader, test_loader)
 
