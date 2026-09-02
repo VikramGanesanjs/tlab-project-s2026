@@ -206,6 +206,7 @@ class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
                     "11",
                     "--num-workers",
                     "0",
+                    "--benchmark",
                     "--epochs",
                     "1",
                     "--min-epochs",
@@ -231,3 +232,25 @@ class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
                     train(args, torch.device("cpu"), root / "checkpoints")
             self.assertTrue((root / "checkpoints" / "best_mst.pt").is_file())
             self.assertTrue((root / "checkpoints" / "last_mst.pt").is_file())
+            summary = json.loads(
+                (root / "checkpoints" / "run_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(len(summary["epoch_benchmarks"]), 1)
+            benchmark = summary["epoch_benchmarks"][0]
+            self.assertEqual(benchmark["epoch"], 1)
+            for name in (
+                "data_loading_s",
+                "host_to_device_s",
+                "dino_forward_s",
+                "rest_network_forward_s",
+                "backward_optimizer_s",
+                "validation_s",
+                "train_wall_s",
+                "epoch_wall_s",
+                "process_peak_rss_mb",
+            ):
+                self.assertIn(name, benchmark)
+                self.assertGreaterEqual(benchmark[name], 0.0)
+            self.assertTrue((root / "checkpoints" / "epoch_benchmarks.json").is_file())

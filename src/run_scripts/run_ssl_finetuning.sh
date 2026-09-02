@@ -20,6 +20,7 @@ python -m dinov3.run.submit \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \
-  --output-dir "${PROJECT_ROOT}/runs/ssl_finetune_ablations/no_croco_loss" \
+  --output-dir "${PROJECT_ROOT}/runs/ssl_finetune_ablations/patients/0.6/1" \
   "${PROJECT_ROOT}/src/ssl_finetuning/train.py" \
-  --config-file "/common/ganesanv/tlab/runs/ssl_finetune_ablations/no_croco_loss.yaml"
+  --config-file "/common/ganesanv/tlab/runs/ssl_finetune_ablations/train_ratio/0.6.yaml" \
+  train.fold=1

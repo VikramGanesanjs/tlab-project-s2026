@@ -13,6 +13,7 @@ import sys
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 _MODULE_DIR = Path(__file__).resolve().parent
 _SRC_DIR = _MODULE_DIR.parent
 _DINOV3_DIR = _SRC_DIR.parent / "opt" / "dinov3"
@@ -44,6 +45,10 @@ from dinov3.logging import MetricLogger, SmoothedValue, setup_logging
 from dinov3.train.cosine_lr_scheduler import CosineScheduler
 
 from datasets.adni import ADNIPairedSliceDataset, DEFAULT_ROOT as ADNI_DEFAULT_ROOT
+from datasets.cq500 import (
+    CQ500PairedSliceDataset,
+    DEFAULT_ROOT as CQ500_DEFAULT_ROOT,
+)
 from datasets.duke import DukeBreastMRIDataset, PairToDinoGlobalCrops
 from datasets.duke.dataset import _DEFAULT_OUT_ROOT as DUKE_DEFAULT_ROOT
 
@@ -401,12 +406,24 @@ def _adni_patient_split_stratum(dataset, index):
     return {"CN": 0, "MCI": 1, "AD": 2}.get(diagnosis)
 
 
+def _cq500_patient_split_stratum(dataset, index):
+    """Return a hashable CQ500 task label for patient-level folds."""
+    target = dataset.get_target(index)
+    if isinstance(target, torch.Tensor):
+        target = target.detach().cpu().tolist()
+    if isinstance(target, np.ndarray):
+        target = target.tolist()
+    if isinstance(target, (list, tuple)):
+        return tuple(int(value) for value in target)
+    return int(target)
+
+
 def _build_train_patient_subset(cfg, dataset, dataset_name):
-    stratum_fn = (
-        _adni_patient_split_stratum
-        if dataset_name == "adni"
-        else _duke_patient_split_stratum
-    )
+    stratum_fn = {
+        "adni": _adni_patient_split_stratum,
+        "cq500": _cq500_patient_split_stratum,
+        "duke": _duke_patient_split_stratum,
+    }[dataset_name]
     folds = make_dataset_patient_folds(
         dataset,
         n_folds=int(cfg.train.n_folds),
@@ -459,8 +476,21 @@ def build_data_loader_from_cfg(
             image_size=cfg.crops.global_crops_size,
             seed=cfg.train.seed,
         )
+    elif dataset_name == "cq500":
+        root = data_root or CQ500_DEFAULT_ROOT
+        dataset = CQ500PairedSliceDataset(
+            root=root,
+            csv_path=root / "reads.csv",
+            task=getattr(cfg.train, "cq500_task", "ich"),
+            max_distance=cfg.train.max_distance,
+            transform=identity_transform,
+            image_size=cfg.crops.global_crops_size,
+            seed=cfg.train.seed,
+        )
     else:
-        raise ValueError(f"Unknown paired dataset={dataset_name!r}; expected 'adni' or 'duke'")
+        raise ValueError(
+            f"Unknown paired dataset={dataset_name!r}; expected 'adni', 'cq500', or 'duke'"
+        )
 
     dataset = _build_train_patient_subset(cfg, dataset, dataset_name)
     pair_transform = PairToDinoGlobalCrops(model.build_data_augmentation_dino(cfg))

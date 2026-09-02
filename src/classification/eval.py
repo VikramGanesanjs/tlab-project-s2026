@@ -35,6 +35,7 @@ from classification.train import (  # noqa: E402
 from datasets.adni import DEFAULT_ROOT as ADNI_DEFAULT_ROOT  # noqa: E402
 from datasets.cq500 import DEFAULT_ROOT as CQ500_DEFAULT_ROOT  # noqa: E402
 from datasets.organmnist3d import DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT  # noqa: E402
+from datasets.breastdm import DEFAULT_ROOT as BREASTDM_DEFAULT_ROOT  # noqa: E402
 from utils.load_dinov3 import (  # noqa: E402
     DINOV3_REPO,
     REPO_ROOT,
@@ -97,6 +98,7 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         "adni": ADNI_DEFAULT_ROOT,
         "cq500": CQ500_DEFAULT_ROOT,
         "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
+        "breastdm": BREASTDM_DEFAULT_ROOT,
     }.get(dataset)
     if data_root is None:
         raise ValueError(f"Unsupported dataset in checkpoint: {dataset!r}")
@@ -254,7 +256,7 @@ def evaluate_head(cli_args: argparse.Namespace) -> Path:
         raise ValueError(f"{cli_args.head} is not a classification MST checkpoint")
     args = _evaluation_args(cli_args, checkpoint)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    if args.dataset == "organmnist3d":
+    if args.dataset in {"organmnist3d", "breastdm"}:
         train_dataset = build_dataset(args, augment=False, split="train")
         val_dataset = build_dataset(args, augment=False, split="val")
         test_dataset = build_dataset(args, augment=False, split="test")

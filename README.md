@@ -2,6 +2,24 @@
 
 ## Adapter Learning of DINO Vision Foundation Models for Medical Images
 
+### Classification performance benchmarking
+
+Pass `--benchmark` to `python -m classification.run` to record a breakdown for
+every completed epoch. The console reports DataLoader wait time, host-to-device
+transfer, DINO encoder forward passes, the multi-slice transformer/classifier
+forward pass, backward/optimizer work, validation wall time, and total epoch
+wall time. Results are saved incrementally to `epoch_benchmarks.json` and are
+also included in `run_summary.json`.
+
+On CUDA, the compute sections use CUDA events, so their values remain accurate
+despite asynchronous kernel launches. Each record additionally includes the
+CUDA allocator's end and peak allocated/reserved memory; `process_peak_rss_mb`
+is the peak host-memory RSS for the process (and is therefore cumulative).
+
+```bash
+python -m classification.run --dataset adni --benchmark ...
+```
+
 ### Patch-feature PCA visualization
 
 `src/utils/pca_dino_backbones.py` constructs the repository ADNI dataset, samples one

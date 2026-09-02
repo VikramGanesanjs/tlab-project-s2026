@@ -1,0 +1,44 @@
+2026-09-02 00:53:02,036 INFO __main__: Run output directory: /common/ganesanv/tlab/runs/ssl_finetune_ablations/misc_experiments/no_croco_loss/patch_cls
+2026-09-02 00:53:07,289 INFO datasets.adni.dataset: Indexed ADNI root=/common/ganesanv/tlab/data/ADNI scans=2182 patients=382 labels={'CN': 748, 'MCI': 981, 'AD': 453}
+2026-09-02 00:53:07,296 INFO datasets.adni.dataset: ADNI task=cn_ad binary=True scans=1201 labels={'CN': 748, 'AD': 453}
+2026-09-02 00:53:07,299 INFO classification.train: full dataset (scans) class distribution (n=1201):
+2026-09-02 00:53:07,299 INFO classification.train:   0 CN               748  ( 62.3%)
+2026-09-02 00:53:07,299 INFO classification.train:   1 AD               453  ( 37.7%)
+2026-09-02 00:53:07,301 INFO dinov3: Ignoring 148 split-file patients absent from the active dataset
+2026-09-02 00:53:07,301 INFO dinov3: Patient-level split for adni: train=140 patients/727 samples, val=47 patients/243 samples, test=47 patients/231 samples
+2026-09-02 00:53:15,362 INFO datasets.adni.dataset: Indexed ADNI root=/common/ganesanv/tlab/data/ADNI scans=2182 patients=382 labels={'CN': 748, 'MCI': 981, 'AD': 453}
+2026-09-02 00:53:15,368 INFO datasets.adni.dataset: ADNI task=cn_ad binary=True scans=727 labels={'CN': 459, 'AD': 268}
+2026-09-02 00:53:20,282 INFO datasets.adni.dataset: Indexed ADNI root=/common/ganesanv/tlab/data/ADNI scans=2182 patients=382 labels={'CN': 748, 'MCI': 981, 'AD': 453}
+2026-09-02 00:53:20,288 INFO datasets.adni.dataset: ADNI task=cn_ad binary=True scans=243 labels={'CN': 151, 'AD': 92}
+2026-09-02 00:53:25,140 INFO datasets.adni.dataset: Indexed ADNI root=/common/ganesanv/tlab/data/ADNI scans=2182 patients=382 labels={'CN': 748, 'MCI': 981, 'AD': 453}
+2026-09-02 00:53:25,146 INFO datasets.adni.dataset: ADNI task=cn_ad binary=True scans=231 labels={'CN': 138, 'AD': 93}
+2026-09-02 00:53:25,150 INFO classification.train: Saved split /common/ganesanv/tlab/runs/ssl_finetune_ablations/misc_experiments/base_run_no_embed/adni_patient_splits.json: train=140 patients/727 scans, val=47 patients/243 scans, test=47 patients/231 scans
+2026-09-02 00:53:25,151 INFO classification.train: train (scans) class distribution (n=727):
+2026-09-02 00:53:25,151 INFO classification.train:   0 CN               459  ( 63.1%)
+2026-09-02 00:53:25,151 INFO classification.train:   1 AD               268  ( 36.9%)
+2026-09-02 00:53:25,151 INFO classification.train: val (scans) class distribution (n=243):
+2026-09-02 00:53:25,151 INFO classification.train:   0 CN               151  ( 62.1%)
+2026-09-02 00:53:25,151 INFO classification.train:   1 AD                92  ( 37.9%)
+2026-09-02 00:53:25,151 INFO classification.train: test (scans) class distribution (n=231):
+2026-09-02 00:53:25,151 INFO classification.train:   0 CN               138  ( 59.7%)
+2026-09-02 00:53:25,151 INFO classification.train:   1 AD                93  ( 40.3%)
+2026-09-02 00:53:25,152 INFO classification.train: Verified mutually exclusive loader patients: train=140 val=47 test=47
+2026-09-02 00:53:25,632 INFO dinov3: using base=100.0 for rope new
+2026-09-02 00:53:25,632 INFO dinov3: using min_period=None for rope new
+2026-09-02 00:53:25,632 INFO dinov3: using max_period=None for rope new
+2026-09-02 00:53:25,632 INFO dinov3: using normalize_coords=separate for rope new
+2026-09-02 00:53:25,632 INFO dinov3: using shift_coords=None for rope new
+2026-09-02 00:53:25,632 INFO dinov3: using rescale_coords=2 for rope new
+2026-09-02 00:53:25,632 INFO dinov3: using jitter_coords=None for rope new
+2026-09-02 00:53:25,632 INFO dinov3: using dtype=fp32 for rope new
+2026-09-02 00:53:25,633 INFO dinov3: using mlp layer as FFN
+/home/ganesanv/.conda/envs/dinov3/lib/python3.10/site-packages/torch/distributed/checkpoint/utils.py:485: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+  return func(*args, **kwargs)
+2026-09-02 00:53:27,050 INFO merge_dcp_lora: Loaded ViT-B backbone from distributed checkpoint /common/ganesanv/tlab/runs/ssl_finetune_ablations/misc_experiments/no_croco_loss/ckpt/4999 (248 tensors); LoRA=True, storage_tokens=True, mask_k_bias=False, unfrozen_tail=0, rank=16; discarded decoder, heads, losses, and optimizer
+2026-09-02 00:53:27,242 INFO classification.train: dataset=adni adni_task=cn_ad encoder=dinov3 features=patch n_cls_tokens=1 aggregator=transformer n_slices=16 encoder_training=frozen lora_r=None freeze_epochs=0 num_classes=1 train_scans=727 val_scans=243 test_scans=231 embed_dim=768 d_model=768 loss=BCEWithLogitsLoss
+2026-09-02 00:53:27,243 INFO classification.train: LR scheduler=ReduceLROnPlateau metric=auroc factor=0.1 patience=3 threshold=0.005 min_lr=1e-06
+2026-09-02 00:55:53,194 INFO classification.train: epoch 1/20 lr=0.0001 train_bce=0.66760 train_acc=0.618 val_bce=0.66064 val_f1=0.000 val_auroc=0.603 early_stopping_auroc=0.60279 *
+2026-09-02 00:58:16,007 INFO classification.train: epoch 2/20 lr=0.0001 train_bce=0.66706 train_acc=0.625 val_bce=0.66541 val_f1=0.000 val_auroc=0.619 early_stopping_auroc=0.61877 *
+2026-09-02 01:00:39,290 INFO classification.train: epoch 3/20 lr=0.0001 train_bce=0.66246 train_acc=0.626 val_bce=0.68452 val_f1=0.000 val_auroc=0.624 early_stopping_auroc=0.62388 *
+2026-09-02 01:03:03,764 INFO classification.train: epoch 4/20 lr=0.0001 train_bce=0.66345 train_acc=0.628 val_bce=0.65849 val_f1=0.000 val_auroc=0.628 early_stopping_auroc=0.62849
+2026-09-02 01:05:23,755 INFO classification.train: epoch 5/20 lr=0.0001 train_bce=0.64935 train_acc=0.629 val_bce=0.65464 val_f1=0.245 val_auroc=0.633 early_stopping_auroc=0.63303 *

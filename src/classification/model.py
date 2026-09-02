@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -158,7 +159,11 @@ class MultiSliceDinoModel(nn.Module):
             nn.init.trunc_normal_(self.position_embedding, std=0.02)
 
     def encode_slices(
-        self, images: torch.Tensor, *, slice_mask: Optional[torch.Tensor] = None
+        self,
+        images: torch.Tensor,
+        *,
+        slice_mask: Optional[torch.Tensor] = None,
+        profiler: Optional[Any] = None,
     ) -> torch.Tensor:
         """Encode ``[B, S, C, H, W]`` into ``[B, S, feature_dim]``.
 
@@ -188,7 +193,9 @@ class MultiSliceDinoModel(nn.Module):
             if self.encoder_training == "lora" and self.training
             else torch.no_grad()
         )
-        with context:
+        with context, (
+            profiler.stage("dino_forward_s") if profiler is not None else nullcontext()
+        ):
             if self.features == "cls" and self.n_cls_tokens > 1:
                 intermediate = self.encoder.get_intermediate_layers(
                     flat,
@@ -226,18 +233,10 @@ class MultiSliceDinoModel(nn.Module):
             token = padded_token
         return token.reshape(batch, n_slices, -1)
 
-    def extract_volume_token(
-        self, images: torch.Tensor, *, slice_mask: Optional[torch.Tensor] = None
+    def _aggregate_slices(
+        self, slices: torch.Tensor, *, slice_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Return one MST volume representation for each input volume.
-
-        For the transformer aggregator this is the output global token.  The
-        mean-pool variant has no learned global token, so this instead returns
-        its mean-pooled slice representation.  Keeping the aggregation here
-        makes inference code able to use the exact representation consumed by
-        the classifier without duplicating the MST forward pass.
-        """
-        slices = self.slice_projection(self.encode_slices(images, slice_mask=slice_mask))
+        """Aggregate projected slice embeddings into one embedding per volume."""
         if self.aggregator == "mean":
             if slice_mask is not None:
                 if slice_mask.shape != slices.shape[:2]:
@@ -282,11 +281,49 @@ class MultiSliceDinoModel(nn.Module):
             )
         return self.transformer(sequence, src_key_padding_mask=padding_mask)[:, 0]
 
-    def forward(
-        self, images: torch.Tensor, *, slice_mask: Optional[torch.Tensor] = None
+    def extract_volume_token(
+        self,
+        images: torch.Tensor,
+        *,
+        slice_mask: Optional[torch.Tensor] = None,
+        profiler: Optional[Any] = None,
     ) -> torch.Tensor:
-        volume = self.extract_volume_token(images, slice_mask=slice_mask)
-        logits = self.classifier(self.output_norm(volume))
+        """Return one MST volume representation for each input volume.
+
+        For the transformer aggregator this is the output global token.  The
+        mean-pool variant has no learned global token, so this instead returns
+        its mean-pooled slice representation.  Keeping the aggregation here
+        makes inference code able to use the exact representation consumed by
+        the classifier without duplicating the MST forward pass.
+        """
+        slices = self.encode_slices(
+            images, slice_mask=slice_mask, profiler=profiler
+        )
+        with (
+            profiler.stage("rest_network_forward_s")
+            if profiler is not None
+            else nullcontext()
+        ):
+            return self._aggregate_slices(
+                self.slice_projection(slices), slice_mask=slice_mask
+            )
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        slice_mask: Optional[torch.Tensor] = None,
+        profiler: Optional[Any] = None,
+    ) -> torch.Tensor:
+        volume = self.extract_volume_token(
+            images, slice_mask=slice_mask, profiler=profiler
+        )
+        with (
+            profiler.stage("rest_network_forward_s")
+            if profiler is not None
+            else nullcontext()
+        ):
+            logits = self.classifier(self.output_norm(volume))
         if self.num_classes == 1:
             return logits.squeeze(-1)
         return logits

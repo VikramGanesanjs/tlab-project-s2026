@@ -31,12 +31,13 @@ from datasets.cq500 import (  # noqa: E402
     DEFAULT_ROOT as CQ500_DEFAULT_ROOT,
 )
 from datasets.organmnist3d import DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT  # noqa: E402
+from datasets.breastdm import DEFAULT_ROOT as BREASTDM_DEFAULT_ROOT  # noqa: E402
 from classification.train import train  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
-DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d")
+DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d", "breastdm")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
@@ -112,7 +113,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "duke: binary breast cancer; adni: diagnosis task selected by "
             "--adni-task; cq500: task selected by --cq500-task; "
-            "organmnist3d: official 11-class volume splits"
+            "organmnist3d: official 11-class volume splits; breastdm: "
+            "official Benign/Malignant img17Se volume splits"
         ),
     )
     parser.add_argument(
@@ -184,6 +186,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--benchmark",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Record per-epoch data, DINO, head, backward, validation, and memory "
+            "measurements in run_summary.json (default: disabled)"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument(
         "--min-epochs",
@@ -409,6 +420,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "adni": ADNI_DEFAULT_ROOT,
             "cq500": CQ500_DEFAULT_ROOT,
             "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
+            "breastdm": BREASTDM_DEFAULT_ROOT,
         }[args.dataset]
     if args.n_slices is not None and args.n_slices <= 0:
         parser.error("--n-slices must be positive")

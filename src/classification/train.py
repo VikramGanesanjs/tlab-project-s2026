@@ -6,10 +6,13 @@ import argparse
 import json
 import logging
 import math
+import resource
 import sys
+import time
 from collections import Counter
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -66,6 +69,12 @@ from datasets.organmnist3d import (  # noqa: E402
     OrganMNIST3DMultiSliceDataset,
     build_organmnist3d_volume_transform,
 )
+from datasets.breastdm import (  # noqa: E402
+    BREASTDM_CLASS_NAMES,
+    BreastDMMultiSliceDataset,
+    DEFAULT_ROOT as BREASTDM_DEFAULT_ROOT,
+    build_breastdm_volume_transform,
+)
 from utils.fold_cv import make_dataset_patient_folds  # noqa: E402
 from utils.splits import patient_level_stratified_split  # noqa: E402
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
@@ -75,7 +84,7 @@ from classification.model import MultiSliceDinoModel, set_lora_requires_grad  # 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
-DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d")
+DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d", "breastdm")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
@@ -85,8 +94,95 @@ MultiSliceDataset = Union[
     ADNIMultiSliceDataset,
     CQ500MultiSliceDataset,
     OrganMNIST3DMultiSliceDataset,
+    BreastDMMultiSliceDataset,
 ]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
+
+
+class EpochProfiler:
+    """Accumulate low-overhead, GPU-accurate timings for one training epoch.
+
+    CUDA kernels are asynchronous, so CUDA events are deliberately used for
+    compute sections.  The DataLoader wait is measured on the host because it
+    represents the time the training loop could not obtain the next batch.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self._cuda = device.type == "cuda"
+        self._cpu_seconds: Dict[str, float] = {}
+        self._cuda_events: Dict[
+            str, List[Tuple[torch.cuda.Event, torch.cuda.Event]]
+        ] = {}
+
+    @contextmanager
+    def stage(self, name: str) -> Iterator[None]:
+        """Time a CPU section or its CUDA work, depending on the active device."""
+        if self._cuda:
+            with torch.cuda.device(self.device):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                try:
+                    yield
+                finally:
+                    end.record()
+            self._cuda_events.setdefault(name, []).append((start, end))
+            return
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._cpu_seconds[name] = self._cpu_seconds.get(name, 0.0) + (
+                time.perf_counter() - start_time
+            )
+
+    def add_host_time(self, name: str, seconds: float) -> None:
+        """Add a wall-clock duration, such as waiting for the next batch."""
+        self._cpu_seconds[name] = self._cpu_seconds.get(name, 0.0) + seconds
+
+    def finish(self) -> Dict[str, float]:
+        """Synchronize once, then return accumulated timing values in seconds."""
+        if self._cuda:
+            torch.cuda.synchronize(self.device)
+            timings = dict(self._cpu_seconds)
+            for name, events in self._cuda_events.items():
+                timings[name] = sum(
+                    start.elapsed_time(end) / 1_000.0 for start, end in events
+                )
+            return timings
+        return dict(self._cpu_seconds)
+
+
+def _process_peak_rss_mb() -> float:
+    """Return process peak RSS in MiB (a process-wide, not per-epoch, value)."""
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Linux reports KiB; macOS reports bytes.  The project runs on Linux in
+    # production, but accepting both makes local runs less surprising.
+    if sys.platform == "darwin":
+        return float(peak_rss) / (1024.0 * 1024.0)
+    return float(peak_rss) / 1024.0
+
+
+def _gpu_memory_metrics(device: torch.device) -> Dict[str, float]:
+    """Return allocator state and epoch peak GPU memory in MiB, if applicable."""
+    if device.type != "cuda":
+        return {}
+    to_mebibytes = 1024.0 * 1024.0
+    return {
+        "gpu_memory_allocated_mb_end": (
+            torch.cuda.memory_allocated(device) / to_mebibytes
+        ),
+        "gpu_memory_reserved_mb_end": (
+            torch.cuda.memory_reserved(device) / to_mebibytes
+        ),
+        "gpu_memory_peak_allocated_mb": (
+            torch.cuda.max_memory_allocated(device) / to_mebibytes
+        ),
+        "gpu_memory_peak_reserved_mb": (
+            torch.cuda.max_memory_reserved(device) / to_mebibytes
+        ),
+    }
 
 def is_binary_task(num_classes: int) -> bool:
     """Duke uses a single logit (``num_classes=1``) with BCE."""
@@ -112,6 +208,8 @@ def task_config(
         return spec.num_logits, spec.class_names, "BCEWithLogitsLoss"
     if dataset_name == "organmnist3d":
         return len(ORGANMNIST3D_CLASS_NAMES), ORGANMNIST3D_CLASS_NAMES, "CrossEntropyLoss"
+    if dataset_name == "breastdm":
+        return 1, BREASTDM_CLASS_NAMES, "BCEWithLogitsLoss"
     raise ValueError(f"Unknown dataset={dataset_name!r}")
 
 
@@ -435,17 +533,30 @@ def save_run_summary(
     *,
     args: argparse.Namespace,
     metrics_by_split: Dict[str, Dict[str, object]],
+    epoch_benchmarks: Optional[Sequence[Dict[str, object]]] = None,
 ) -> None:
     """Write run parameters and split metrics to a JSON summary file."""
     payload = {
         "parameters": args_to_dict(args),
         "metrics": _json_safe(metrics_by_split),
     }
+    if epoch_benchmarks is not None:
+        payload["epoch_benchmarks"] = _json_safe(epoch_benchmarks)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
     logger.info("Wrote run summary → %s", out_path)
+
+
+def save_epoch_benchmarks(
+    out_path: Path, epoch_benchmarks: Sequence[Dict[str, object]]
+) -> None:
+    """Persist completed epoch measurements so an interrupted run keeps its data."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as handle:
+        json.dump({"epoch_benchmarks": _json_safe(epoch_benchmarks)}, handle, indent=2)
+        handle.write("\n")
 
 
 def should_early_stop(
@@ -723,6 +834,7 @@ def _checkpoint_payload(
         "n_cls_tokens": args.n_cls_tokens,
         "slice_aggregator": args.slice_aggregator,
         "weight_ce_loss": args.weight_ce_loss,
+        "benchmark": getattr(args, "benchmark", False),
         "early_stopping": args.early_stopping,
         "early_stopping_metric": args.early_stopping_metric,
         "n_slices": args.n_slices,
@@ -824,6 +936,15 @@ def build_dataset(
             image_size=args.image_size,
             transform=build_organmnist3d_volume_transform(augment=use_augment),
         )
+    if args.dataset == "breastdm":
+        return BreastDMMultiSliceDataset(
+            root=args.data_root,
+            split=split or "train",
+            n_slices=args.n_slices,
+            augment=use_augment,
+            image_size=args.image_size,
+            transform=build_breastdm_volume_transform(augment=use_augment),
+        )
     raise ValueError(f"Unknown dataset={args.dataset!r}")
 
 
@@ -843,17 +964,15 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         "adni": "scans",
         "cq500": "volumes",
         "organmnist3d": "volumes",
+        "breastdm": "volumes",
     }[args.dataset]
-    if args.dataset == "organmnist3d":
+    if args.dataset in {"organmnist3d", "breastdm"}:
         train_dataset = build_dataset(args, augment=args.augment, split="train")
-        val_dataset: Optional[MultiSliceDataset] = build_dataset(
-            args, augment=False, split="val"
-        )
-        test_dataset: Optional[MultiSliceDataset] = build_dataset(
-            args, augment=False, split="test"
-        )
+        val_dataset: Optional[MultiSliceDataset] = build_dataset(args, augment=False, split="val")
+        test_dataset: Optional[MultiSliceDataset] = build_dataset(args, augment=False, split="test")
         logger.info(
-            "Using supplied OrganMNIST3D splits: train=%d %s, val=%d %s, test=%d %s",
+            "Using supplied %s splits: train=%d %s, val=%d %s, test=%d %s",
+            args.dataset,
             len(train_dataset), unit_name, len(val_dataset), unit_name,
             len(test_dataset), unit_name,
         )
@@ -1077,6 +1196,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     lora_unfrozen = not (
         args.encoder_training == "lora" and args.freeze_epochs > 0
     )
+    benchmark_enabled = bool(getattr(args, "benchmark", False))
+    epoch_benchmarks: List[Dict[str, object]] = []
 
     logger.info(
         "dataset=%s adni_task=%s encoder=%s features=%s n_cls_tokens=%d aggregator=%s "
@@ -1114,6 +1235,11 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             getattr(args, "lr_plateau_threshold", 0.005),
             args.min_lr,
         )
+    if benchmark_enabled:
+        logger.info(
+            "Epoch benchmarking enabled: CUDA event timings measure GPU work; "
+            "data_loading_s measures DataLoader wait time."
+        )
     for epoch in range(1, args.epochs + 1):
         epochs_trained = epoch
         if (
@@ -1130,19 +1256,40 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         running_loss = 0.0
         correct = 0
         seen = 0
-        for batch in train_loader:
+        profiler = EpochProfiler(device) if benchmark_enabled else None
+        if benchmark_enabled and device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        epoch_start_time = time.perf_counter()
+        train_start_time = epoch_start_time
+        train_iterator = iter(train_loader)
+        batch_wait_start = time.perf_counter()
+        while True:
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                break
+            if profiler is not None:
+                profiler.add_host_time(
+                    "data_loading_s", time.perf_counter() - batch_wait_start
+                )
             images, targets, slice_mask = _unpack_volume_batch(batch)
-            images = images.to(device, non_blocking=True)
-            logits = model(
-                images,
-                slice_mask=(
+            with (
+                profiler.stage("host_to_device_s")
+                if profiler is not None
+                else nullcontext()
+            ):
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                device_slice_mask = (
                     slice_mask.to(device, non_blocking=True)
                     if slice_mask is not None
                     else None
-                ),
+                )
+            logits = model(
+                images, slice_mask=device_slice_mask, profiler=profiler
             )
             if binary or multi_label:
-                targets = targets.to(device, non_blocking=True).float()
+                targets = targets.float()
                 if bce_pos_weight is None:
                     loss = F.binary_cross_entropy_with_logits(logits, targets)
                 else:
@@ -1152,30 +1299,64 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
                 predictions = (logits >= 0).float()
                 correct += int((predictions == targets).sum().item())
             else:
-                targets = targets.to(device, non_blocking=True).long()
+                targets = targets.long()
                 loss = F.cross_entropy(logits, targets, weight=class_weights)
                 correct += int((logits.argmax(dim=-1) == targets).sum().item())
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            with (
+                profiler.stage("backward_optimizer_s")
+                if profiler is not None
+                else nullcontext()
+            ):
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
             n_items = int(targets.numel())
             running_loss += float(loss.item()) * n_items
             seen += n_items
+            batch_wait_start = time.perf_counter()
 
         train_loss = running_loss / max(seen, 1)
         train_accuracy = correct / max(seen, 1)
+        train_timings = profiler.finish() if profiler is not None else {}
+        train_wall_time = time.perf_counter() - train_start_time
         if val_loader is None:
+            if profiler is not None:
+                epoch_benchmark: Dict[str, object] = {
+                    "epoch": epoch,
+                    "train_wall_s": train_wall_time,
+                    "validation_s": 0.0,
+                    "epoch_wall_s": time.perf_counter() - epoch_start_time,
+                    "process_peak_rss_mb": _process_peak_rss_mb(),
+                    **train_timings,
+                    **_gpu_memory_metrics(device),
+                }
+                epoch_benchmarks.append(epoch_benchmark)
+                save_epoch_benchmarks(
+                    checkpoint_dir / "epoch_benchmarks.json", epoch_benchmarks
+                )
             logger.info(
-                "epoch %d/%d lr=%.6g train_%s=%.5f train_acc=%.3f",
+                "epoch %d/%d lr=%.6g train_%s=%.5f train_acc=%.3f%s",
                 epoch,
                 args.epochs,
                 current_lr,
                 loss_tag,
                 train_loss,
                 train_accuracy,
+                (
+                    " data=%.2fs dino=%.2fs head=%.2fs backward=%.2fs"
+                    % (
+                        train_timings.get("data_loading_s", 0.0),
+                        train_timings.get("dino_forward_s", 0.0),
+                        train_timings.get("rest_network_forward_s", 0.0),
+                        train_timings.get("backward_optimizer_s", 0.0),
+                    )
+                    if profiler is not None
+                    else ""
+                ),
             )
             continue
 
+        validation_start_time = time.perf_counter()
         val_loss, val_f1, val_auroc = evaluate(
             model,
             val_loader,
@@ -1184,6 +1365,23 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             bce_pos_weight=bce_pos_weight,
             multi_label=multi_label,
         )
+        if profiler is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        validation_wall_time = time.perf_counter() - validation_start_time
+        if profiler is not None:
+            epoch_benchmark = {
+                "epoch": epoch,
+                "train_wall_s": train_wall_time,
+                "validation_s": validation_wall_time,
+                "epoch_wall_s": time.perf_counter() - epoch_start_time,
+                "process_peak_rss_mb": _process_peak_rss_mb(),
+                **train_timings,
+                **_gpu_memory_metrics(device),
+            }
+            epoch_benchmarks.append(epoch_benchmark)
+            save_epoch_benchmarks(
+                checkpoint_dir / "epoch_benchmarks.json", epoch_benchmarks
+            )
         validation_metrics = {
             "bce_loss": val_loss,
             "f1": val_f1,
@@ -1229,7 +1427,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         logger.info(
             "epoch %d/%d lr=%.6g train_%s=%.5f train_acc=%.3f "
             "val_%s=%.5f val_f1=%.3f val_auroc=%.3f "
-            "early_stopping_%s=%.5f%s",
+            "early_stopping_%s=%.5f%s%s",
             epoch,
             args.epochs,
             current_lr,
@@ -1243,6 +1441,21 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             args.early_stopping_metric,
             current_metric_value,
             " *" if improved else "",
+            (
+                " | time: data=%.2fs transfer=%.2fs dino=%.2fs head=%.2fs "
+                "backward=%.2fs val=%.2fs epoch=%.2fs"
+                % (
+                    train_timings.get("data_loading_s", 0.0),
+                    train_timings.get("host_to_device_s", 0.0),
+                    train_timings.get("dino_forward_s", 0.0),
+                    train_timings.get("rest_network_forward_s", 0.0),
+                    train_timings.get("backward_optimizer_s", 0.0),
+                    validation_wall_time,
+                    epoch_benchmark["epoch_wall_s"] if profiler is not None else 0.0,
+                )
+                if profiler is not None
+                else ""
+            ),
         )
         epochs_without_improvement = epoch - best_epoch
         if args.early_stopping and should_early_stop(
@@ -1403,4 +1616,5 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         checkpoint_dir / "run_summary.json",
         args=args,
         metrics_by_split=metrics_by_split,
+        epoch_benchmarks=epoch_benchmarks if benchmark_enabled else None,
     )

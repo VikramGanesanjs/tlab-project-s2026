@@ -376,16 +376,20 @@ class _CQ500BaseDataset(VisionDataset):
 
 
 class CQ500PairedSliceDataset(_CQ500BaseDataset):
-    """Unlabelled paired axial slices with shared stochastic augmentation.
+    """Paired axial slices with task labels for patient-level splitting.
 
     ``get_volume_metadata`` exposes the original volume's slice spacing for any
-    entry.  ``__getitem__`` deliberately returns only ``(slice_a, slice_b)``.
+    entry.  ``__getitem__`` deliberately returns only ``(slice_a, slice_b)``
+    because SSL training does not consume labels. :meth:`get_target` exposes
+    the configured label separately so split utilities can make stratified,
+    patient-level folds without changing the paired-sample data contract.
     """
 
     def __init__(
         self,
         root: Union[str, Path] = DEFAULT_ROOT,
         *,
+        task: str = "ich",
         patient_ids: Optional[Sequence[str]] = None,
         max_distance: int = 3,
         z_min: float = 0.0,
@@ -403,7 +407,22 @@ class CQ500PairedSliceDataset(_CQ500BaseDataset):
             raise ValueError("Require max_distance >= 0 and 0 <= z_min <= z_max <= 1")
         if transforms is None and transform is None:
             transform = build_cq500_transform(image_size=image_size, augment=augment)
-        super().__init__(root, csv_path=csv_path, patient_ids=patient_ids, load_labels=False, transforms=transforms, transform=transform, target_transform=target_transform, volume_cache_size=volume_cache_size)
+        self.task_spec = resolve_cq500_task(task)
+        self.task, self.class_names = self.task_spec.name, self.task_spec.class_names
+        super().__init__(
+            root,
+            csv_path=csv_path,
+            patient_ids=patient_ids,
+            load_labels=True,
+            transforms=transforms,
+            transform=transform,
+            target_transform=target_transform,
+            volume_cache_size=volume_cache_size,
+        )
+        if self.task == "subtype":
+            self._records = [
+                record for record in self._records if self.labels[record.patient_id]["ich"] == 1
+            ]
         self.max_distance, self.z_min, self.z_max, self._seed = int(max_distance), float(z_min), float(z_max), seed
         self._entries: List[Tuple[_VolumeRecord, int]] = []
         for record in self._records:
@@ -428,6 +447,11 @@ class CQ500PairedSliceDataset(_CQ500BaseDataset):
 
     def get_slice_spacing_mm(self, index: int) -> float:
         return float(self._entries[index][0].slice_spacing_mm)
+
+    def get_target(self, index: int) -> Union[int, np.ndarray]:
+        """Return the configured CQ500 label for the pair's source volume."""
+        label = self.labels[self._entries[index][0].patient_id]
+        return int(label["ich"]) if self.task == "ich" else label["subtype"].copy()
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         record, z = self._entries[index]
