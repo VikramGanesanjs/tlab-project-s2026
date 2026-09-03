@@ -9,6 +9,8 @@ dino:
   head_hidden_dim: 2048
 ibot:
   mask_sample_probability: 0.5
+  # Reuse each sample's mask for both slices in a pair.
+  identical_masks: false
   mask_ratio_min_max:
   - 0.1
   - 0.5
@@ -126,6 +128,3 @@ decoder:
   embed_dim: null
   n_heads: 4
   mlp_ratio: 4.0
-  rope_base: 100.0
-  # masked = corresponding teacher patches only; full = all teacher patches.
-  context_mode: masked

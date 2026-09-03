@@ -36,7 +36,7 @@ from dinov3.models import build_model_from_cfg
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
 
-from .cvd import CrossViewDecoder, _patch_positions
+from .cvd import CrossViewDecoder
 from .losses import croco_ibot_loss as compute_croco_ibot_loss
 from .losses import uwsd_loss as compute_uwsd_loss
 
@@ -212,6 +212,7 @@ class SSLFineTune(nn.Module):
         self.teacher_temp = float(cfg.teacher.teacher_temp)
         self.mask_ratio_min, self.mask_ratio_max = tuple(cfg.ibot.mask_ratio_min_max)
         self.mask_sample_probability = float(cfg.ibot.mask_sample_probability)
+        self.identical_masks = bool(getattr(cfg.ibot, "identical_masks", False))
         self.ema_params_lists: Optional[Tuple[list[nn.Parameter], list[nn.Parameter]]] = None
 
         logger.info(
@@ -483,7 +484,7 @@ class SSLFineTune(nn.Module):
         self,
         images: Tensor,
     ) -> Dict[str, Tensor]:
-        """DINOv3-style teacher forward, extended with full patch logits.
+        """DINOv3-style teacher forward, returning detached loss targets.
 
         ``images`` follows the original script convention: ``[n_crops, B,
         C, H, W]``. Teacher images are always clean; masking is only used to
@@ -493,15 +494,10 @@ class SSLFineTune(nn.Module):
         flat_images = images.flatten(0, 1)
         backbone_out = self.teacher.backbone(flat_images, is_training=True)
         cls = backbone_out["x_norm_clstoken"]
-        reg = backbone_out["x_storage_tokens"]
-        patches = backbone_out["x_norm_patchtokens"]
         cls_logits = self.teacher.dino_head(cls)
-        ibot_logits = self.teacher.ibot_head(patches)
+        ibot_logits = self.teacher.ibot_head(backbone_out["x_norm_patchtokens"])
 
         return {
-            "cls_pre_head": cls.unflatten(0, (n_crops, batch_size)),
-            "reg_pre_head": reg.unflatten(0, (n_crops, batch_size)),
-            "patch_pre_head": patches.unflatten(0, (n_crops, batch_size)),
             "cls_after_head": cls_logits.unflatten(0, (n_crops, batch_size)),
             "ibot_after_head": ibot_logits.unflatten(0, (n_crops, batch_size)),
         }
@@ -603,46 +599,22 @@ class SSLFineTune(nn.Module):
             masks[0, 0] = True
         return masks
 
-    def _decode_masked_queries(
+    def _decode_cross_view_student_tokens(
         self,
-        query_tokens: Tensor,
-        context_tokens: Tensor,
-        masks: Tensor,
-        positions: Tensor,
+        query_cls: Tensor,
+        query_patches: Tensor,
+        context_cls: Tensor,
+        context_patches: Tensor,
     ) -> Tensor:
-        """Decode masked queries while preserving each patch's source position.
+        """Decode one complete student slice conditioned on the other slice.
 
-        Masks can contain different numbers of patches for different samples,
-        so each sample is decoded separately. This avoids padding tokens or
-        allowing attention to mix unrelated samples in the batch.
+        The cross-view decoder sees the full student CLS-plus-patch sequences
+        from both views. Teacher outputs remain loss targets and are never
+        supplied to this student forward path.
         """
-        decoded = []
-        for batch_index in range(query_tokens.shape[0]):
-            sample_mask = masks[batch_index].bool()
-            if not sample_mask.any():
-                continue
-
-            query = query_tokens[batch_index : batch_index + 1, sample_mask]
-            query_pos = positions[batch_index : batch_index + 1, sample_mask]
-            if self.cross_view_decoder.context_mode == "masked":
-                context = context_tokens[batch_index : batch_index + 1, sample_mask]
-                context_pos = positions[batch_index : batch_index + 1, sample_mask]
-            else:
-                context = context_tokens[batch_index : batch_index + 1]
-                context_pos = positions[batch_index : batch_index + 1]
-
-            decoded.append(
-                self.cross_view_decoder(
-                    query,
-                    context.detach(),
-                    query_pos=query_pos,
-                    context_pos=context_pos,
-                ).squeeze(0)
-            )
-
-        if not decoded:
-            return query_tokens.new_empty((0, query_tokens.shape[-1]))
-        return torch.cat(decoded, dim=0)
+        query = torch.cat((query_cls.unsqueeze(1), query_patches), dim=1)
+        context = torch.cat((context_cls.unsqueeze(1), context_patches), dim=1)
+        return self.cross_view_decoder(query, context)[:, 1:]
 
     def compute_losses(
         self,
@@ -657,12 +629,10 @@ class SSLFineTune(nn.Module):
 
         teacher1 = {
             "cls_logits": teacher_global["cls_after_head"][0],
-            "patch_pre_head": teacher_global["patch_pre_head"][0],
             "ibot_logits": teacher_global["ibot_after_head"][0],
         }
         teacher2 = {
             "cls_logits": teacher_global["cls_after_head"][1],
-            "patch_pre_head": teacher_global["patch_pre_head"][1],
             "ibot_logits": teacher_global["ibot_after_head"][1],
         }
         student1 = {
@@ -698,19 +668,23 @@ class SSLFineTune(nn.Module):
         )
         batch_size = student_global["cls_after_head"].shape[1]
         masks = masks.reshape(2, batch_size, -1)
-        _, num_patches, _ = teacher1["patch_pre_head"].shape
-        positions = _patch_positions(batch_size, num_patches, teacher1["patch_pre_head"].device)
-        decoded_tokens1 = self._decode_masked_queries(
-            student1["patch_pre_head"], teacher2["patch_pre_head"], masks[0], positions
+        decoded_patches1 = self._decode_cross_view_student_tokens(
+            student_global["cls_pre_head"][0],
+            student1["patch_pre_head"],
+            student_global["cls_pre_head"][1],
+            student2["patch_pre_head"],
         )
-        decoded_tokens2 = self._decode_masked_queries(
-            student2["patch_pre_head"], teacher1["patch_pre_head"], masks[1], positions
+        decoded_patches2 = self._decode_cross_view_student_tokens(
+            student_global["cls_pre_head"][1],
+            student2["patch_pre_head"],
+            student_global["cls_pre_head"][0],
+            student1["patch_pre_head"],
         )
         croco_ibot_loss = compute_croco_ibot_loss(
             teacher_logits1=teacher1["ibot_logits"],
             teacher_logits2=teacher2["ibot_logits"],
-            decoded_tokens1=decoded_tokens1,
-            decoded_tokens2=decoded_tokens2,
+            decoded_tokens1=decoded_patches1[masks[0]],
+            decoded_tokens2=decoded_patches2[masks[1]],
             masks1=masks[0],
             masks2=masks[1],
             ibot_head=self.student.ibot_head,
@@ -731,9 +705,21 @@ class SSLFineTune(nn.Module):
 
         global_crops = torch.stack((slices1, slices2), dim=0)
         teacher_global = self.get_teacher_output(global_crops)
-        num_patches = teacher_global["patch_pre_head"].shape[2]
+        patch_size = int(self.cfg.student.patch_size)
+        height, width = slices1.shape[-2:]
+        if height % patch_size or width % patch_size:
+            raise ValueError(
+                "Global crop dimensions must be divisible by the student patch size: "
+                f"crop=({height}, {width}), patch_size={patch_size}"
+            )
+        num_patches = (height // patch_size) * (width // patch_size)
         masks1 = self._prepare_mask(masks1, slices1.shape[0], num_patches, device)
-        masks2 = self._prepare_mask(masks2, slices2.shape[0], num_patches, device)
+        if self.identical_masks:
+            # The other student view must not expose the unmasked value at a
+            # patch that this view asks the CVD to reconstruct.
+            masks2 = masks1.clone()
+        else:
+            masks2 = self._prepare_mask(masks2, slices2.shape[0], num_patches, device)
         masks = torch.cat((masks1, masks2), dim=0)
 
         local1_tensor = self._normalize_local_crops(local1)
