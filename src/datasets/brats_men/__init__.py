@@ -1,17 +1,15 @@
-"""AMOS self-supervised slice datasets."""
+"""BraTSMen self-supervised slice datasets."""
 
 from __future__ import annotations
 
 from typing import Any
 
 __all__ = [
-    "AMOSPairedSliceDataset",
-    "AMOSSingleSliceDataset",
-    "AMOSSliceDataset",
+    "BraTSMenPairedSliceDataset",
+    "BraTSMenSingleSliceDataset",
+    "BraTSMenSliceDataset",
     "DEFAULT_ROOT",
-    "IMAGENET_MEAN",
-    "IMAGENET_STD",
-    "build_amos_transform",
+    "build_brats_men_transform",
 ]
 
 

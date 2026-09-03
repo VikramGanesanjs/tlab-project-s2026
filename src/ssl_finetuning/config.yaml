@@ -103,7 +103,7 @@ crops:
   local_crops_size: 96
   localcrops_subset_of_globalcrops: false
   share_color_jitter: false
-  horizontal_flips: true
+  horizontal_flips: false
 evaluation:
   eval_period_epochs: 10
 checkpointing:

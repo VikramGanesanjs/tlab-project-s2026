@@ -22,8 +22,8 @@ python -m classification.run --dataset adni --benchmark ...
 
 ### Patch-feature PCA visualization
 
-`src/utils/pca_dino_backbones.py` constructs the repository ADNI dataset, samples one
-slice from the middle 50% of a volume, and compares DINOv3, BrainDINO, and a
+`src/utils/pca_dino_backbones.py` constructs the selected repository single-slice
+dataset, samples one slice, and compares DINOv3, BrainDINO, and a
 multi-slice-classification checkpoint. The custom checkpoint may be a distributed
 checkpoint directory, a plain merged teacher `.pth`, or a
 `--hub-compatible` merged teacher `.pth`. The PCA uses `whiten=True`, matching
@@ -32,14 +32,20 @@ next model is loaded.
 
 ```bash
 python -m utils.pca_dino_backbones \
-  --data-root /path/to/data/ADNI \
+  --dataset amos \
   --dinov3-checkpoint /path/to/dinov3_vitb16.pth \
   --braindino-checkpoint /path/to/brain_dino_weights.pth \
   --custom-checkpoint /path/to/distributed/checkpoint-or-merged-backbone.pth \
   --dinov3-repo /path/to/dinov3 \
   --image-size 512 \
-  --output pca_adni_slice.png
+  --output pca_slice.png
 ```
+
+`--dataset` selects the standard data root and matching single-slice dataset.
+Available values are `adni`, `duke`, `cq500`, `breastdm`, `amos`, and
+`brats_men`; use `--data-root` only for a nonstandard data location. BraTSMen's
+four MRI modalities are deterministically projected to DINO RGB as T1c, T1n,
+and mean(T2f, T2w).
 
 ### Classification visualization
 
@@ -88,7 +94,7 @@ checkpoints as columns, with the original image in the leftmost column:
 ```bash
 python -m utils.pca_dino_backbones evolution \
   --checkpoint-parent /path/to/checkpoint_parent \
-  --data-root /common/ganesanv/tlab/data/ADNI \
+  --dataset cq500 \
   --n-images 5 \
   --checkpoint-stride 3 \
   --image-size 512 \

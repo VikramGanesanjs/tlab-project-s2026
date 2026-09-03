@@ -80,6 +80,11 @@ from utils.splits import patient_level_stratified_split  # noqa: E402
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from utils.vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
 from classification.model import MultiSliceDinoModel, set_lora_requires_grad  # noqa: E402
+from classification.triad import (  # noqa: E402
+    DEFAULT_TRIAD_CHECKPOINT,
+    TriadEncoder,
+    TriadVolumeClassifier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +101,7 @@ MultiSliceDataset = Union[
     OrganMNIST3DMultiSliceDataset,
     BreastDMMultiSliceDataset,
 ]
+ClassificationModel = Union[MultiSliceDinoModel, TriadVolumeClassifier]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
 
@@ -700,7 +706,7 @@ def _assert_loader_patient_disjoint(
 
 @torch.no_grad()
 def evaluate(
-    model: MultiSliceDinoModel,
+    model: ClassificationModel,
     loader: DataLoader,
     device: torch.device,
     *,
@@ -765,7 +771,7 @@ def evaluate(
 
 @torch.no_grad()
 def collect_predictions(
-    model: MultiSliceDinoModel,
+    model: ClassificationModel,
     loader: DataLoader,
     device: torch.device,
     *,
@@ -809,7 +815,7 @@ def collect_predictions(
 
 
 def _checkpoint_payload(
-    model: MultiSliceDinoModel,
+    model: ClassificationModel,
     *,
     epoch: int,
     args: argparse.Namespace,
@@ -826,6 +832,7 @@ def _checkpoint_payload(
         "cq500_task": args.cq500_task if args.dataset == "cq500" else None,
         "encoder": args.encoder,
         "encoder_training": args.encoder_training,
+        "triad_trainable": getattr(args, "triad_trainable", False),
         "lora_r": args.lora_r if args.encoder_training == "lora" else None,
         "freeze_epochs": args.freeze_epochs,
         "model_name": args.model_name,
@@ -847,6 +854,12 @@ def _checkpoint_payload(
         "mst_heads": args.mst_heads,
         "mst_ffn_dim": args.mst_ffn_dim,
         "mst_dropout": args.mst_dropout,
+        "triad_input_channels": getattr(args, "triad_input_channels", None),
+        "triad_volume_size": getattr(args, "triad_volume_size", None),
+        "triad_input_normalization": getattr(args, "triad_input_normalization", None),
+        "triad_feature_size": getattr(args, "triad_feature_size", None),
+        "triad_drop_path_rate": getattr(args, "triad_drop_path_rate", None),
+        "triad_use_checkpoint": getattr(args, "triad_use_checkpoint", None),
         "hidden_dim": args.hidden_dim,
         "min_epochs": args.min_epochs,
         "early_stopping_patience": args.early_stopping_patience,
@@ -1122,47 +1135,64 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     if args.dataset != "organmnist3d":
         _assert_loader_patient_disjoint(train_loader, val_loader, test_loader)
 
-    if args.weights is not None and args.encoder == "dinov3":
-        encoder = load_custom_dinov3_encoder(
-            checkpoint=Path(args.weights),
-            repo_dir=args.dinov3_repo,
-            device=device,
-            encoder_training=args.encoder_training,
-            lora_rank=args.lora_r,
+    if args.encoder == "triad":
+        encoder = TriadEncoder(
+            checkpoint=Path(args.weights) if args.weights is not None else DEFAULT_TRIAD_CHECKPOINT,
+            feature_size=args.triad_feature_size,
+            drop_path_rate=args.triad_drop_path_rate,
+            use_checkpoint=args.triad_use_checkpoint,
         )
+        model: ClassificationModel = TriadVolumeClassifier(
+            encoder,
+            input_channels=args.triad_input_channels,
+            volume_size=args.triad_volume_size,
+            input_normalization=args.triad_input_normalization,
+            hidden_dim=args.hidden_dim or None,
+            num_classes=num_classes,
+            encoder_training="finetune" if args.triad_trainable else "frozen",
+        ).to(device)
     else:
-        encoder = load_encoder(
-            args.encoder,
-            device=device,
-            weights=args.weights,
-            repo_dir=args.dinov3_repo,
-            model_name=args.model_name,
-        )
-        if args.encoder_training == "lora":
-            add_lora_to_vit(encoder, r=args.lora_r)
-            freeze_non_lora_parameters(encoder)
-    if args.encoder_training == "lora" and args.freeze_epochs > 0:
-        set_lora_requires_grad(encoder, False)
-    model = MultiSliceDinoModel(
-        encoder,
-        n_slices=args.n_slices,
-        features=args.features,
-        n_cls_tokens=args.n_cls_tokens,
-        aggregator=args.slice_aggregator,
-        d_model=args.d_model,
-        depth=args.mst_depth,
-        n_heads=args.mst_heads,
-        ffn_dim=args.mst_ffn_dim,
-        dropout=args.mst_dropout,
-        hidden_dim=args.hidden_dim or args.d_model,
-        num_classes=num_classes,
-        encoder_training=args.encoder_training,
-    ).to(device)
+        if args.weights is not None and args.encoder == "dinov3":
+            encoder = load_custom_dinov3_encoder(
+                checkpoint=Path(args.weights),
+                repo_dir=args.dinov3_repo,
+                device=device,
+                encoder_training=args.encoder_training,
+                lora_rank=args.lora_r,
+            )
+        else:
+            encoder = load_encoder(
+                args.encoder,
+                device=device,
+                weights=args.weights,
+                repo_dir=args.dinov3_repo,
+                model_name=args.model_name,
+            )
+            if args.encoder_training == "lora":
+                add_lora_to_vit(encoder, r=args.lora_r)
+                freeze_non_lora_parameters(encoder)
+        if args.encoder_training == "lora" and args.freeze_epochs > 0:
+            set_lora_requires_grad(encoder, False)
+        model = MultiSliceDinoModel(
+            encoder,
+            n_slices=args.n_slices,
+            features=args.features,
+            n_cls_tokens=args.n_cls_tokens,
+            aggregator=args.slice_aggregator,
+            d_model=args.d_model,
+            depth=args.mst_depth,
+            n_heads=args.mst_heads,
+            ffn_dim=args.mst_ffn_dim,
+            dropout=args.mst_dropout,
+            hidden_dim=args.hidden_dim or args.d_model,
+            num_classes=num_classes,
+            encoder_training=args.encoder_training,
+        ).to(device)
     trainable_parameters = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if MultiSliceDinoModel._is_trainable_state_name(name)
+        parameter for parameter in model.parameters() if parameter.requires_grad
     ]
+    if not trainable_parameters:
+        raise RuntimeError("No trainable parameters were configured for the classifier")
     optimizer = torch.optim.AdamW(
         trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
     )
@@ -1189,7 +1219,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     )
     best_checkpoint_val_loss = float("inf")
     best_epoch = 0
-    best_path = checkpoint_dir / "best_mst.pt"
+    model_kind = "triad" if args.encoder == "triad" else "mst"
+    best_path = checkpoint_dir / f"best_{model_kind}.pt"
     epochs_trained = 0
     stopped_early = False
     loss_tag = "bce" if binary or multi_label else "ce"
@@ -1222,7 +1253,11 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         unit_name,
         len(test_dataset) if test_dataset is not None else 0,
         int(encoder.embed_dim),
-        args.d_model,
+        (
+            args.triad_volume_size
+            if args.encoder == "triad"
+            else args.d_model
+        ),
         loss_name,
     )
     if scheduler is not None:
@@ -1252,7 +1287,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             logger.info("Unfroze LoRA adapters at epoch %d", epoch)
         current_lr = optimizer.param_groups[0]["lr"]
         model.train()
-        model.encoder.eval()
+        if args.encoder != "triad" or not args.triad_trainable:
+            model.encoder.eval()
         running_loss = 0.0
         correct = 0
         seen = 0
@@ -1500,7 +1536,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         optimizer.load_state_dict(best["optimizer"])
         logger.info("Restored best model from epoch %d", best["epoch"])
 
-    last_path = checkpoint_dir / "last_mst.pt"
+    last_path = checkpoint_dir / f"last_{model_kind}.pt"
     torch.save(
         _checkpoint_payload(
             model,

@@ -1,9 +1,11 @@
-"""Self-supervised slice datasets backed by AMOS nnU-Net 2-D stores.
+"""Self-supervised slice datasets backed by BraTSMen nnU-Net 2-D stores.
 
-Each ``.b2nd`` image store has ``[channel, z, y, x]`` layout. AMOS contains a
-single CT channel, which is copied into RGB, scaled to ``[0, 255]``, and
-ImageNet-normalized for the DINO-style image encoder.
-Segmentation stores are intentionally ignored: these datasets are for SSL.
+Each ``.b2nd`` image store has ``[channel, z, y, x]`` layout. BraTSMen has
+four MRI modalities. A returned slice keeps all four channels, with each
+modality independently min--max scaled to float values in the ``[0, 255]``
+range before ImageNet normalization. This lets a training model learn its own
+4-to-3 channel projection (for example with a 1x1 convolution). Segmentation
+stores are intentionally ignored: these datasets are for SSL.
 """
 
 from __future__ import annotations
@@ -16,29 +18,32 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-from torchvision import transforms as tv_transforms
 from torchvision.datasets.vision import VisionDataset
 
+from datasets.amos.dataset import (
+    _ImageNetNormalize,
+    _RandomIntensityJitter,
+    _scale_channels_to_255,
+)
+
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 DEFAULT_ROOT = (
     _REPOSITORY_ROOT
     / "data"
     / "nnUNet_preprocessed"
-    / "Dataset001_AMOS22"
+    / "Dataset002_BraTSMen"
     / "nnUNetPlans_2d"
 )
 
 
 def _import_blosc2() -> Any:
-    """Import the reader only when an AMOS dataset is instantiated."""
+    """Import the reader only when a BraTSMen dataset is instantiated."""
     try:
         import blosc2
     except ImportError as exc:
         raise ImportError(
-            "AMOS datasets require the 'blosc2' package to read nnU-Net .b2nd "
-            "files. Install blosc2 (it is included in the nnU-Net environment)."
+            "BraTSMen datasets require the 'blosc2' package to read nnU-Net "
+            ".b2nd files. Install blosc2 (it is included in the nnU-Net environment)."
         ) from exc
     return blosc2
 
@@ -105,7 +110,9 @@ def _discover_cases(
     root: Path, case_ids: Optional[Sequence[Union[str, int]]]
 ) -> List[_CaseRecord]:
     if not root.is_dir():
-        raise FileNotFoundError(f"AMOS nnU-Net plans directory does not exist: {root}")
+        raise FileNotFoundError(
+            f"BraTSMen nnU-Net plans directory does not exist: {root}"
+        )
 
     requested = (
         None if case_ids is None else {str(case_id).zfill(4) for case_id in case_ids}
@@ -118,10 +125,10 @@ def _discover_cases(
         missing = requested.difference(path.stem for path in image_paths)
         if missing:
             raise FileNotFoundError(
-                f"Requested AMOS case(s) not found under {root}: {sorted(missing)}"
+                f"Requested BraTSMen case(s) not found under {root}: {sorted(missing)}"
             )
     if not image_paths:
-        raise RuntimeError(f"No AMOS image .b2nd files found under {root}")
+        raise RuntimeError(f"No BraTSMen image .b2nd files found under {root}")
 
     blosc2 = _import_blosc2()
     records: List[_CaseRecord] = []
@@ -131,102 +138,29 @@ def _discover_cases(
             image_path, mode="r", mmap_mode="r", dparams={"nthreads": 1}
         )
         shape = tuple(image.shape)
-        if len(shape) != 4 or shape[0] != 1:
+        if len(shape) != 4 or shape[0] != 4:
             raise ValueError(
-                f"Expected one-channel [1, z, y, x] image store for {image_path}, "
+                f"Expected four-channel [4, z, y, x] image store for {image_path}, "
                 f"got {shape}"
             )
         records.append(_CaseRecord(image_path.stem, image_path, int(shape[1])))
     return records
 
 
-def _scale_channels_to_255(image: np.ndarray) -> np.ndarray:
-    """Min--max scale every channel of a ``[C, H, W]`` image to floats in 0--255."""
-    image = np.asarray(image, dtype=np.float32)
-    finite = np.isfinite(image)
-    if not np.all(finite.any(axis=(1, 2))):
-        bad_channels = np.flatnonzero(~finite.any(axis=(1, 2))).tolist()
-        raise ValueError(f"Image slice has no finite values in channel(s) {bad_channels}")
-    low = np.where(finite, image, np.inf).min(axis=(1, 2), keepdims=True)
-    high = np.where(finite, image, -np.inf).max(axis=(1, 2), keepdims=True)
-    scaled = np.divide(
-        image - low,
-        high - low,
-        out=np.zeros_like(image),
-        where=(high > low),
-    )
-    return np.nan_to_num(
-        scaled.clip(0.0, 1.0) * 255.0, nan=0.0, posinf=255.0, neginf=0.0
-    )
-
-
-def _read_rgb_slice(record: _CaseRecord, z: int, cache: _BloscCaseCache) -> torch.Tensor:
-    """Read, scale, and copy one axial CT slice into RGB."""
+def _read_scaled_slice(
+    record: _CaseRecord, z: int, cache: _BloscCaseCache
+) -> torch.Tensor:
+    """Read one axial MRI slice as four independently scaled float channels."""
     image_store = cache.get(record)
-    image_2d = np.ascontiguousarray(
-        np.asarray(image_store[0, z], dtype=np.float32)
-    ).reshape(1, *image_store.shape[2:])
-    scaled = _scale_channels_to_255(image_2d)
-    return torch.from_numpy(scaled).repeat(3, 1, 1)
+    image_2d = np.ascontiguousarray(np.asarray(image_store[:, z], dtype=np.float32))
+    try:
+        scaled = _scale_channels_to_255(image_2d)
+    except ValueError as exc:
+        raise ValueError(f"BraTSMen case {record.case_id} slice {z}: {exc}") from exc
+    return torch.from_numpy(np.ascontiguousarray(scaled))
 
 
-class _RandomIntensityJitter:
-    """Apply tensor-safe brightness and contrast jitter to every modality.
-
-    Unlike :class:`torchvision.transforms.ColorJitter`, this works for both
-    AMOS RGB tensors and BraTSMen's four MRI modality channels. The sampled
-    factors are shared by every channel of a slice, so modalities remain
-    aligned for a later learned channel projection.
-    """
-
-    def __init__(self, jitter: float) -> None:
-        self.jitter = float(jitter)
-
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        if not isinstance(image, torch.Tensor) or image.ndim != 3:
-            raise TypeError(
-                "Random intensity jitter expects a channel-first [C, H, W] tensor"
-            )
-        brightness = float(
-            torch.empty(()).uniform_(1.0 - self.jitter, 1.0 + self.jitter)
-        )
-        contrast = float(
-            torch.empty(()).uniform_(1.0 - self.jitter, 1.0 + self.jitter)
-        )
-        result = image.to(torch.float32).mul(brightness)
-        mean = result.mean(dim=(-2, -1), keepdim=True)
-        result = (result - mean).mul(contrast).add(mean)
-        return result.clamp_(0, 255)
-
-
-class _ImageNetNormalize:
-    """Normalize 0--255 channel-first tensors without uint8 quantization.
-
-    ImageNet publishes RGB statistics only. Four-channel BraTSMen inputs use
-    those statistics cyclically (R, G, B, R), keeping every modality intact
-    for the learned 4-to-3 projection that follows the dataset.
-    """
-
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        if not isinstance(image, torch.Tensor) or image.ndim != 3:
-            raise TypeError(
-                "ImageNet normalization expects a channel-first [C, H, W] tensor"
-            )
-        channels = image.shape[0]
-        if channels not in (3, 4):
-            raise ValueError(
-                f"ImageNet normalization supports 3 or 4 channels, got {channels}"
-            )
-        mean = image.new_tensor(
-            tuple(IMAGENET_MEAN[channel % 3] for channel in range(channels))
-        ).view(channels, 1, 1)
-        std = image.new_tensor(
-            tuple(IMAGENET_STD[channel % 3] for channel in range(channels))
-        ).view(channels, 1, 1)
-        return image.to(torch.float32).div(255.0).sub(mean).div(std)
-
-
-def build_amos_transform(
+def build_brats_men_transform(
     image_size: int = 224,
     *,
     augment: bool = True,
@@ -235,12 +169,19 @@ def build_amos_transform(
     rotation_degrees: float = 15.0,
     horizontal_flip_prob: float = 0.5,
     vertical_flip_prob: float = 0.0,
-) -> tv_transforms.Compose:
-    """Build ADNI-style 2-D augmentation for channel-first AMOS slices.
+) -> Callable:
+    """Build ADNI-style 2-D augmentation for four-channel BraTSMen slices.
 
-    The output is a float32 ImageNet-normalized tensor. When ``augment=False``
-    this is a deterministic square resize followed by normalization.
+    Brightness/contrast jitter is applied with shared factors across the four
+    MRI modalities. This is the four-channel equivalent of ADNI's
+    ``ColorJitter``; hue and saturation do not have a medical-MRI analogue.
+    ``augment=False`` performs deterministic square resizing followed by
+    ImageNet normalization.
     """
+    # Keep the validation and geometric augmentation choices identical to
+    # AMOS, but reuse the generic tensor-safe jitter for four channels.
+    from torchvision import transforms as tv_transforms
+
     if image_size <= 0:
         raise ValueError(f"image_size must be positive, got {image_size}")
     if not 0.0 < crop_scale_min <= 1.0:
@@ -273,12 +214,12 @@ def build_amos_transform(
     return tv_transforms.Compose(operations)
 
 
-class AMOSSingleSliceDataset(VisionDataset):
-    """All axial AMOS slices for single-image self-supervised learning.
+class BraTSMenSingleSliceDataset(VisionDataset):
+    """All axial BraTSMen slices for single-image self-supervised learning.
 
     Each z-plane of every volume is an item, so a shuffled DataLoader samples
-    slices randomly. Items are RGB float32 ImageNet-normalized tensors with
-    shape ``[3, image_size, image_size]``; no segmentation target is read or
+    slices randomly. Items are float32 ImageNet-normalized tensors with shape
+    ``[4, image_size, image_size]``; no segmentation target is read or
     returned.
 
     ``transform`` is an image-only callable. ``transforms`` is supported for
@@ -302,7 +243,9 @@ class AMOSSingleSliceDataset(VisionDataset):
         self.root_path = Path(root).expanduser().resolve()
         self.image_size = int(image_size)
         if transforms is None and transform is None:
-            transform = build_amos_transform(image_size=self.image_size, augment=augment)
+            transform = build_brats_men_transform(
+                image_size=self.image_size, augment=augment
+            )
         super().__init__(str(self.root_path), transforms=transforms, transform=transform)
         self._records = _discover_cases(self.root_path, case_ids)
         self._cache = _BloscCaseCache(volume_cache_size)
@@ -321,19 +264,20 @@ class AMOSSingleSliceDataset(VisionDataset):
 
     def __getitem__(self, index: int) -> Any:
         record, z = self._entries[index]
-        image: Any = _read_rgb_slice(record, z, self._cache)
+        image: Any = _read_scaled_slice(record, z, self._cache)
         if self.transforms is not None:
             transformed = self.transforms(image, None)
             return transformed[0] if isinstance(transformed, tuple) else transformed
         return image
 
 
-class AMOSPairedSliceDataset(AMOSSingleSliceDataset):
-    """Random nearby slice pairs from one AMOS volume for SSL.
+class BraTSMenPairedSliceDataset(BraTSMenSingleSliceDataset):
+    """Random nearby slice pairs from one BraTSMen volume for SSL.
 
-    Items are ``(slice_1, slice_2)`` RGB tensors. The partner is selected from
-    the same volume within the inclusive ``max_distance`` radius. At a
-    one-slice boundary or with ``max_distance=0``, the indexed plane is reused.
+    Items are ``(slice_1, slice_2)`` four-channel float32 ImageNet-normalized
+    tensors. The partner is selected from the same volume within the inclusive
+    ``max_distance`` radius. At a one-slice boundary or with
+    ``max_distance=0``, the indexed plane is reused.
 
     ``min_distance`` is an alias for the requested maximum offset; supplying
     it alongside ``max_distance`` is an error.
@@ -373,8 +317,8 @@ class AMOSPairedSliceDataset(AMOSSingleSliceDataset):
         record, z = self._entries[index]
         partner_z = self._partner_index(index, z, record.n_slices)
         images: Tuple[Any, Any] = (
-            _read_rgb_slice(record, z, self._cache),
-            _read_rgb_slice(record, partner_z, self._cache),
+            _read_scaled_slice(record, z, self._cache),
+            _read_scaled_slice(record, partner_z, self._cache),
         )
         if self.transform is not None:
             return _apply_shared_pair_transform(self.transform, images)
@@ -385,15 +329,13 @@ class AMOSPairedSliceDataset(AMOSSingleSliceDataset):
 
 
 # Concise alias for callers that do not need to distinguish the modality name.
-AMOSSliceDataset = AMOSSingleSliceDataset
+BraTSMenSliceDataset = BraTSMenSingleSliceDataset
 
 
 __all__ = [
-    "AMOSPairedSliceDataset",
-    "AMOSSingleSliceDataset",
-    "AMOSSliceDataset",
+    "BraTSMenPairedSliceDataset",
+    "BraTSMenSingleSliceDataset",
+    "BraTSMenSliceDataset",
     "DEFAULT_ROOT",
-    "IMAGENET_MEAN",
-    "IMAGENET_STD",
-    "build_amos_transform",
+    "build_brats_men_transform",
 ]

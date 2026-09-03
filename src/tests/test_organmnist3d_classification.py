@@ -13,6 +13,7 @@ from torch import nn
 
 from classification.model import MultiSliceDinoModel
 from classification.run import parse_args
+from classification.triad import TriadVolumeClassifier
 from classification.train import build_dataset, saved_split_patient_ids, task_config, train
 from utils import load_dinov3
 
@@ -23,6 +24,17 @@ class _ToyEncoder(nn.Module):
     def forward_features(self, images: torch.Tensor):
         pooled = images.mean(dim=(1, 2, 3), keepdim=False).unsqueeze(1)
         return {"x_norm_clstoken": pooled.repeat(1, self.embed_dim)}
+
+
+class _ToyTriadEncoder(nn.Module):
+    embed_dim = 4
+
+    def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        assert volume.ndim == 5
+        assert volume.shape[1] == 1
+        return volume.mean(dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1).repeat(
+            1, self.embed_dim
+        )
 
 
 class _ToyPatientDataset:
@@ -40,6 +52,65 @@ class _ToyPatientDataset:
 
 
 class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
+    def test_triad_is_a_selectable_classification_encoder(self) -> None:
+        args = parse_args(["--encoder", "triad"])
+
+        self.assertEqual(args.encoder, "triad")
+        self.assertEqual(args.triad_volume_size, 96)
+        self.assertEqual(args.triad_input_channels, 3)
+
+    def test_triad_classifier_processes_a_complete_volume(self) -> None:
+        model = TriadVolumeClassifier(
+            _ToyTriadEncoder(),
+            input_channels=3,
+            volume_size=32,
+            input_normalization="none",
+            hidden_dim=4,
+            num_classes=2,
+        ).eval()
+        images = torch.randn(2, 5, 3, 8, 8)
+
+        with torch.no_grad():
+            output = model(images)
+
+        self.assertEqual(tuple(output.shape), (2, 2))
+
+    def test_frozen_triad_keeps_the_input_projection_trainable(self) -> None:
+        model = TriadVolumeClassifier(
+            _ToyTriadEncoder(),
+            input_channels=3,
+            volume_size=32,
+            input_normalization="none",
+            hidden_dim=4,
+        ).train()
+        output = model(torch.randn(2, 5, 3, 8, 8))
+        output.sum().backward()
+
+        projection = model.input_projection
+        self.assertIsInstance(projection, nn.Conv3d)
+        self.assertIsNotNone(projection.weight.grad)
+
+    def test_triad_ignores_padded_native_depth_slices(self) -> None:
+        model = TriadVolumeClassifier(
+            _ToyTriadEncoder(),
+            input_channels=3,
+            volume_size=32,
+            input_normalization="none",
+            hidden_dim=4,
+        ).eval()
+        short_volume = torch.randn(2, 3, 6, 6)
+        long_volume = torch.randn(4, 3, 6, 6)
+        padded_batch = torch.zeros(2, 4, 3, 6, 6)
+        padded_batch[0, :2] = short_volume
+        padded_batch[1] = long_volume
+        slice_mask = torch.tensor([[True, True, False, False], [True, True, True, True]])
+
+        with torch.no_grad():
+            standalone = model(short_volume.unsqueeze(0))
+            batched = model(padded_batch, slice_mask=slice_mask)
+
+        torch.testing.assert_close(batched[0], standalone[0])
+
     def test_meddinov3_is_a_selectable_classification_encoder(self) -> None:
         args = parse_args(["--encoder", "meddinov3"])
 
@@ -254,3 +325,41 @@ class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
                 self.assertIn(name, benchmark)
                 self.assertGreaterEqual(benchmark[name], 0.0)
             self.assertTrue((root / "checkpoints" / "epoch_benchmarks.json").is_file())
+
+    def test_training_selects_triad_instead_of_the_multislice_dino_model(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_archive(root)
+            args = parse_args(
+                [
+                    "--dataset",
+                    "organmnist3d",
+                    "--data-root",
+                    str(root),
+                    "--encoder",
+                    "triad",
+                    "--n-slices",
+                    "2",
+                    "--image-size",
+                    "8",
+                    "--triad-volume-size",
+                    "32",
+                    "--no-augment",
+                    "--batch-size",
+                    "11",
+                    "--num-workers",
+                    "0",
+                    "--epochs",
+                    "1",
+                    "--min-epochs",
+                    "0",
+                    "--no-early-stopping",
+                    "--hidden-dim",
+                    "4",
+                ]
+            )
+            with patch("classification.train.TriadEncoder", return_value=_ToyTriadEncoder()):
+                train(args, torch.device("cpu"), root / "checkpoints")
+
+            self.assertTrue((root / "checkpoints" / "best_triad.pt").is_file())
+            self.assertTrue((root / "checkpoints" / "last_triad.pt").is_file())

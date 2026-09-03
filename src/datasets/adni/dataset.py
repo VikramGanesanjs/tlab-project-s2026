@@ -150,18 +150,24 @@ class _VolumeCache:
             self._cache.move_to_end(key)
             return self._cache[key]
 
-        import nibabel as nib
-
-        image = nib.load(key, mmap="r")
-        canonical = nib.as_closest_canonical(image)
-        volume = np.asanyarray(canonical.dataobj)
-        if volume.ndim != 3:
-            raise ValueError(f"Expected a 3D NIfTI volume at {path}, got shape {volume.shape}")
+        volume = _load_canonical_volume(path)
 
         self._cache[key] = volume
         if len(self._cache) > self.maxsize:
             self._cache.popitem(last=False)
         return volume
+
+
+def _load_canonical_volume(path: Path) -> np.ndarray:
+    """Load a canonical ADNI volume without retaining it between samples."""
+    import nibabel as nib
+
+    image = nib.load(str(path), mmap="r")
+    canonical = nib.as_closest_canonical(image)
+    volume = np.asanyarray(canonical.dataobj)
+    if volume.ndim != 3:
+        raise ValueError(f"Expected a 3D NIfTI volume at {path}, got shape {volume.shape}")
+    return volume
 
 
 def _canonical_depth(path: Path) -> int:
@@ -574,7 +580,7 @@ class _ADNIBaseDataset(VisionDataset):
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
-        volume_cache_size: int = 8,
+        volume_cache_size: Optional[int] = 8,
         augment: bool = True,
         image_size: int = 224,
         build_default_transform: bool = True,
@@ -601,7 +607,9 @@ class _ADNIBaseDataset(VisionDataset):
         self.z_min = float(z_min)
         self.z_max = float(z_max)
         _z_index_range(1, self.z_min, self.z_max)
-        self._volume_cache = _VolumeCache(volume_cache_size)
+        self._volume_cache = (
+            _VolumeCache(volume_cache_size) if volume_cache_size is not None else None
+        )
         records, self.phenotype_columns = _build_scan_index(root_path, metadata_path)
         allowed = set(self.task_spec.diagnoses)
         self._records = [
@@ -700,6 +708,7 @@ class ADNIClassificationDataset(_ADNIBaseDataset):
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         record, z = self._entries[index]
+        assert self._volume_cache is not None
         volume = self._volume_cache.get(record.volume_path)
         image: Any = _slice_to_pil(volume, z)
         target: Any = record.label
@@ -735,7 +744,6 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
-        volume_cache_size: int = 8,
         augment: bool = True,
         image_size: int = 224,
     ) -> None:
@@ -755,7 +763,9 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
             transforms=transforms,
             transform=transform,
             target_transform=target_transform,
-            volume_cache_size=volume_cache_size,
+            # Each item consumes its entire volume once, so a per-worker cache
+            # only holds large arrays without useful reuse.
+            volume_cache_size=None,
             augment=augment,
             image_size=image_size,
             build_default_transform=False,
@@ -779,7 +789,7 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         record = self._entries[index]
-        volume = self._volume_cache.get(record.volume_path)
+        volume = _load_canonical_volume(record.volume_path)
         volume_t = _resample_volume(
             _zscore_normalize_volume(volume), self.n_slices, self.image_size
         ).unsqueeze(0)

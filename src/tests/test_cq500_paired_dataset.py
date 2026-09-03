@@ -7,11 +7,47 @@ from unittest.mock import patch
 
 import numpy as np
 
-from datasets.cq500.dataset import CQ500PairedSliceDataset, _VolumeRecord
+from datasets.cq500.dataset import (
+    CQ500MultiSliceDataset,
+    CQ500PairedSliceDataset,
+    _VolumeRecord,
+    _slice_to_pil,
+    _window_volume_per_slice,
+)
 from utils.fold_cv import make_dataset_patient_folds
 
 
 class TestCQ500PairedSliceDataset(unittest.TestCase):
+    def test_slice_uses_fixed_brain_ct_window(self) -> None:
+        volume = np.array([[[-100.0], [0.0], [40.0], [80.0], [200.0]]])
+
+        image = _slice_to_pil(volume, 0)
+
+        pixels = np.asarray(image)
+        self.assertEqual(tuple(pixels.shape), (1, 5, 3))
+        self.assertEqual(pixels[0, :, 0].tolist(), [0, 0, 127, 255, 255])
+        self.assertTrue(np.array_equal(pixels[..., 0], pixels[..., 1]))
+        self.assertTrue(np.array_equal(pixels[..., 1], pixels[..., 2]))
+
+    def test_volume_windowing_is_independent_per_axial_slice(self) -> None:
+        volume = np.array(
+            [
+                [[0.0, 40.0], [80.0, 120.0]],
+                [[-20.0, 20.0], [60.0, 100.0]],
+            ]
+        )
+
+        windowed = _window_volume_per_slice(volume)
+
+        expected = np.array(
+            [
+                [[0.0, 0.5], [1.0, 1.0]],
+                [[0.0, 0.25], [0.75, 1.0]],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(windowed, expected)
+
     def _records(self, root: Path) -> list[_VolumeRecord]:
         return [
             _VolumeRecord(
@@ -85,6 +121,32 @@ class TestCQ500PairedSliceDataset(unittest.TestCase):
         self.assertIsInstance(target, np.ndarray)
         target[0] = 0.0
         self.assertEqual(dataset.get_target(0)[0], 1.0)
+
+    def test_multi_slice_dataset_does_not_retain_full_volumes(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            labels_path = self._write_labels(root)
+            volume = np.linspace(-100.0, 120.0, num=8, dtype=np.float32).reshape(2, 2, 2)
+            with patch(
+                "datasets.cq500.dataset._discover_volume_records",
+                return_value=self._records(root),
+            ):
+                dataset = CQ500MultiSliceDataset(
+                    root=root,
+                    csv_path=labels_path,
+                    patient_ids=["CQ500CT1"],
+                    n_slices=2,
+                    image_size=2,
+                    augment=False,
+                )
+            with patch(
+                "datasets.cq500.dataset._load_canonical_volume", return_value=volume
+            ) as load_volume:
+                dataset[0]
+                dataset[0]
+
+        self.assertIsNone(dataset._volume_cache)
+        self.assertEqual(load_volume.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,8 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # Native-depth batches are padded to their longest volume.  Cap unusually long
 # acquisitions so one outlier cannot inflate every tensor in the batch.
 MAX_NATIVE_SLICES = 128
+CT_WINDOW_CENTER = 40.0
+CT_WINDOW_WIDTH = 80.0
 
 
 @dataclass(frozen=True)
@@ -148,16 +150,22 @@ class _VolumeCache:
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
-        import nibabel as nib
-
-        image = nib.as_closest_canonical(nib.load(key, mmap="r"))
-        volume = np.asanyarray(image.dataobj)
-        if volume.ndim != 3:
-            raise ValueError(f"Expected a 3-D NIfTI volume at {path}, got {volume.shape}")
+        volume = _load_canonical_volume(path)
         self._cache[key] = volume
         if len(self._cache) > self.maxsize:
             self._cache.popitem(last=False)
         return volume
+
+
+def _load_canonical_volume(path: Path) -> np.ndarray:
+    """Load a canonical CQ500 volume without retaining it between samples."""
+    import nibabel as nib
+
+    image = nib.as_closest_canonical(nib.load(str(path), mmap="r"))
+    volume = np.asanyarray(image.dataobj)
+    if volume.ndim != 3:
+        raise ValueError(f"Expected a 3-D NIfTI volume at {path}, got {volume.shape}")
+    return volume
 
 
 @dataclass(frozen=True)
@@ -211,28 +219,44 @@ def _discover_volume_records(root: Path) -> List[_VolumeRecord]:
     return records
 
 
-def _slice_to_pil(volume: np.ndarray, z: int) -> Image.Image:
-    image_slice = np.asarray(volume[..., z], dtype=np.float32)
+def _apply_ct_window(
+    image_slice: np.ndarray,
+    *,
+    center: float = CT_WINDOW_CENTER,
+    width: float = CT_WINDOW_WIDTH,
+) -> np.ndarray:
+    """Apply a CT intensity window to one 2-D slice and return floats in [0, 1]."""
+    if width <= 0:
+        raise ValueError(f"CT window width must be positive, got {width}")
+    image_slice = np.asarray(image_slice, dtype=np.float32)
     finite = image_slice[np.isfinite(image_slice)]
     if finite.size == 0:
-        raise ValueError(f"CQ500 slice {z} contains no finite values")
-    low, high = np.percentile(finite, (1.0, 99.0))
-    if high <= low:
-        high = low + 1.0
-    scaled = np.nan_to_num(np.clip((image_slice - low) / (high - low), 0.0, 1.0))
-    return Image.fromarray(np.rint(scaled * 255).astype(np.uint8), mode="L").convert("RGB")
+        raise ValueError("CQ500 slice contains no finite values")
+    low = float(center) - float(width) / 2.0
+    high = float(center) + float(width) / 2.0
+    return np.nan_to_num(
+        np.clip(image_slice, low, high) - low,
+        nan=0.0,
+        posinf=float(width),
+        neginf=0.0,
+    ).astype(np.float32, copy=False) / float(width)
 
 
-def _zscore_normalize(volume: np.ndarray) -> np.ndarray:
+def _window_volume_per_slice(volume: np.ndarray) -> np.ndarray:
+    """Apply the CQ500 40/80 window independently to every axial z-plane."""
     volume = np.asarray(volume, dtype=np.float32)
-    finite = volume[np.isfinite(volume)]
-    if finite.size == 0:
-        raise ValueError("CQ500 volume contains no finite values")
-    low, high = np.percentile(finite, (0.5, 99.5))
-    if high <= low:
-        high = low + 1.0
-    normalized = np.nan_to_num(np.clip(volume, low, high), nan=low, posinf=high, neginf=low)
-    return ((normalized - float(normalized.mean())) / max(float(normalized.std()), 1e-6)).astype(np.float32)
+    if volume.ndim != 3:
+        raise ValueError(f"Expected CQ500 volume [H, W, D], got {volume.shape}")
+    return np.stack(
+        [_apply_ct_window(volume[..., z]) for z in range(volume.shape[-1])], axis=-1
+    )
+
+
+def _slice_to_pil(volume: np.ndarray, z: int) -> Image.Image:
+    """Convert one CQ500 axial slice using the fixed brain CT 40/80 window."""
+    scaled = _apply_ct_window(volume[..., z])
+    pixels = (scaled * 255.0).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(pixels, mode="L").convert("RGB")
 
 
 def _resample_volume(
@@ -278,11 +302,8 @@ def _resample_volume(
 
 
 def _volume_to_rgb(volume: torch.Tensor) -> torch.Tensor:
-    """Convert normalized ``[D,H,W]`` volume to ImageNet-normalized RGB slices."""
-    low = volume.amin(dim=(1, 2), keepdim=True)
-    high = volume.amax(dim=(1, 2), keepdim=True)
-    scaled = torch.where(high > low, (volume - low) / (high - low), torch.zeros_like(volume))
-    images = scaled.clamp(0, 1).unsqueeze(1).repeat(1, 3, 1, 1)
+    """Convert 40/80-windowed ``[D,H,W]`` volume to ImageNet-normalized RGB."""
+    images = volume.clamp(0, 1).unsqueeze(1).repeat(1, 3, 1, 1)
     mean = images.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
     std = images.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
     return (images - mean) / std
@@ -338,7 +359,7 @@ class _CQ500BaseDataset(VisionDataset):
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
-        volume_cache_size: int = 8,
+        volume_cache_size: Optional[int] = 8,
     ) -> None:
         root_path = Path(root).expanduser().resolve()
         super().__init__(str(root_path), transforms=transforms, transform=transform, target_transform=target_transform)
@@ -353,7 +374,9 @@ class _CQ500BaseDataset(VisionDataset):
         ]
         if not self._records:
             raise RuntimeError(f"No labelled CQ500 volumes under {root_path}")
-        self._volume_cache = _VolumeCache(volume_cache_size)
+        self._volume_cache = (
+            _VolumeCache(volume_cache_size) if volume_cache_size is not None else None
+        )
 
     def get_patient_id(self, index: int) -> str:
         return self._records[index].patient_id
@@ -583,7 +606,6 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
-        volume_cache_size: int = 8,
         augment: bool = True,
         csv_path: Optional[Union[str, Path]] = None,
     ) -> None:
@@ -600,7 +622,18 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
         self.image_size = int(image_size)
         if transforms is None and transform is None and augment:
             transform = build_cq500_volume_transform(augment=True)
-        super().__init__(root, csv_path=csv_path, patient_ids=patient_ids, transforms=transforms, transform=transform, target_transform=target_transform, volume_cache_size=volume_cache_size)
+        # A multi-slice item uses every voxel of its source volume exactly once.
+        # Avoid retaining full volumes per worker: it adds substantial memory
+        # pressure but no useful hit rate when sampling scans without replacement.
+        super().__init__(
+            root,
+            csv_path=csv_path,
+            patient_ids=patient_ids,
+            transforms=transforms,
+            transform=transform,
+            target_transform=target_transform,
+            volume_cache_size=None,
+        )
         if self.task == "subtype":
             self._records = [record for record in self._records if self.labels[record.patient_id]["ich"] == 1]
         if not self._records:
@@ -615,9 +648,9 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, Any]:
         record = self._records[index]
-        volume = self._volume_cache.get(record.volume_path)
+        volume = _load_canonical_volume(record.volume_path)
         image = _resample_volume(
-            _zscore_normalize(volume),
+            _window_volume_per_slice(volume),
             self.n_slices,
             self.image_size,
             self.cq500_max_slices,
@@ -640,7 +673,7 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
 
 __all__ = [
     "CQ500MultiSliceDataset", "CQ500PairedSliceDataset", "CQ500SliceDataset", "CQ500TaskSpec",
-    "CQ500_TASK_CHOICES", "DEFAULT_LABELS_CSV", "DEFAULT_ROOT", "ICH_SUBTYPES",
+    "CQ500_TASK_CHOICES", "CT_WINDOW_CENTER", "CT_WINDOW_WIDTH", "DEFAULT_LABELS_CSV", "DEFAULT_ROOT", "ICH_SUBTYPES",
     "build_cq500_transform", "build_cq500_volume_transform", "read_cq500_labels",
     "resolve_cq500_task",
 ]

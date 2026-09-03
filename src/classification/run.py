@@ -40,6 +40,7 @@ DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
 DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d", "breastdm")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
+CLASSIFICATION_ENCODER_CHOICES = (*ENCODER_CHOICES, "triad")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
 
 
@@ -328,9 +329,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--mst-dropout", type=float, default=0.1)
     parser.add_argument(
         "--encoder",
-        choices=list(ENCODER_CHOICES),
+        choices=list(CLASSIFICATION_ENCODER_CHOICES),
         default="dinov3",
-        help="Frozen backbone: dinov3 | meddinov3 | braindino | custom (wireframe)",
+        help=(
+            "Backbone: dinov3 | meddinov3 | braindino | custom (wireframe) | "
+            "triad (3-D MRI Swin)"
+        ),
     )
     parser.add_argument(
         "--encoder-training",
@@ -384,8 +388,57 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "distributed-checkpoint directory loads only the ViT-B teacher "
             "backbone. Defaults: dinov3 → opt/dinov3-weights/...; "
             "meddinov3 → opt/meddinov3/model.pth; "
-            "braindino → opt/braindino/brain_dino_weights.pth"
+            "braindino → opt/braindino/brain_dino_weights.pth; "
+            "triad → opt/triad/Triad-SwinB-SimMIM.pth"
         ),
+    )
+    parser.add_argument(
+        "--triad-input-channels",
+        type=int,
+        default=3,
+        help=(
+            "Channels emitted by the selected volume dataset before Triad's "
+            "learned projection to one MRI channel (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--triad-volume-size",
+        type=int,
+        default=96,
+        help="Cubic D/H/W size passed to Triad; must be a multiple of 32 (default: 96)",
+    )
+    parser.add_argument(
+        "--triad-input-normalization",
+        choices=("imagenet", "none"),
+        default="imagenet",
+        help=(
+            "Input convention before Triad. imagenet reverses the current "
+            "volume datasets' ImageNet normalization before the MRI projection"
+        ),
+    )
+    parser.add_argument(
+        "--triad-feature-size",
+        type=int,
+        default=48,
+        help="Triad initial Swin feature width; use 48 with the supplied Swin-B checkpoint",
+    )
+    parser.add_argument(
+        "--triad-drop-path-rate",
+        type=float,
+        default=0.0,
+        help="Triad Swin stochastic-depth rate (default: 0)",
+    )
+    parser.add_argument(
+        "--triad-use-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use activation checkpointing inside Triad to reduce memory (default)",
+    )
+    parser.add_argument(
+        "--triad-trainable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fine-tune Triad's MRI-pretrained backbone instead of keeping it frozen",
     )
     parser.add_argument(
         "--dinov3-repo",
@@ -451,6 +504,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--d-model must be positive")
     if args.lora_r <= 0:
         parser.error("--lora-r must be positive")
+    if args.triad_input_channels <= 0:
+        parser.error("--triad-input-channels must be positive")
+    if args.triad_volume_size <= 0 or args.triad_volume_size % 32:
+        parser.error("--triad-volume-size must be a positive multiple of 32")
+    if args.triad_feature_size <= 0:
+        parser.error("--triad-feature-size must be positive")
+    if not 0.0 <= args.triad_drop_path_rate <= 1.0:
+        parser.error("--triad-drop-path-rate must be in [0, 1]")
+    if args.encoder == "triad" and args.encoder_training != "frozen":
+        parser.error("Triad does not support --encoder-training; use --triad-trainable")
+    if args.encoder != "triad" and args.triad_trainable:
+        parser.error("--triad-trainable requires --encoder triad")
     if args.freeze_epochs < 0:
         parser.error("--freeze-epochs must be non-negative")
     if args.encoder_training != "lora" and args.freeze_epochs > 0:

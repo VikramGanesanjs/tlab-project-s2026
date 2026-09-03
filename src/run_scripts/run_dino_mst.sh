@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=cq500_cls_transformer.err  ## error log file
-#SBATCH --output=cq500_cls_transformer.out ## output log file
+#SBATCH --error=cq500_cls_transformer_fixed.err  ## error log file
+#SBATCH --output=cq500_cls_transformer_fixed.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 

@@ -12,6 +12,7 @@ import logging
 import re
 import sys
 from pathlib import Path
+from typing import Any, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,20 +25,176 @@ if str(SRC_DIR) not in sys.path:
 
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from utils.load_dinov3 import load_braindino_encoder, load_dinov3_encoder  # noqa: E402
-from datasets.adni import (  # noqa: E402
-    ADNIClassificationDataset,
-    DEFAULT_ADNI_TASK,
-    build_adni_transform,
-)
-from datasets.duke import DukeClassificationDataset, build_duke_transform  # noqa: E402
-
 LOGGER = logging.getLogger("pca_dino_backbones")
 MEAN = torch.tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
 STD = torch.tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
-ADNI_DEFAULT_ROOT = Path("/common/ganesanv/tlab/data/ADNI")
 DUKE_DEFAULT_ROOT = Path("/common/ganesanv/tlab/data/tcia/duke_breast_cancer_processed")
 DINOV3_DEFAULT_REPO = Path("/common/ganesanv/tlab/opt/dinov3")
 DEFAULT_IMAGE_SIZE = 224
+DEFAULT_ADNI_TASK = "cn_mci_ad"
+PCA_DATASET_CHOICES = ("adni", "duke", "cq500", "breastdm", "amos", "brats_men")
+
+
+class _PCASingleSliceDataset:
+    """Adapt repository single-slice datasets to the PCA utility interface."""
+
+    def __init__(self, dataset: Any, *, name: str) -> None:
+        self.dataset = dataset
+        self.name = name
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def _image_and_target(self, index: int) -> tuple[torch.Tensor, Any]:
+        item = self.dataset[index]
+        if isinstance(item, tuple):
+            image, target = item
+        else:
+            image, target = item, None
+        image = torch.as_tensor(image)
+        if image.ndim != 3:
+            raise ValueError(
+                f"{self.name} single-slice dataset must return [C, H, W], "
+                f"got {tuple(image.shape)}"
+            )
+        if image.shape[0] == 4:
+            # DINO is RGB-only. Preserve all BraTSMen modalities in a fixed,
+            # deterministic 4-to-3 projection: T1c, T1n, and mean(T2f, T2w).
+            # BraTSMen has already applied its four-channel extension of
+            # ImageNet normalization, so temporarily reverse it before the
+            # projection and apply standard RGB ImageNet normalization again.
+            input_mean = image.new_tensor((0.485, 0.456, 0.406, 0.485)).view(4, 1, 1)
+            input_std = image.new_tensor((0.229, 0.224, 0.225, 0.229)).view(4, 1, 1)
+            modalities = image * input_std + input_mean
+            image = torch.stack(
+                (modalities[0], modalities[1], modalities[2:].mean(dim=0))
+            )
+            output_mean = image.new_tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
+            output_std = image.new_tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
+            image = (image - output_mean) / output_std
+        elif image.shape[0] == 1:
+            image = image.repeat(3, 1, 1)
+        elif image.shape[0] != 3:
+            raise ValueError(
+                f"{self.name} returned {image.shape[0]} channels; PCA DINO requires RGB"
+            )
+        return image, target
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, Any]:
+        return self._image_and_target(index)
+
+    def get_patient_id(self, index: int) -> str:
+        for name in ("get_patient_id", "get_case_id", "get_image_id"):
+            getter = getattr(self.dataset, name, None)
+            if callable(getter):
+                return str(getter(index))
+        return str(index)
+
+    def get_image_id(self, index: int) -> str:
+        getter = getattr(self.dataset, "get_image_id", None)
+        if callable(getter):
+            return str(getter(index))
+        patient_id = self.get_patient_id(index)
+        slice_getter = getattr(self.dataset, "get_slice_index", None)
+        suffix = slice_getter(index) if callable(slice_getter) else index
+        return f"{patient_id}_slice-{suffix}"
+
+
+def _default_data_root(dataset: str) -> Path:
+    if dataset == "adni":
+        from datasets.adni import DEFAULT_ROOT
+
+        return DEFAULT_ROOT
+    if dataset == "duke":
+        return DUKE_DEFAULT_ROOT
+    if dataset == "cq500":
+        from datasets.cq500 import DEFAULT_ROOT
+
+        return DEFAULT_ROOT
+    if dataset == "breastdm":
+        from datasets.breastdm import DEFAULT_ROOT
+
+        return DEFAULT_ROOT
+    if dataset == "amos":
+        from datasets.amos import DEFAULT_ROOT
+
+        return DEFAULT_ROOT
+    if dataset == "brats_men":
+        from datasets.brats_men import DEFAULT_ROOT
+
+        return DEFAULT_ROOT
+    raise ValueError(f"Unknown PCA dataset={dataset!r}")
+
+
+def build_pca_dataset(args: argparse.Namespace) -> _PCASingleSliceDataset:
+    """Build a deterministic repository single-slice dataset for PCA.
+
+    ``--dataset`` alone selects each dataset's own default root. Optional
+    ``--data-root`` and dataset-specific label/split arguments remain available
+    for alternate copies of the data.
+    """
+    root = Path(args.data_root) if args.data_root is not None else _default_data_root(args.dataset)
+    if args.dataset == "adni":
+        from datasets.adni import ADNIClassificationDataset, build_adni_transform
+
+        dataset: Any = ADNIClassificationDataset(
+            root=root,
+            csv_path=args.csv_path,
+            task=args.adni_task,
+            z_min=args.z_min,
+            z_max=args.z_max,
+            transform=build_adni_transform(args.image_size, augment=False),
+        )
+    elif args.dataset == "duke":
+        from datasets.duke import DukeClassificationDataset, build_duke_transform
+
+        dataset = DukeClassificationDataset(
+            root=root,
+            scan=args.scan,
+            z_min=args.z_min,
+            z_max=args.z_max,
+            include_bilateral=args.include_bilateral,
+            transform=build_duke_transform(args.image_size, augment=False),
+        )
+    elif args.dataset == "cq500":
+        from datasets.cq500 import CQ500SliceDataset, build_cq500_transform
+
+        dataset = CQ500SliceDataset(
+            root=root,
+            csv_path=args.csv_path,
+            task=args.cq500_task,
+            z_min=args.z_min,
+            z_max=args.z_max,
+            transform=build_cq500_transform(args.image_size, augment=False),
+        )
+    elif args.dataset == "breastdm":
+        from datasets.breastdm import BreastDMSingleSliceDataset
+
+        dataset = BreastDMSingleSliceDataset(
+            root=root,
+            split=args.split,
+            image_size=args.image_size,
+            augment=False,
+        )
+    elif args.dataset == "amos":
+        from datasets.amos import AMOSSingleSliceDataset
+
+        dataset = AMOSSingleSliceDataset(
+            root=root,
+            image_size=args.image_size,
+            augment=False,
+        )
+    elif args.dataset == "brats_men":
+        from datasets.brats_men import BraTSMenSingleSliceDataset
+
+        dataset = BraTSMenSingleSliceDataset(
+            root=root,
+            image_size=args.image_size,
+            augment=False,
+        )
+    else:  # pragma: no cover - argparse constrains choices
+        raise ValueError(f"Unknown PCA dataset={args.dataset!r}")
+    return _PCASingleSliceDataset(dataset, name=args.dataset)
 
 
 def load_pca_backbone(
@@ -67,16 +224,9 @@ def load_pca_backbone(
     )
 
 
-def sample_adni_slice(args):
-    """Construct the repository ADNI dataset and return one random sample."""
-    dataset = ADNIClassificationDataset(
-        root=args.data_root,
-        csv_path=args.csv_path,
-        task=args.adni_task,
-        z_min=args.z_min,
-        z_max=args.z_max,
-        transform=build_adni_transform(args.image_size, augment=False),
-    )
+def sample_dataset_slice(args):
+    """Construct the selected repository dataset and return one random slice."""
+    dataset = build_pca_dataset(args)
     if args.sample_index is None:
         generator = np.random.default_rng(args.seed)
         index = int(generator.integers(len(dataset)))
@@ -86,13 +236,19 @@ def sample_adni_slice(args):
             raise IndexError(f"--sample-index must be in [0, {len(dataset)}), got {index}")
     image, label = dataset[index]
     LOGGER.info(
-        "Sampled ADNI index=%d image_id=%s patient=%s label=%s",
+        "Sampled %s index=%d image_id=%s patient=%s label=%s",
+        args.dataset,
         index,
         dataset.get_image_id(index),
         dataset.get_patient_id(index),
         label,
     )
     return image.unsqueeze(0), index
+
+
+# Backward-compatible name for downstream scripts that used the old ADNI-only
+# helper. It now honors ``args.dataset`` when present.
+sample_adni_slice = sample_dataset_slice
 
 
 @torch.inference_mode()
@@ -119,7 +275,7 @@ def save_plot(image, maps, output):
     display = (image[0].cpu() * STD + MEAN).clamp(0, 1).permute(1, 2, 0).numpy()
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     axes[0].imshow(display)
-    axes[0].set_title("ADNI slice")
+    axes[0].set_title("Input slice")
     axes[0].axis("off")
     for axis, (title, projection) in zip(axes[1:], maps):
         axis.imshow(projection, interpolation="nearest")
@@ -132,26 +288,7 @@ def save_plot(image, maps, output):
 
 
 def _evolution_dataset(args):
-    root = args.data_root or (
-        ADNI_DEFAULT_ROOT if args.dataset == "adni" else DUKE_DEFAULT_ROOT
-    )
-    if args.dataset == "adni":
-        return ADNIClassificationDataset(
-            root=root,
-            csv_path=args.csv_path,
-            task=args.adni_task,
-            z_min=args.z_min,
-            z_max=args.z_max,
-            transform=build_adni_transform(args.image_size, augment=False),
-        )
-    return DukeClassificationDataset(
-        root=root,
-        scan=args.scan,
-        z_min=args.z_min,
-        z_max=args.z_max,
-        include_bilateral=args.include_bilateral,
-        transform=build_duke_transform(args.image_size, augment=False),
-    )
+    return build_pca_dataset(args)
 
 
 def _sample_evolution_images(dataset, n_images: int, seed: int | None):
@@ -175,10 +312,7 @@ def _sample_evolution_images(dataset, n_images: int, seed: int | None):
     for index in indices:
         image, _ = dataset[index]
         images.append(image)
-        if hasattr(dataset, "get_image_id"):
-            names.append(dataset.get_image_id(index))
-        else:
-            names.append(f"{dataset.get_patient_id(index)}_{dataset.get_side(index)}")
+        names.append(dataset.get_image_id(index))
     return torch.stack(images), names
 
 
@@ -337,9 +471,16 @@ def parse_evolution_args(argv=None):
         ),
     )
     parser.add_argument("--data-root", type=Path, default=None)
-    parser.add_argument("--dataset", choices=("adni", "duke"), default="adni")
+    parser.add_argument("--dataset", choices=PCA_DATASET_CHOICES, default="adni")
     parser.add_argument("--csv-path", type=Path, default=None)
     parser.add_argument("--adni-task", default=DEFAULT_ADNI_TASK)
+    parser.add_argument("--cq500-task", default="ich")
+    parser.add_argument(
+        "--split",
+        choices=("train", "val", "test"),
+        default="train",
+        help="BreastDM split (ignored by the other PCA datasets)",
+    )
     parser.add_argument("--scan", default="pre")
     parser.add_argument("--include-bilateral", action="store_true")
     parser.add_argument("--z-min", type=float, default=0.25)
@@ -361,11 +502,26 @@ def parse_evolution_args(argv=None):
     return args
 
 
-def parse_args():
+def parse_args(argv: Optional[list[str]] = None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=ADNI_DEFAULT_ROOT)
+    parser.add_argument(
+        "--dataset",
+        choices=PCA_DATASET_CHOICES,
+        default="adni",
+        help="Single-slice dataset to visualize; its standard root is used by default",
+    )
+    parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--csv-path", type=Path, default=None)
     parser.add_argument("--adni-task", default=DEFAULT_ADNI_TASK)
+    parser.add_argument("--cq500-task", default="ich")
+    parser.add_argument(
+        "--split",
+        choices=("train", "val", "test"),
+        default="train",
+        help="BreastDM split (ignored by the other datasets)",
+    )
+    parser.add_argument("--scan", default="pre")
+    parser.add_argument("--include-bilateral", action="store_true")
     parser.add_argument("--z-min", type=float, default=0.25)
     parser.add_argument("--z-max", type=float, default=0.75)
     parser.add_argument("--sample-index", type=int, default=None)
@@ -386,7 +542,7 @@ def parse_args():
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--output", type=Path, default=Path("pca_adni_slice.png"))
     parser.add_argument("--device", default=None)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
@@ -400,7 +556,7 @@ def main():
     if args.image_size <= 0 or args.image_size % 16:
         raise ValueError("--image-size must be positive and divisible by 16")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    image, index = sample_adni_slice(args)
+    image, index = sample_dataset_slice(args)
     grid = (args.image_size // 16, args.image_size // 16)
     LOGGER.info("Image size=%dx%d, patch grid=%s", args.image_size, args.image_size, grid)
 
@@ -438,8 +594,9 @@ def main():
         features = patch_features(model, image, grid, device)[0]
         feature_sets.append((name, features))
         LOGGER.info(
-            "%s features for ADNI sample %d: %s",
+            "%s features for %s sample %d: %s",
             name,
+            args.dataset,
             index,
             features.shape,
         )
