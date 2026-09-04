@@ -9,8 +9,6 @@ dino:
   head_hidden_dim: 2048
 ibot:
   mask_sample_probability: 0.5
-  # Reuse each sample's mask for both slices in a pair.
-  identical_masks: false
   mask_ratio_min_max:
   - 0.1
   - 0.5
@@ -114,7 +112,8 @@ checkpointing:
 
 # Volumetric-DINO slice-pair fine-tuning options.
 uwsd_loss_weight: 1.0
-croco_ibot_loss_weight: 1.0
+ibot_loss_weight: 1.0
+cross_slice_gram_penalty_weight: 0.1
 cross_view_global_loss_weight: 1.0
 gamma: 1.0
 lora:
@@ -122,9 +121,3 @@ lora:
   rank: 8
 unfreeze_last_layers: 0
 unfreeze_patch_embeddings: false
-decoder:
-  n_blocks: 2
-  # null uses the encoder embedding dimension.
-  embed_dim: null
-  n_heads: 4
-  mlp_ratio: 4.0

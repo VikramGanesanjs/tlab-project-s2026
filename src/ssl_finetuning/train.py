@@ -317,7 +317,7 @@ def build_schedulers(cfg, iterations_per_epoch):
     momentum_schedule = CosineScheduler(**momentum)
     teacher_temp_schedule = CosineScheduler(**teacher_temp)
     # The custom SSL objective trains both heads from the beginning. Keep the
-    # last-layer schedule active during Stage A (heads + CVD only).
+    # last-layer schedule active during Stage A (heads only).
     last_layer_lr_schedule = CosineScheduler(**lr)
     logger.info("Schedulers ready.")
     return (
@@ -655,7 +655,7 @@ def do_train(cfg, model, resume=False):
         max_iter,
     )
     logger.info(
-        "LR policy: heads/CVD start at %.6g immediately; LoRA stays at 0 for "
+        "LR policy: heads start at %.6g immediately; LoRA stays at 0 for "
         "%d iterations, then warms to the configured peak over %d iterations",
         float(lr_schedule[0]),
         freeze_backbone_iters,
