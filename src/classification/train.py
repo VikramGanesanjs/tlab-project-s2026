@@ -79,11 +79,18 @@ from utils.fold_cv import make_dataset_patient_folds  # noqa: E402
 from utils.splits import patient_level_stratified_split  # noqa: E402
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
 from utils.vit_lora import LoRA, add_lora_to_vit, freeze_non_lora_parameters  # noqa: E402
+from utils.data_pipeline_timing import DataPipelineTimer  # noqa: E402
 from classification.model import MultiSliceDinoModel, set_lora_requires_grad  # noqa: E402
 from classification.triad import (  # noqa: E402
     DEFAULT_TRIAD_CHECKPOINT,
     TriadEncoder,
     TriadVolumeClassifier,
+)
+from classification.neurovfm import (  # noqa: E402
+    DEFAULT_NEUROVFM_REPO,
+    DEFAULT_NEUROVFM_WEIGHTS,
+    NeuroVFMEncoder,
+    NeuroVFMVolumeClassifier,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,7 +108,7 @@ MultiSliceDataset = Union[
     OrganMNIST3DMultiSliceDataset,
     BreastDMMultiSliceDataset,
 ]
-ClassificationModel = Union[MultiSliceDinoModel, TriadVolumeClassifier]
+ClassificationModel = Union[MultiSliceDinoModel, TriadVolumeClassifier, NeuroVFMVolumeClassifier]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
 
 
@@ -860,6 +867,11 @@ def _checkpoint_payload(
         "triad_feature_size": getattr(args, "triad_feature_size", None),
         "triad_drop_path_rate": getattr(args, "triad_drop_path_rate", None),
         "triad_use_checkpoint": getattr(args, "triad_use_checkpoint", None),
+        "neurovfm_repo": str(getattr(args, "neurovfm_repo", DEFAULT_NEUROVFM_REPO)),
+        "neurovfm_input_channels": getattr(args, "neurovfm_input_channels", None),
+        "neurovfm_volume_shape": list(getattr(args, "neurovfm_volume_shape", ())),
+        "neurovfm_input_normalization": getattr(args, "neurovfm_input_normalization", None),
+        "neurovfm_modality": getattr(args, "neurovfm_modality", None),
         "hidden_dim": args.hidden_dim,
         "min_epochs": args.min_epochs,
         "early_stopping_patience": args.early_stopping_patience,
@@ -899,6 +911,7 @@ def build_dataset(
     augment: Optional[bool] = None,
     patient_ids: Optional[Sequence[str]] = None,
     split: Optional[str] = None,
+    data_timing: Optional[Any] = None,
 ) -> MultiSliceDataset:
     use_augment = args.augment if augment is None else bool(augment)
     if args.dataset == "duke":
@@ -916,12 +929,15 @@ def build_dataset(
         return ADNIMultiSliceDataset(
             root=args.data_root,
             csv_path=args.csv_path,
+            manifest_path=getattr(args, "adni_manifest_path", None),
             task=args.adni_task,
             n_slices=args.n_slices,
             patient_ids=patient_ids,
             augment=use_augment,
             image_size=args.image_size,
             transform=build_adni_volume_transform(augment=use_augment),
+            return_imagenet_tensors=args.encoder != "neurovfm",
+            data_timing=data_timing,
         )
     if args.dataset == "cq500":
         return CQ500MultiSliceDataset(
@@ -963,6 +979,7 @@ def build_dataset(
 
 def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) -> None:
     torch.manual_seed(args.seed)
+    data_pipeline_timer = DataPipelineTimer() if getattr(args, "benchmark", False) else None
     cq500_task = getattr(args, "cq500_task", "ich")
     splits_file = getattr(args, "splits_file", None)
     if args.n_slices is None and args.dataset != "cq500":
@@ -990,7 +1007,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             len(test_dataset), unit_name,
         )
     else:
-        split_dataset = build_dataset(args, augment=False)
+        split_dataset = build_dataset(args, augment=False, data_timing=data_pipeline_timer.proxy if data_pipeline_timer else None)
         labels = collect_labels(split_dataset)
         summarize_class_counts(
             labels, name=f"full dataset ({unit_name})", class_names=class_names
@@ -1009,9 +1026,9 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             train_patient_ids, val_patient_ids, test_patient_ids = folds.get_split(
                 args.fold, train_ratio=args.train_ratio, train_seed=args.data_seed
             )
-        train_dataset = build_dataset(args, augment=args.augment, patient_ids=train_patient_ids)
-        val_dataset = build_dataset(args, augment=False, patient_ids=val_patient_ids)
-        test_dataset = build_dataset(args, augment=False, patient_ids=test_patient_ids)
+        train_dataset = build_dataset(args, augment=args.augment, patient_ids=train_patient_ids, data_timing=data_pipeline_timer.proxy if data_pipeline_timer else None)
+        val_dataset = build_dataset(args, augment=False, patient_ids=val_patient_ids, data_timing=data_pipeline_timer.proxy if data_pipeline_timer else None)
+        test_dataset = build_dataset(args, augment=False, patient_ids=test_patient_ids, data_timing=data_pipeline_timer.proxy if data_pipeline_timer else None)
         _require_dataset_patient_ids(train_dataset, train_patient_ids, split_name="train")
         _require_dataset_patient_ids(val_dataset, val_patient_ids, split_name="validation")
         _require_dataset_patient_ids(test_dataset, test_patient_ids, split_name="test")
@@ -1151,6 +1168,24 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             num_classes=num_classes,
             encoder_training="finetune" if args.triad_trainable else "frozen",
         ).to(device)
+    elif args.encoder == "neurovfm":
+        modality = args.neurovfm_modality
+        if modality == "auto":
+            modality = "ct" if args.dataset == "cq500" else "mri"
+        encoder = NeuroVFMEncoder(
+            repo=Path(args.neurovfm_repo),
+            weights=Path(args.weights) if args.weights is not None else DEFAULT_NEUROVFM_WEIGHTS,
+            device=device,
+            modality=modality,
+        )
+        model = NeuroVFMVolumeClassifier(
+            encoder,
+            input_channels=args.neurovfm_input_channels,
+            volume_shape=args.neurovfm_volume_shape,
+            input_normalization=args.neurovfm_input_normalization,
+            hidden_dim=args.hidden_dim or None,
+            num_classes=num_classes,
+        ).to(device)
     else:
         if args.weights is not None and args.encoder == "dinov3":
             encoder = load_custom_dinov3_encoder(
@@ -1219,7 +1254,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
     )
     best_checkpoint_val_loss = float("inf")
     best_epoch = 0
-    model_kind = "triad" if args.encoder == "triad" else "mst"
+    model_kind = args.encoder if args.encoder in {"triad", "neurovfm"} else "mst"
     best_path = checkpoint_dir / f"best_{model_kind}.pt"
     epochs_trained = 0
     stopped_early = False
@@ -1234,7 +1269,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         "dataset=%s adni_task=%s encoder=%s features=%s n_cls_tokens=%d aggregator=%s "
         "n_slices=%s "
         "encoder_training=%s lora_r=%s freeze_epochs=%d num_classes=%d "
-        "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%d loss=%s",
+        "train_%s=%d val_%s=%d test_%s=%d embed_dim=%d d_model=%s loss=%s",
         args.dataset,
         args.adni_task if args.dataset == "adni" else cq500_task if args.dataset == "cq500" else None,
         args.encoder,
@@ -1256,6 +1291,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         (
             args.triad_volume_size
             if args.encoder == "triad"
+            else args.neurovfm_volume_shape
+            if args.encoder == "neurovfm"
             else args.d_model
         ),
         loss_name,
@@ -1293,6 +1330,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         correct = 0
         seen = 0
         profiler = EpochProfiler(device) if benchmark_enabled else None
+        if data_pipeline_timer is not None:
+            data_pipeline_timer.reset()
         if benchmark_enabled and device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         epoch_start_time = time.perf_counter()
@@ -1354,6 +1393,8 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         train_loss = running_loss / max(seen, 1)
         train_accuracy = correct / max(seen, 1)
         train_timings = profiler.finish() if profiler is not None else {}
+        if data_pipeline_timer is not None:
+            train_timings.update(data_pipeline_timer.snapshot())
         train_wall_time = time.perf_counter() - train_start_time
         if val_loader is None:
             if profiler is not None:
@@ -1379,9 +1420,12 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
                 train_loss,
                 train_accuracy,
                 (
-                    " data=%.2fs dino=%.2fs head=%.2fs backward=%.2fs"
+                    " data=%.2fs read=%.2fs prep=%.2fs aug=%.2fs dino=%.2fs head=%.2fs backward=%.2fs"
                     % (
                         train_timings.get("data_loading_s", 0.0),
+                        train_timings.get("volume_read_s", 0.0),
+                        train_timings.get("volume_preprocessing_s", 0.0),
+                        train_timings.get("volume_augmentation_s", 0.0),
                         train_timings.get("dino_forward_s", 0.0),
                         train_timings.get("rest_network_forward_s", 0.0),
                         train_timings.get("backward_optimizer_s", 0.0),
@@ -1478,10 +1522,13 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
             current_metric_value,
             " *" if improved else "",
             (
-                " | time: data=%.2fs transfer=%.2fs dino=%.2fs head=%.2fs "
+                " | time: data=%.2fs read=%.2fs prep=%.2fs aug=%.2fs transfer=%.2fs dino=%.2fs head=%.2fs "
                 "backward=%.2fs val=%.2fs epoch=%.2fs"
                 % (
                     train_timings.get("data_loading_s", 0.0),
+                    train_timings.get("volume_read_s", 0.0),
+                    train_timings.get("volume_preprocessing_s", 0.0),
+                    train_timings.get("volume_augmentation_s", 0.0),
                     train_timings.get("host_to_device_s", 0.0),
                     train_timings.get("dino_forward_s", 0.0),
                     train_timings.get("rest_network_forward_s", 0.0),
@@ -1654,3 +1701,5 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         metrics_by_split=metrics_by_split,
         epoch_benchmarks=epoch_benchmarks if benchmark_enabled else None,
     )
+    if data_pipeline_timer is not None:
+        data_pipeline_timer.close()

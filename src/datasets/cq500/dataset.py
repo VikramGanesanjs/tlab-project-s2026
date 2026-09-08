@@ -188,9 +188,21 @@ def _canonical_metadata(volume_path: Path) -> Tuple[int, Tuple[float, float, flo
     return int(image.shape[-1]), spacing
 
 
-def _discover_volume_records(root: Path) -> List[_VolumeRecord]:
+def _discover_volume_records(
+    root: Path, patient_ids: Optional[Sequence[str]] = None
+) -> List[_VolumeRecord]:
     records: List[_VolumeRecord] = []
-    for volume_path in sorted(root.glob(f"CQ500CT*/*/{VOLUME_NAME}")):
+    requested = (
+        {_normalize_patient_id(patient_id) for patient_id in patient_ids}
+        if patient_ids is not None
+        else None
+    )
+    volume_paths = (
+        [path for patient_id in sorted(requested) for path in (root / patient_id).glob(f"*/{VOLUME_NAME}")]
+        if requested is not None
+        else root.glob(f"CQ500CT*/*/{VOLUME_NAME}")
+    )
+    for volume_path in sorted(volume_paths):
         relative = volume_path.relative_to(root)
         if len(relative.parts) != 3:
             continue
@@ -365,7 +377,7 @@ class _CQ500BaseDataset(VisionDataset):
         super().__init__(str(root_path), transforms=transforms, transform=transform, target_transform=target_transform)
         self.root_path = root_path
         self.labels = read_cq500_labels(csv_path or DEFAULT_LABELS_CSV) if load_labels else {}
-        records = _discover_volume_records(root_path)
+        records = _discover_volume_records(root_path, patient_ids=patient_ids)
         selected = {_normalize_patient_id(value) for value in patient_ids} if patient_ids is not None else None
         self._records = [
             record for record in records

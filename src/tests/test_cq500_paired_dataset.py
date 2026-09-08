@@ -122,6 +122,27 @@ class TestCQ500PairedSliceDataset(unittest.TestCase):
         target[0] = 0.0
         self.assertEqual(dataset.get_target(0)[0], 1.0)
 
+    def test_patient_ids_restrict_paired_samples(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            labels_path = self._write_labels(root)
+            with patch(
+                "datasets.cq500.dataset._discover_volume_records",
+                return_value=self._records(root),
+            ):
+                dataset = CQ500PairedSliceDataset(
+                    root=root,
+                    csv_path=labels_path,
+                    patient_ids=["CQ500CT2", "CQ500CT5"],
+                    transform=lambda image: image,
+                )
+
+        self.assertEqual(len(dataset), 4)
+        self.assertEqual(
+            {dataset.get_patient_id(index) for index in range(len(dataset))},
+            {"CQ500CT2", "CQ500CT5"},
+        )
+
     def test_multi_slice_dataset_does_not_retain_full_volumes(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -259,6 +259,15 @@ def _epochs_to_iterations(epochs, iterations_per_epoch: int, *, field_name: str)
     return int(math.floor(epochs * iterations_per_epoch + 0.5))
 
 
+def _delayed_penalty_weight(
+    configured_weight: float,
+    delay_iterations: int,
+    iteration: int,
+) -> float:
+    """Keep a penalty disabled until its epoch-derived iteration boundary."""
+    return 0.0 if iteration < delay_iterations else float(configured_weight)
+
+
 def build_schedulers(cfg, iterations_per_epoch):
     total_iterations = cfg.optim["epochs"] * iterations_per_epoch
     freeze_iterations = _epochs_to_iterations(
@@ -418,7 +427,7 @@ def _cq500_patient_split_stratum(dataset, index):
     return int(target)
 
 
-def _build_train_patient_subset(cfg, dataset, dataset_name):
+def _select_train_patient_ids(cfg, dataset, dataset_name):
     stratum_fn = {
         "adni": _adni_patient_split_stratum,
         "cq500": _cq500_patient_split_stratum,
@@ -435,16 +444,20 @@ def _build_train_patient_subset(cfg, dataset, dataset_name):
         train_ratio=float(cfg.train.train_ratio),
         train_seed=int(cfg.train.data_seed),
     )
-    train_dataset = dataset_subset_for_patients(dataset, train_patient_ids)
+    train_patient_id_set = set(train_patient_ids)
+    train_sample_count = sum(
+        str(dataset.get_patient_id(index)) in train_patient_id_set
+        for index in range(len(dataset))
+    )
 
     logger.info(
         "Fine-tuning fold %d/%d (seed=%d) uses %d class-balanced training "
         "patients (%d samples, ratio=%.3f); validation/test reserve %d/%d patients",
         int(cfg.train.fold), int(cfg.train.n_folds), int(cfg.train.data_seed),
-        len(train_patient_ids), len(train_dataset), float(cfg.train.train_ratio),
+        len(train_patient_ids), train_sample_count, float(cfg.train.train_ratio),
         len(val_patient_ids), len(test_patient_ids),
     )
-    return train_dataset
+    return train_patient_ids
 
 
 def build_data_loader_from_cfg(
@@ -460,7 +473,6 @@ def build_data_loader_from_cfg(
             root=data_root or ADNI_DEFAULT_ROOT,
             task=cfg.train.adni_task,
             max_distance=cfg.train.max_distance,
-            n_patients=None,
             transform=identity_transform,
             image_size=cfg.crops.global_crops_size,
             seed=cfg.train.seed,
@@ -492,7 +504,31 @@ def build_data_loader_from_cfg(
             f"Unknown paired dataset={dataset_name!r}; expected 'adni', 'cq500', or 'duke'"
         )
 
-    dataset = _build_train_patient_subset(cfg, dataset, dataset_name)
+    train_patient_ids = _select_train_patient_ids(cfg, dataset, dataset_name)
+    if dataset_name == "adni":
+        dataset = ADNIPairedSliceDataset(
+            root=data_root or ADNI_DEFAULT_ROOT,
+            task=cfg.train.adni_task,
+            patient_ids=train_patient_ids,
+            max_distance=cfg.train.max_distance,
+            transform=identity_transform,
+            image_size=cfg.crops.global_crops_size,
+            seed=cfg.train.seed,
+        )
+    elif dataset_name == "cq500":
+        dataset = CQ500PairedSliceDataset(
+            root=root,
+            csv_path=root / "reads.csv",
+            task=getattr(cfg.train, "cq500_task", "ich"),
+            patient_ids=train_patient_ids,
+            max_distance=cfg.train.max_distance,
+            transform=identity_transform,
+            image_size=cfg.crops.global_crops_size,
+            seed=cfg.train.seed,
+        )
+    else:
+        # Duke has not yet adopted the patient_ids paired-dataset interface.
+        dataset = dataset_subset_for_patients(dataset, train_patient_ids)
     pair_transform = PairToDinoGlobalCrops(model.build_data_augmentation_dino(cfg))
 
     batch_size = cfg.train.batch_size_per_gpu
@@ -619,6 +655,14 @@ def do_train(cfg, model, resume=False):
         iterations_per_epoch,
         field_name="optim.freeze_backbone_epochs",
     )
+    cross_slice_gram_penalty_delay_iters = _epochs_to_iterations(
+        cfg.cross_slice_gram_penalty_delay_epochs,
+        iterations_per_epoch,
+        field_name="cross_slice_gram_penalty_delay_epochs",
+    )
+    configured_cross_slice_gram_penalty_weight = float(
+        model.cross_slice_gram_penalty_weight
+    )
     eval_period_iterations = _period_in_iterations(
         cfg.evaluation,
         epoch_key="eval_period_epochs",
@@ -676,6 +720,13 @@ def do_train(cfg, model, resume=False):
         ),
         cfg.optim.freeze_backbone_epochs,
         freeze_backbone_iters,
+    )
+    logger.info(
+        "Cross-slice Gram penalty: weight=%.6g after a %.3f-epoch delay "
+        "(%d iterations)",
+        configured_cross_slice_gram_penalty_weight,
+        cfg.cross_slice_gram_penalty_delay_epochs,
+        cross_slice_gram_penalty_delay_iters,
     )
     logger.info(
         "Evaluation period: %d iterations; checkpoint period: %d iterations",
@@ -749,6 +800,12 @@ def do_train(cfg, model, resume=False):
         teacher_temp = teacher_temp_schedule[it]
         last_layer_lr = last_layer_lr_schedule[it]
         lora_lr = lora_lr_schedule[it]
+        cross_slice_gram_penalty_weight = _delayed_penalty_weight(
+            configured_cross_slice_gram_penalty_weight,
+            cross_slice_gram_penalty_delay_iters,
+            it,
+        )
+        model.cross_slice_gram_penalty_weight = cross_slice_gram_penalty_weight
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr, lora_lr)
 
         # Forward backward
@@ -823,6 +880,9 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(mom=mom)
         metric_logger.update(teacher_temp=teacher_temp)
         metric_logger.update(last_layer_lr=last_layer_lr)
+        metric_logger.update(
+            cross_slice_gram_penalty_weight=cross_slice_gram_penalty_weight
+        )
         metric_logger.update(
             epoch=iteration // iterations_per_epoch + 1,
             epoch_iteration=iteration % iterations_per_epoch + 1,

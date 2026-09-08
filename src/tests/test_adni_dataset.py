@@ -8,37 +8,67 @@ import numpy as np
 import torch
 
 from datasets.adni.dataset import (
+    ADNIPairedSliceDataset,
     ADNIMultiSliceDataset,
     _ScanRecord,
-    _slice_to_imagenet_tensor,
+    _scale_volume_to_unit_interval,
     _volume_to_imagenet_tensors,
 )
 
 
 class TestADNIVolumeToImageNetTensors(unittest.TestCase):
-    def test_matches_the_previous_per_slice_pil_conversion(self) -> None:
-        volume = torch.tensor(
-            [
-                [[-2.0, -0.5, 0.0], [0.25, 0.5, 1.0]],
-                [[4.0, 4.0, 4.0], [4.0, 4.0, 4.0]],
-                [[-3.0, float("nan"), 1.0], [float("-inf"), 2.0, float("inf")]],
-            ]
+    def test_paired_dataset_restricts_samples_to_patient_ids(self) -> None:
+        records = [
+            _ScanRecord(
+                image_id=f"I{index}",
+                patient_id=f"patient-{index}",
+                volume_path=Path(f"/unused/volume-{index}.nii"),
+                n_slices=2,
+                label=index,
+                phenotype={"Group": "CN", "Sex": "F", "Age": "70"},
+            )
+            for index in range(2)
+        ]
+        with patch(
+            "datasets.adni.dataset._build_scan_index",
+            return_value=(records, ["Group", "Sex", "Age"]),
+        ):
+            dataset = ADNIPairedSliceDataset(
+                root=Path("/unused"),
+                patient_ids=["patient-1"],
+                transform=lambda image: image,
+            )
+
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual(
+            {dataset.get_patient_id(index) for index in range(len(dataset))},
+            {"patient-1"},
         )
 
-        expected = torch.stack(
-            [_slice_to_imagenet_tensor(image_slice) for image_slice in volume], dim=0
+    def test_applies_imagenet_normalization_without_per_slice_rescaling(self) -> None:
+        volume = torch.tensor(
+            [
+                [[0.0, 0.25, 0.5], [0.75, 1.0, 0.5]],
+                [[0.25, 0.25, 0.25], [0.25, 0.25, 0.25]],
+            ]
         )
         actual = _volume_to_imagenet_tensors(volume)
+        mean = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+        std = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+        expected = (volume.unsqueeze(1).repeat(1, 3, 1, 1) - mean) / std
 
         self.assertEqual(actual.dtype, torch.float32)
         self.assertEqual(tuple(actual.shape), (3, 3, 2, 3))
         self.assertTrue(torch.equal(actual, expected))
 
-    def test_rejects_a_slice_without_finite_values(self) -> None:
-        volume = torch.tensor([[[0.0]], [[float("nan")]]])
+    def test_volume_scaling_uses_one_robust_scale_for_all_slices(self) -> None:
+        volume = np.array([[[0.0, 10.0], [20.0, 1000.0]]], dtype=np.float32)
+        scaled = _scale_volume_to_unit_interval(volume)
 
-        with self.assertRaisesRegex(ValueError, "contains no finite"):
-            _volume_to_imagenet_tensors(volume)
+        self.assertEqual(scaled.dtype, np.float32)
+        self.assertEqual(float(scaled.min()), 0.0)
+        self.assertEqual(float(scaled.max()), 1.0)
+        self.assertLess(float(scaled[0, 0, 1]), 0.1)
 
     def test_multi_slice_item_loads_without_using_the_volume_cache(self) -> None:
         dataset = object.__new__(ADNIMultiSliceDataset)

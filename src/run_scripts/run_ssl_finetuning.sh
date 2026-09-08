@@ -20,7 +20,7 @@ python -m dinov3.run.submit \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \
-  --output-dir "${PROJECT_ROOT}/runs/fixed_ssl_finetuning/adjustments_5/0" \
+  --output-dir "${PROJECT_ROOT}/runs/ssl_gram_penalty/only_uwsd/4" \
   "${PROJECT_ROOT}/src/ssl_finetuning/train.py" \
-  --config-file "/common/ganesanv/tlab/runs/fixed_ssl_finetuning/adjustments_5.yaml" \
-  train.fold=0
+  --config-file "/common/ganesanv/tlab/runs/ssl_gram_penalty/only_uwsd.yaml" \
+  train.fold=4

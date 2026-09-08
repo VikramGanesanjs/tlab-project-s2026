@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=120G
 #SBATCH --time 48:00:00        
-#SBATCH --error=cq500_cls_transformer_fixed.err  ## error log file
-#SBATCH --output=cq500_cls_transformer_fixed.out ## output log file
+#SBATCH --error=uwsd_9999.err  ## error log file
+#SBATCH --output=uwsd_9999.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
@@ -17,4 +17,4 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab/src
 
-python -m classification.run --params-file /common/ganesanv/tlab/runs/cq500/transformer.yaml
+python -m classification.run --params-file /common/ganesanv/tlab/runs/ssl_gram_penalty/only_uwsd/0/classification.yaml

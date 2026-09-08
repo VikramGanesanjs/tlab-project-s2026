@@ -1,1 +1,1 @@
-"""Multi-slice DINOv3 and Triad 3-D MRI classification package."""
+"""Multi-slice DINOv3, Triad, and NeuroVFM volume classification package."""

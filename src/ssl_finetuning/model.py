@@ -31,13 +31,14 @@ from dinov3.data import DataAugmentationDINO
 from dinov3.data.masking import MaskingGenerator
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
 from dinov3.layers.dino_head import DINOHead
-from dinov3.loss import DINOLoss, GramLoss, iBOTPatchLoss
+from dinov3.loss import DINOLoss, iBOTPatchLoss
 from dinov3.models import build_model_from_cfg
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
 
 from .losses import _sinkhorn_knopp
 from .losses import uwsd_loss as compute_uwsd_loss
+from .gram_loss import GramLoss
 
 logger = logging.getLogger("dinov3")
 
@@ -206,6 +207,7 @@ class SSLFineTune(nn.Module):
             apply_norm=True,
             img_level=True,
             remove_neg=True,
+            spatial_window_size=getattr(cfg, "cross_slice_gram_spatial_window_size", 0),
         )
         self._distributed_prepared = False
         self.uwsd_loss_weight = float(cfg.uwsd_loss_weight)
