@@ -49,6 +49,10 @@ from datasets.cq500 import (
     CQ500PairedSliceDataset,
     DEFAULT_ROOT as CQ500_DEFAULT_ROOT,
 )
+from datasets.breastdm import (
+    BreastDMPairedSliceDataset,
+    DEFAULT_ROOT as BREASTDM_DEFAULT_ROOT,
+)
 from datasets.duke import DukeBreastMRIDataset, PairToDinoGlobalCrops
 from datasets.duke.dataset import _DEFAULT_OUT_ROOT as DUKE_DEFAULT_ROOT
 
@@ -499,12 +503,26 @@ def build_data_loader_from_cfg(
             image_size=cfg.crops.global_crops_size,
             seed=cfg.train.seed,
         )
+    elif dataset_name == "breastdm":
+        # BreastDM supplies fixed train/val/test directories. SSL fine-tuning
+        # uses the supplied training split directly rather than constructing
+        # patient-level cross-validation folds.
+        dataset = BreastDMPairedSliceDataset(
+            root=data_root or BREASTDM_DEFAULT_ROOT,
+            split="train",
+            transform=identity_transform,
+            image_size=cfg.crops.global_crops_size,
+            seed=cfg.train.seed,
+        )
     else:
         raise ValueError(
-            f"Unknown paired dataset={dataset_name!r}; expected 'adni', 'cq500', or 'duke'"
+            "Unknown paired dataset="
+            f"{dataset_name!r}; expected 'adni', 'breastdm', 'cq500', or 'duke'"
         )
 
-    train_patient_ids = _select_train_patient_ids(cfg, dataset, dataset_name)
+    train_patient_ids = None
+    if dataset_name != "breastdm":
+        train_patient_ids = _select_train_patient_ids(cfg, dataset, dataset_name)
     if dataset_name == "adni":
         dataset = ADNIPairedSliceDataset(
             root=data_root or ADNI_DEFAULT_ROOT,
@@ -526,7 +544,7 @@ def build_data_loader_from_cfg(
             image_size=cfg.crops.global_crops_size,
             seed=cfg.train.seed,
         )
-    else:
+    elif dataset_name == "duke":
         # Duke has not yet adopted the patient_ids paired-dataset interface.
         dataset = dataset_subset_for_patients(dataset, train_patient_ids)
     pair_transform = PairToDinoGlobalCrops(model.build_data_augmentation_dino(cfg))

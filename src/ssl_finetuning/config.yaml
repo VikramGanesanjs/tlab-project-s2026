@@ -18,6 +18,8 @@ ibot:
   head_hidden_dim: 2048
 train:
   batch_size_per_gpu: 64
+  # Paired-slice datasets: adni, breastdm, cq500, duke. BreastDM consumes
+  # its supplied train split directly; the fold settings below do not apply.
   dataset: adni
   data_root: /common/ganesanv/tlab/data/ADNI
   adni_task: cn_mci_ad

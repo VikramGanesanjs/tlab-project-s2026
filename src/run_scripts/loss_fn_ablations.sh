@@ -3,24 +3,25 @@
 #SBATCH --job-name=loss_fn_ablation
 #SBATCH -p gpu
 #SBATCH --gpus=l40s:1
-#SBATCH --cpus-per-gpu=2
-#SBATCH --mem=80G
+#SBATCH --cpus-per-gpu=4
+#SBATCH --mem=64G
 #SBATCH --time 72:00:00        
-#SBATCH --array=0-39
+#SBATCH --array=0-19
 #SBATCH --error=loss_fn_%a.err  ## error log file
 #SBATCH --output=loss_fn_%a.out ## output log file
 #SBATCH --mail-user=Vikram.Ganesan@cshs.org
 #SBATCH --mail-type=ALL
 
 
-runs=("no_mask_uwsd_only" "no_masking" "only_uwsd" "spatial_window")
+runs=("only_uwsd" "spatial_window")
 folds=("0" "1" "2" "3" "4")
-ckpts=("4999" "9999")
-task="cn_mci"
+features=("patch" "both")
+task="cn_ad"
+ckpt=9999
 
 run=${runs[$((SLURM_ARRAY_TASK_ID / 10))]}
 fold=${folds[$(((SLURM_ARRAY_TASK_ID / 2) % 5))]}
-ckpt=${ckpts[$((SLURM_ARRAY_TASK_ID % 2))]}
+feature=${features[$((SLURM_ARRAY_TASK_ID % 2))]}
 
 
 
@@ -31,7 +32,7 @@ conda activate dinov3
 source_run_dir=/common/ganesanv/tlab/runs/ssl_gram_penalty/$run
 classification_dir=/common/ganesanv/tlab/runs/loss_fn_comparison/$run
 weights=$source_run_dir/$fold/ckpt/$ckpt
-write_dir=$classification_dir/$fold/$task/$ckpt
+write_dir=$classification_dir/$fold/$task/$feature-$ckpt
 
 if [[ -f "$write_dir/run_summary.json" ]]; then
     echo "Skipping $run fold $fold checkpoint $ckpt: classification is complete"
@@ -52,4 +53,5 @@ python -m classification.run \
     --fold "$fold" \
     --checkpoint-dir "$write_dir" \
     --weights "$weights" \
-    --adni-task $task
+    --adni-task $task \
+    --features $feature 
