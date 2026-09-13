@@ -21,6 +21,10 @@ from dinov3.data.datasets.extended import ExtendedVisionDataset
 
 from datasets.adni import ADNIClassificationDataset, DEFAULT_ROOT as ADNI_DEFAULT_ROOT
 from datasets.amos import AMOSSingleSliceDataset, DEFAULT_ROOT as AMOS_DEFAULT_ROOT
+from datasets.breastdm import (
+    BreastDMSingleSliceDataset,
+    DEFAULT_ROOT as BREASTDM_DEFAULT_ROOT,
+)
 from datasets.cq500 import CQ500SliceDataset, DEFAULT_ROOT as CQ500_DEFAULT_ROOT
 from datasets.duke import DukeBreastMRIDataset
 from datasets.duke.dataset import _DEFAULT_OUT_ROOT as DUKE_DEFAULT_ROOT
@@ -32,7 +36,7 @@ from utils.fold_cv import dataset_subset_for_patients, make_dataset_patient_fold
 
 logger = logging.getLogger("dinov3")
 
-DATASET_CHOICES = ("adni", "amos", "cq500", "duke", "organmnist3d")
+DATASET_CHOICES = ("adni", "amos", "breastdm", "cq500", "duke", "organmnist3d")
 
 
 def _identity_pair(image: Any, target: Any) -> tuple[Any, Any]:
@@ -141,6 +145,13 @@ def build_base_dataset(
             root=root or CQ500_DEFAULT_ROOT, csv_path=csv_path, task=task or "ich",
             transforms=_identity_pair, augment=False,
         )
+    if name == "breastdm":
+        return BreastDMSingleSliceDataset(
+            root=root or BREASTDM_DEFAULT_ROOT,
+            split=split,
+            transforms=_identity_pair,
+            augment=False,
+        )
     if name == "amos":
         return AMOSSingleSliceDataset(root=root or AMOS_DEFAULT_ROOT, transform=None)
     if name == "organmnist3d":
@@ -174,7 +185,14 @@ def build_dataset_from_cfg(cfg: Any, *, transform: Callable, target_transform: C
     root = getattr(train_cfg, "data_root", None)
     task = getattr(train_cfg, "task", None)
     csv_path = getattr(train_cfg, "csv_path", None)
-    base = build_base_dataset(dataset_name, root=root, task=task, csv_path=csv_path)
+    split = getattr(train_cfg, "split", "train")
+    base = build_base_dataset(
+        dataset_name,
+        root=root,
+        task=task,
+        split=split,
+        csv_path=csv_path,
+    )
     wrapped = TlabExtendedVisionDataset(
         base, root=root or getattr(base, "root_path", getattr(base, "root", ".")),
         transform=transform, target_transform=target_transform,

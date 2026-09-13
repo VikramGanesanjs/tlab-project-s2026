@@ -129,12 +129,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_RESULTS_ROOT)
+    parser.add_argument("--output-stem", default="cq500_ich_auroc_comparison")
     args = parser.parse_args()
 
     dataframe = collect_results(args.results_root)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    dataframe.to_csv(args.output_dir / "cq500_ich_auroc_comparison.csv", index=False)
-    plot(dataframe, args.output_dir / "cq500_ich_auroc_comparison.png")
+    dataframe.to_csv(args.output_dir / f"{args.output_stem}.csv", index=False)
+    plot(dataframe, args.output_dir / f"{args.output_stem}.png")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from classification.run import parse_args
 from classification.triad import TriadVolumeClassifier
 from classification.neurovfm import NeuroVFMVolumeClassifier
 from classification.train import build_dataset, saved_split_patient_ids, task_config, train
+from datasets.organmnist3d import OrganMNIST3DMultiSliceDataset
 from utils import load_dinov3
 
 
@@ -66,14 +67,14 @@ class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
     def test_neurovfm_classifier_processes_a_complete_volume(self) -> None:
         model = NeuroVFMVolumeClassifier(
             _ToyNeuroVFMEncoder(),
-            input_channels=3,
+            input_channels=1,
             volume_shape=(4, 16, 16),
             input_normalization="none",
             hidden_dim=4,
             num_classes=2,
         ).eval()
         with torch.no_grad():
-            output = model(torch.randn(2, 5, 3, 8, 8))
+            output = model(torch.randn(2, 5, 1, 8, 8))
 
         self.assertEqual(tuple(output.shape), (2, 2))
 
@@ -82,50 +83,52 @@ class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
 
         self.assertEqual(args.encoder, "triad")
         self.assertEqual(args.triad_volume_size, 96)
-        self.assertEqual(args.triad_input_channels, 3)
+        self.assertEqual(args.triad_input_channels, 1)
+        self.assertTrue(args.three_d_encoder)
 
     def test_triad_classifier_processes_a_complete_volume(self) -> None:
         model = TriadVolumeClassifier(
             _ToyTriadEncoder(),
-            input_channels=3,
+            input_channels=1,
             volume_size=32,
             input_normalization="none",
             hidden_dim=4,
             num_classes=2,
         ).eval()
-        images = torch.randn(2, 5, 3, 8, 8)
+        images = torch.randn(2, 5, 1, 8, 8)
 
         with torch.no_grad():
             output = model(images)
 
         self.assertEqual(tuple(output.shape), (2, 2))
 
-    def test_frozen_triad_keeps_the_input_projection_trainable(self) -> None:
+    def test_frozen_triad_requires_native_single_channel_input(self) -> None:
+        with self.assertRaisesRegex(ValueError, "one-channel"):
+            TriadVolumeClassifier(_ToyTriadEncoder(), input_channels=3)
+
+    def test_frozen_triad_does_not_build_an_input_projection(self) -> None:
         model = TriadVolumeClassifier(
             _ToyTriadEncoder(),
-            input_channels=3,
+            input_channels=1,
             volume_size=32,
             input_normalization="none",
             hidden_dim=4,
         ).train()
-        output = model(torch.randn(2, 5, 3, 8, 8))
-        output.sum().backward()
-
-        projection = model.input_projection
-        self.assertIsInstance(projection, nn.Conv3d)
-        self.assertIsNotNone(projection.weight.grad)
+        output = model(torch.randn(2, 5, 1, 8, 8))
+        self.assertEqual(tuple(output.shape), (2,))
+        self.assertIsInstance(model.input_projection, nn.Identity)
 
     def test_triad_ignores_padded_native_depth_slices(self) -> None:
         model = TriadVolumeClassifier(
             _ToyTriadEncoder(),
-            input_channels=3,
+            input_channels=1,
             volume_size=32,
             input_normalization="none",
             hidden_dim=4,
         ).eval()
-        short_volume = torch.randn(2, 3, 6, 6)
-        long_volume = torch.randn(4, 3, 6, 6)
-        padded_batch = torch.zeros(2, 4, 3, 6, 6)
+        short_volume = torch.randn(2, 1, 6, 6)
+        long_volume = torch.randn(4, 1, 6, 6)
+        padded_batch = torch.zeros(2, 4, 1, 6, 6)
         padded_batch[0, :2] = short_volume
         padded_batch[1] = long_volume
         slice_mask = torch.tensor([[True, True, False, False], [True, True, True, True]])
@@ -216,6 +219,20 @@ class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
                 num_classes=num_classes,
             )
             self.assertEqual(tuple(model(images.unsqueeze(0)).shape), (1, 11))
+
+    def test_three_d_encoder_returns_one_channel_volume(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_archive(root)
+            dataset = OrganMNIST3DMultiSliceDataset(
+                root=root, split="train", n_slices=2, image_size=8,
+                augment=False, three_d_encoder=True,
+            )
+
+            volume, target = dataset[0]
+
+            self.assertEqual(tuple(volume.shape), (2, 1, 8, 8))
+            self.assertEqual(target, 0)
 
     def test_native_depth_transformer_ignores_padded_slices(self) -> None:
         """A native-depth CQ500 batch can use the transformer aggregator."""

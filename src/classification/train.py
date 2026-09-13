@@ -936,7 +936,7 @@ def build_dataset(
             augment=use_augment,
             image_size=args.image_size,
             transform=build_adni_volume_transform(augment=use_augment),
-            return_imagenet_tensors=args.encoder != "neurovfm",
+            three_d_encoder=getattr(args, "three_d_encoder", False),
             data_timing=data_timing,
         )
     if args.dataset == "cq500":
@@ -950,6 +950,7 @@ def build_dataset(
             augment=use_augment,
             image_size=args.image_size,
             transform=build_cq500_volume_transform(augment=use_augment),
+            three_d_encoder=getattr(args, "three_d_encoder", False),
         )
     if args.dataset == "organmnist3d":
         if patient_ids is not None:
@@ -964,6 +965,7 @@ def build_dataset(
             augment=use_augment,
             image_size=args.image_size,
             transform=build_organmnist3d_volume_transform(augment=use_augment),
+            three_d_encoder=getattr(args, "three_d_encoder", False),
         )
     if args.dataset == "breastdm":
         return BreastDMMultiSliceDataset(
@@ -973,6 +975,7 @@ def build_dataset(
             augment=use_augment,
             image_size=args.image_size,
             transform=build_breastdm_volume_transform(augment=use_augment),
+            three_d_encoder=getattr(args, "three_d_encoder", False),
         )
     raise ValueError(f"Unknown dataset={args.dataset!r}")
 

@@ -220,6 +220,25 @@ class TestCQ500PairedSliceDataset(unittest.TestCase):
         self.assertFalse(torch.equal(image[:, 0], image[:, 1]))
         self.assertFalse(torch.equal(image[:, 1], image[:, 2]))
 
+    def test_multi_slice_three_d_encoder_returns_resampled_one_channel_volume(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            labels_path = self._write_labels(root)
+            volume = np.linspace(-100.0, 120.0, num=8, dtype=np.float32).reshape(2, 2, 2)
+            with patch(
+                "datasets.cq500.dataset._discover_volume_records",
+                return_value=self._records(root),
+            ):
+                dataset = CQ500MultiSliceDataset(
+                    root=root, csv_path=labels_path, patient_ids=["CQ500CT1"],
+                    n_slices=2, image_size=2, augment=False, three_d_encoder=True,
+                )
+            with patch("datasets.cq500.dataset._load_canonical_volume", return_value=volume):
+                image, _ = dataset[0]
+
+        self.assertEqual(tuple(image.shape), (2, 1, 2, 2))
+        self.assertTrue(torch.equal(image[:, 0], torch.from_numpy(volume).permute(2, 0, 1)))
+
 
 if __name__ == "__main__":
     unittest.main()

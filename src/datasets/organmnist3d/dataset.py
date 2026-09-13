@@ -380,11 +380,12 @@ class OrganMNIST3DPairedSliceDataset(OrganMNIST3DClassificationDataset):
 
 
 class OrganMNIST3DMultiSliceDataset(_OrganMNIST3DBaseDataset):
-    """Volume-level classification with 3-D augmentation and 224×224 slices.
+    """Volume-level classification with optional 3-D encoder output.
 
     The entire native 64×64×64 volume is augmented first.  Its depth is then
     resampled to ``n_slices`` (64 by default) and each axial image is resized
     to ``image_size``; defaults therefore return ``[64, 3, 224, 224]``.
+    Set ``three_d_encoder=True`` to return ``[depth, 1, height, width]``.
     """
 
     def __init__(
@@ -395,12 +396,14 @@ class OrganMNIST3DMultiSliceDataset(_OrganMNIST3DBaseDataset):
         n_slices: int = 64,
         augment: bool = True,
         image_size: int = 224,
+        three_d_encoder: bool = False,
         **kwargs: Any,
     ) -> None:
         if n_slices <= 0:
             raise ValueError(f"n_slices must be positive, got {n_slices}")
         self.n_slices = int(n_slices)
         self.image_size = _validate_image_size(image_size)
+        self.three_d_encoder = bool(three_d_encoder)
         if "transforms" not in kwargs and "transform" not in kwargs and augment:
             kwargs["transform"] = build_organmnist3d_volume_transform(augment=True)
         super().__init__(root=root, split=split, **kwargs)
@@ -433,6 +436,8 @@ class OrganMNIST3DMultiSliceDataset(_OrganMNIST3DBaseDataset):
                 align_corners=False,
             ).squeeze(0)
         volume_t = _resize_volume_spatially(volume_t, self.image_size)
+        if self.three_d_encoder:
+            return volume_t.permute(1, 0, 2, 3), target
         return _volume_to_imagenet_slices(volume_t), target
 
 

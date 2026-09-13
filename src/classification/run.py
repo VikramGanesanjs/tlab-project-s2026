@@ -356,6 +356,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--three-d-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Return single-channel, volume-native tensors from multi-slice "
+            "datasets instead of ImageNet-normalized RGB slices. This is enabled "
+            "automatically for whole-volume encoders such as Triad and NeuroVFM"
+        ),
+    )
+    parser.add_argument(
         "--encoder-training",
         choices=list(ENCODER_TRAINING_CHOICES),
         default="frozen",
@@ -415,10 +425,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--triad-input-channels",
         type=int,
-        default=3,
+        default=1,
         help=(
-            "Channels emitted by the selected volume dataset before Triad's "
-            "learned projection to one MRI channel (default: 3)"
+            "Channels emitted by the selected volume dataset before Triad "
+            "(default: 1)"
         ),
     )
     parser.add_argument(
@@ -429,11 +439,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--triad-input-normalization",
-        choices=("imagenet", "none"),
-        default="imagenet",
+        choices=("none",),
+        default="none",
         help=(
-            "Input convention before Triad. imagenet reverses the current "
-            "volume datasets' ImageNet normalization before the MRI projection"
+            "Triad consumes unnormalized, native single-channel volume tensors"
         ),
     )
     parser.add_argument(
@@ -507,6 +516,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if config_args.params_file is not None:
         parser.set_defaults(**_yaml_defaults(config_args.params_file, parser))
     args = parser.parse_args(argv)
+    if args.three_d_encoder is None:
+        args.three_d_encoder = args.encoder in {"triad", "neurovfm"}
     if args.data_root is None:
         args.data_root = {
             "duke": DEFAULT_DATA_ROOT,
@@ -554,6 +565,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--triad-drop-path-rate must be in [0, 1]")
     if args.encoder == "triad" and args.encoder_training != "frozen":
         parser.error("Triad does not support --encoder-training; use --triad-trainable")
+    if args.three_d_encoder and args.encoder not in {"triad", "neurovfm"}:
+        parser.error("--three-d-encoder requires --encoder triad or neurovfm")
+    if args.encoder in {"triad", "neurovfm"} and not args.three_d_encoder:
+        parser.error("--encoder triad and --encoder neurovfm require --three-d-encoder")
     if args.encoder != "triad" and args.triad_trainable:
         parser.error("--triad-trainable requires --encoder triad")
     if args.neurovfm_input_channels != 1:

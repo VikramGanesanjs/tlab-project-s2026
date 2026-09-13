@@ -95,6 +95,20 @@ class TestBreastDMDataset(unittest.TestCase):
             self.assertEqual(target, 1)
             self.assertEqual(dataset.get_volume_metadata(1)["patient_id"], "M-001")
 
+    def test_multi_slice_three_d_encoder_returns_one_channel_volume(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_dataset(root)
+            dataset = BreastDMMultiSliceDataset(
+                root=root, split="train", n_slices=4, image_size=8,
+                augment=False, three_d_encoder=True,
+            )
+
+            volume, target = dataset[1]
+
+            self.assertEqual(tuple(volume.shape), (4, 1, 8, 8))
+            self.assertEqual(target, 1)
+
     def test_rejects_unknown_split(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

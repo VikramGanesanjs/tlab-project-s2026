@@ -181,6 +181,49 @@ class TestCQ500SSLLoader(unittest.TestCase):
         )
         select_patients.assert_not_called()
 
+    def test_builds_organmnist3d_from_its_official_training_split_without_folds(self) -> None:
+        root = Path("/tmp/organmnist3d")
+        cfg = SimpleNamespace(
+            train=SimpleNamespace(
+                dataset="organmnist3d",
+                data_root=root,
+                max_distance=2,
+                seed=7,
+                batch_size_per_gpu=2,
+                num_workers=0,
+                cache_dataset=True,
+            ),
+            crops=SimpleNamespace(global_crops_size=224),
+        )
+        dataset = _ToyCQ500Pairs()
+        loader = object()
+
+        with (
+            patch.object(
+                train, "OrganMNIST3DPairedSliceDataset", return_value=dataset
+            ) as build_dataset,
+            patch.object(train, "_select_train_patient_ids") as select_patients,
+            patch.object(train, "PairToDinoGlobalCrops", return_value=object()),
+            patch.object(train, "make_data_loader", return_value=loader),
+        ):
+            actual_loader, size = train.build_data_loader_from_cfg(
+                cfg=cfg,
+                model=_ToyModel(),
+                start_iter=0,
+            )
+
+        self.assertIs(actual_loader, loader)
+        self.assertEqual(size, len(dataset))
+        build_dataset.assert_called_once_with(
+            root=root,
+            split="train",
+            max_distance=2,
+            transform=train.identity_transform,
+            image_size=224,
+            seed=7,
+        )
+        select_patients.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
