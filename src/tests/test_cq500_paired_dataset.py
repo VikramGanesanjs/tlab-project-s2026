@@ -6,47 +6,48 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+import torch
+from PIL import Image
 
 from datasets.cq500.dataset import (
     CQ500MultiSliceDataset,
     CQ500PairedSliceDataset,
     _VolumeRecord,
-    _slice_to_pil,
+    _slice_to_channels,
     _window_volume_per_slice,
 )
 from utils.fold_cv import make_dataset_patient_folds
 
 
 class TestCQ500PairedSliceDataset(unittest.TestCase):
-    def test_slice_uses_fixed_brain_ct_window(self) -> None:
+    def test_slice_uses_three_percentile_normalized_ct_windows(self) -> None:
         volume = np.array([[[-100.0], [0.0], [40.0], [80.0], [200.0]]])
 
-        image = _slice_to_pil(volume, 0)
+        image = _slice_to_channels(volume, 0)
 
-        pixels = np.asarray(image)
-        self.assertEqual(tuple(pixels.shape), (1, 5, 3))
-        self.assertEqual(pixels[0, :, 0].tolist(), [0, 0, 127, 255, 255])
-        self.assertTrue(np.array_equal(pixels[..., 0], pixels[..., 1]))
-        self.assertTrue(np.array_equal(pixels[..., 1], pixels[..., 2]))
+        self.assertEqual(tuple(image.shape), (3, 1, 5))
+        self.assertEqual(image.dtype, torch.float32)
+        self.assertTrue(torch.all((0.0 <= image) & (image <= 1.0)))
+        # Brain 40/80 clipping gives [0, 0, 40, 80, 80]; its 1st and 99th
+        # percentiles are 0 and 80 respectively.
+        torch.testing.assert_close(image[0, 0], torch.tensor([0.0, 0.0, 0.5, 1.0, 1.0]))
+        self.assertFalse(torch.equal(image[0], image[1]))
+        self.assertFalse(torch.equal(image[1], image[2]))
 
     def test_volume_windowing_is_independent_per_axial_slice(self) -> None:
         volume = np.array(
             [
-                [[0.0, 40.0], [80.0, 120.0]],
-                [[-20.0, 20.0], [60.0, 100.0]],
+                [[-1000.0, -500.0], [0.0, 80.0]],
+                [[600.0, 1200.0], [2000.0, 2500.0]],
             ]
         )
 
         windowed = _window_volume_per_slice(volume)
 
-        expected = np.array(
-            [
-                [[0.0, 0.5], [1.0, 1.0]],
-                [[0.0, 0.25], [0.75, 1.0]],
-            ],
-            dtype=np.float32,
-        )
-        np.testing.assert_allclose(windowed, expected)
+        self.assertEqual(windowed.shape, (2, 3, 2, 2))
+        self.assertTrue(np.all((0.0 <= windowed) & (windowed <= 1.0)))
+        self.assertFalse(np.array_equal(windowed[:, 0], windowed[:, 1]))
+        self.assertFalse(np.array_equal(windowed[:, 1], windowed[:, 2]))
 
     def _records(self, root: Path) -> list[_VolumeRecord]:
         return [
@@ -122,6 +123,73 @@ class TestCQ500PairedSliceDataset(unittest.TestCase):
         target[0] = 0.0
         self.assertEqual(dataset.get_target(0)[0], 1.0)
 
+    def test_patient_ids_restrict_paired_samples(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            labels_path = self._write_labels(root)
+            with patch(
+                "datasets.cq500.dataset._discover_volume_records",
+                return_value=self._records(root),
+            ):
+                dataset = CQ500PairedSliceDataset(
+                    root=root,
+                    csv_path=labels_path,
+                    patient_ids=["CQ500CT2", "CQ500CT5"],
+                    transform=lambda image: image,
+                )
+
+        self.assertEqual(len(dataset), 4)
+        self.assertEqual(
+            {dataset.get_patient_id(index) for index in range(len(dataset))},
+            {"CQ500CT2", "CQ500CT5"},
+        )
+
+    def test_paired_slices_are_three_channel_imagenet_normalized_tensors(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            labels_path = self._write_labels(root)
+            volume = np.array(
+                [[[-1000.0, -500.0], [0.0, 80.0]], [[600.0, 1200.0], [2000.0, 2500.0]]],
+                dtype=np.float32,
+            )
+            with patch(
+                "datasets.cq500.dataset._discover_volume_records",
+                return_value=self._records(root)[:1],
+            ):
+                dataset = CQ500PairedSliceDataset(
+                    root=root, csv_path=labels_path, augment=False, image_size=2, seed=3
+                )
+            with patch("datasets.cq500.dataset._load_canonical_volume", return_value=volume):
+                image, partner = dataset[0]
+
+        self.assertEqual(tuple(image.shape), (3, 2, 2))
+        self.assertEqual(tuple(partner.shape), (3, 2, 2))
+        raw = _slice_to_channels(volume, 0)
+        mean = torch.tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
+        std = torch.tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
+        quantized = torch.round(raw * 255.0) / 255.0
+        torch.testing.assert_close(image, (quantized - mean) / std)
+
+    def test_paired_identity_transform_receives_quantized_rgb_pil_images(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            labels_path = self._write_labels(root)
+            volume = np.linspace(-1000.0, 2500.0, num=8, dtype=np.float32).reshape(2, 2, 2)
+            with patch(
+                "datasets.cq500.dataset._discover_volume_records",
+                return_value=self._records(root)[:1],
+            ):
+                dataset = CQ500PairedSliceDataset(
+                    root=root, csv_path=labels_path, transform=lambda image: image, seed=3
+                )
+            with patch("datasets.cq500.dataset._load_canonical_volume", return_value=volume):
+                image, partner = dataset[0]
+
+        self.assertIsInstance(image, Image.Image)
+        self.assertIsInstance(partner, Image.Image)
+        self.assertEqual(image.mode, "RGB")
+        self.assertEqual(np.asarray(image).dtype, np.uint8)
+
     def test_multi_slice_dataset_does_not_retain_full_volumes(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -142,11 +210,15 @@ class TestCQ500PairedSliceDataset(unittest.TestCase):
             with patch(
                 "datasets.cq500.dataset._load_canonical_volume", return_value=volume
             ) as load_volume:
-                dataset[0]
+                image, _ = dataset[0]
                 dataset[0]
 
         self.assertIsNone(dataset._volume_cache)
         self.assertEqual(load_volume.call_count, 2)
+        self.assertEqual(tuple(image.shape), (2, 3, 2, 2))
+        # All three channels are ImageNet-normalized rather than grayscale copies.
+        self.assertFalse(torch.equal(image[:, 0], image[:, 1]))
+        self.assertFalse(torch.equal(image[:, 1], image[:, 2]))
 
 
 if __name__ == "__main__":

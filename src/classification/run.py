@@ -40,7 +40,7 @@ DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
 DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d", "breastdm")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
-CLASSIFICATION_ENCODER_CHOICES = (*ENCODER_CHOICES, "triad")
+CLASSIFICATION_ENCODER_CHOICES = (*ENCODER_CHOICES, "triad", "neurovfm")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
 
 
@@ -84,6 +84,16 @@ def _yaml_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict[str, obj
         if is_boolean_flag:
             if not isinstance(value, bool):
                 parser.error(f"YAML parameter {raw_key!r} must be true or false")
+        elif (
+            value is not None
+            and action.type is not None
+            and action.nargs not in (None, 0)
+            and isinstance(value, (list, tuple))
+        ):
+            try:
+                value = [action.type(item) for item in value]
+            except (TypeError, ValueError) as exc:
+                parser.error(f"invalid value for YAML parameter {raw_key!r}: {exc}")
         elif value is not None and action.type is not None:
             try:
                 value = action.type(value)
@@ -145,6 +155,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Metadata CSV (ADNI or CQ500 reads.csv; ignored by Duke and OrganMNIST3D)",
+    )
+    parser.add_argument(
+        "--adni-manifest-path",
+        type=Path,
+        default=None,
+        help=(
+            "ADNI patient-to-NIfTI JSON manifest; defaults to "
+            "<data-root>/adni_nii_manifest.json and is created when absent"
+        ),
     )
     parser.add_argument("--scan", type=str, default="pre")
     parser.add_argument(
@@ -333,7 +352,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="dinov3",
         help=(
             "Backbone: dinov3 | meddinov3 | braindino | custom (wireframe) | "
-            "triad (3-D MRI Swin)"
+            "triad (3-D MRI Swin) | neurovfm (3-D medical ViT)"
         ),
     )
     parser.add_argument(
@@ -389,7 +408,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "backbone. Defaults: dinov3 → opt/dinov3-weights/...; "
             "meddinov3 → opt/meddinov3/model.pth; "
             "braindino → opt/braindino/brain_dino_weights.pth; "
-            "triad → opt/triad/Triad-SwinB-SimMIM.pth"
+            "triad → opt/triad/Triad-SwinB-SimMIM.pth; "
+            "neurovfm → opt/neurovfm/weights"
         ),
     )
     parser.add_argument(
@@ -439,6 +459,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Fine-tune Triad's MRI-pretrained backbone instead of keeping it frozen",
+    )
+    parser.add_argument(
+        "--neurovfm-repo", type=Path, default=REPO_ROOT / "opt" / "neurovfm",
+        help="Local NeuroVFM source checkout; it is imported directly, not installed",
+    )
+    parser.add_argument(
+        "--neurovfm-input-channels", type=int, default=1,
+        help="NeuroVFM native volume channels; only one channel is supported",
+    )
+    parser.add_argument(
+        "--neurovfm-volume-shape", type=int, nargs=3, default=(128, 192, 192), metavar=("D", "H", "W"),
+        help="D/H/W volume shape for NeuroVFM; must be divisible by 4/16/16",
+    )
+    parser.add_argument(
+        "--neurovfm-input-normalization", choices=("none",), default="none",
+        help="NeuroVFM consumes native [0, 1] volumes without ImageNet normalization",
+    )
+    parser.add_argument(
+        "--neurovfm-modality", choices=("auto", "mri", "ct"), default="auto",
+        help="NeuroVFM normalization mode; auto selects CT for CQ500 and MRI otherwise",
     )
     parser.add_argument(
         "--dinov3-repo",
@@ -516,6 +556,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("Triad does not support --encoder-training; use --triad-trainable")
     if args.encoder != "triad" and args.triad_trainable:
         parser.error("--triad-trainable requires --encoder triad")
+    if args.neurovfm_input_channels != 1:
+        parser.error("--neurovfm-input-channels must be 1")
+    if any(size <= 0 for size in args.neurovfm_volume_shape) or any(
+        size % patch for size, patch in zip(args.neurovfm_volume_shape, (4, 16, 16))
+    ):
+        parser.error("--neurovfm-volume-shape must be positive and divisible by 4 16 16")
+    if args.encoder == "neurovfm" and args.encoder_training != "frozen":
+        parser.error("NeuroVFM is a frozen local encoder; use --encoder-training=frozen")
     if args.freeze_epochs < 0:
         parser.error("--freeze-epochs must be non-negative")
     if args.encoder_training != "lora" and args.freeze_epochs > 0:

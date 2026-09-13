@@ -34,6 +34,12 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 MAX_NATIVE_SLICES = 128
 CT_WINDOW_CENTER = 40.0
 CT_WINDOW_WIDTH = 80.0
+CT_WINDOWS: Tuple[Tuple[str, float, float], ...] = (
+    ("brain", 40.0, 80.0),
+    ("subdural", 80.0, 200.0),
+    ("bone", 600.0, 2000.0),
+)
+WINDOW_PERCENTILES = (1.0, 99.0)
 
 
 @dataclass(frozen=True)
@@ -188,9 +194,21 @@ def _canonical_metadata(volume_path: Path) -> Tuple[int, Tuple[float, float, flo
     return int(image.shape[-1]), spacing
 
 
-def _discover_volume_records(root: Path) -> List[_VolumeRecord]:
+def _discover_volume_records(
+    root: Path, patient_ids: Optional[Sequence[str]] = None
+) -> List[_VolumeRecord]:
     records: List[_VolumeRecord] = []
-    for volume_path in sorted(root.glob(f"CQ500CT*/*/{VOLUME_NAME}")):
+    requested = (
+        {_normalize_patient_id(patient_id) for patient_id in patient_ids}
+        if patient_ids is not None
+        else None
+    )
+    volume_paths = (
+        [path for patient_id in sorted(requested) for path in (root / patient_id).glob(f"*/{VOLUME_NAME}")]
+        if requested is not None
+        else root.glob(f"CQ500CT*/*/{VOLUME_NAME}")
+    )
+    for volume_path in sorted(volume_paths):
         relative = volume_path.relative_to(root)
         if len(relative.parts) != 3:
             continue
@@ -219,13 +237,8 @@ def _discover_volume_records(root: Path) -> List[_VolumeRecord]:
     return records
 
 
-def _apply_ct_window(
-    image_slice: np.ndarray,
-    *,
-    center: float = CT_WINDOW_CENTER,
-    width: float = CT_WINDOW_WIDTH,
-) -> np.ndarray:
-    """Apply a CT intensity window to one 2-D slice and return floats in [0, 1]."""
+def _apply_ct_window(image_slice: np.ndarray, *, center: float, width: float) -> np.ndarray:
+    """Clip one CT slice to a width/level window."""
     if width <= 0:
         raise ValueError(f"CT window width must be positive, got {width}")
     image_slice = np.asarray(image_slice, dtype=np.float32)
@@ -235,28 +248,66 @@ def _apply_ct_window(
     low = float(center) - float(width) / 2.0
     high = float(center) + float(width) / 2.0
     return np.nan_to_num(
-        np.clip(image_slice, low, high) - low,
-        nan=0.0,
-        posinf=float(width),
-        neginf=0.0,
-    ).astype(np.float32, copy=False) / float(width)
+        np.clip(image_slice, low, high),
+        nan=low,
+        posinf=high,
+        neginf=low,
+    ).astype(np.float32, copy=False)
 
 
-def _window_volume_per_slice(volume: np.ndarray) -> np.ndarray:
-    """Apply the CQ500 40/80 window independently to every axial z-plane."""
-    volume = np.asarray(volume, dtype=np.float32)
-    if volume.ndim != 3:
-        raise ValueError(f"Expected CQ500 volume [H, W, D], got {volume.shape}")
+def _percentile_normalize(image: np.ndarray) -> np.ndarray:
+    """Normalize a windowed image to [0, 1] using its 1st and 99th percentiles."""
+    image = np.asarray(image, dtype=np.float32)
+    finite = image[np.isfinite(image)]
+    if finite.size == 0:
+        raise ValueError("CQ500 window contains no finite values")
+    low, high = np.percentile(finite, WINDOW_PERCENTILES)
+    if high <= low:
+        return np.zeros_like(image, dtype=np.float32)
+    return np.clip((image - low) / (high - low), 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _window_slice_to_channels(image_slice: np.ndarray) -> np.ndarray:
+    """Return brain, subdural, and bone windows as a [3, H, W] float array.
+
+    Every window is independently clipped then percentile-normalized. This keeps
+    each channel in [0, 1] while preserving its dedicated CT contrast range.
+    """
+    image_slice = np.asarray(image_slice, dtype=np.float32)
+    if image_slice.ndim != 2:
+        raise ValueError(f"Expected a CQ500 axial slice [H, W], got {image_slice.shape}")
     return np.stack(
-        [_apply_ct_window(volume[..., z]) for z in range(volume.shape[-1])], axis=-1
+        [
+            _percentile_normalize(_apply_ct_window(image_slice, center=center, width=width))
+            for _, center, width in CT_WINDOWS
+        ],
+        axis=0,
     )
 
 
+def _window_volume_per_slice(volume: np.ndarray) -> np.ndarray:
+    """Return independently normalized three-window axial images [D, 3, H, W]."""
+    volume = np.asarray(volume, dtype=np.float32)
+    if volume.ndim != 3:
+        raise ValueError(f"Expected CQ500 volume [H, W, D], got {volume.shape}")
+    return np.stack([_window_slice_to_channels(volume[..., z]) for z in range(volume.shape[-1])])
+
+
+def _slice_to_channels(volume: np.ndarray, z: int) -> torch.Tensor:
+    """Return one three-window axial image as a tensor in [0, 1]."""
+    return torch.from_numpy(_window_slice_to_channels(volume[..., z]))
+
+
 def _slice_to_pil(volume: np.ndarray, z: int) -> Image.Image:
-    """Convert one CQ500 axial slice using the fixed brain CT 40/80 window."""
-    scaled = _apply_ct_window(volume[..., z])
-    pixels = (scaled * 255.0).clip(0, 255).astype(np.uint8)
-    return Image.fromarray(pixels, mode="L").convert("RGB")
+    """Return one three-window axial image as an 8-bit RGB PIL image.
+
+    The paired and single-slice datasets use PIL so their existing torchvision
+    and DINO augmentations retain their expected uint8 semantics (including
+    DINO's solarize threshold of 128).
+    """
+    channels = _window_slice_to_channels(volume[..., z])
+    pixels = np.moveaxis(np.rint(channels * 255.0).clip(0, 255).astype(np.uint8), 0, -1)
+    return Image.fromarray(pixels, mode="RGB")
 
 
 def _resample_volume(
@@ -265,10 +316,12 @@ def _resample_volume(
     image_size: int,
     cq500_max_slices: int = MAX_NATIVE_SLICES,
 ) -> torch.Tensor:
-    """Resize in-plane and, when requested, resample the depth dimension.
+    """Resize a raw-HU [H, W, D] volume in plane and depth.
 
     Native-depth mode retains all depths up to ``cq500_max_slices`` and uses
-    ADNI-style trilinear interpolation only for longer volumes.
+    ADNI-style trilinear interpolation only for longer volumes. This deliberately
+    precedes CT windowing and percentile normalization, so those operations see
+    the final voxel grid rather than interpolation-created normalized values.
     """
     if n_slices is not None and n_slices <= 0:
         raise ValueError("n_slices must be positive when provided")
@@ -276,36 +329,39 @@ def _resample_volume(
         raise ValueError("image_size must be positive")
     if cq500_max_slices <= 0:
         raise ValueError("cq500_max_slices must be positive")
+    if volume.ndim != 3:
+        raise ValueError(f"Expected raw CQ500 volume [H, W, D], got {volume.shape}")
     tensor = torch.from_numpy(np.ascontiguousarray(volume)).permute(2, 0, 1)
     output_depth = (
         int(n_slices)
         if n_slices is not None
         else min(int(tensor.shape[0]), int(cq500_max_slices))
     )
-    if output_depth != tensor.shape[0]:
-        tensor = F.interpolate(
-            tensor.unsqueeze(0).unsqueeze(0),
-            size=(output_depth, volume.shape[0], volume.shape[1]),
-            mode="trilinear",
-            align_corners=False,
-        ).squeeze(0)
-    else:
-        tensor = tensor.unsqueeze(0)
-    # In native-depth mode this preserves z exactly unless it exceeds the cap.
+    # In native-depth mode z is retained unless the acquisition exceeds the cap.
     tensor = F.interpolate(
-        tensor,
-        size=(image_size, image_size),
-        mode="bilinear",
+        tensor.unsqueeze(0).unsqueeze(0),
+        size=(output_depth, image_size, image_size),
+        mode="trilinear",
         align_corners=False,
     )
-    return tensor.squeeze(0)
+    return tensor.squeeze(0).squeeze(0).permute(1, 2, 0)
 
 
-def _volume_to_rgb(volume: torch.Tensor) -> torch.Tensor:
-    """Convert 40/80-windowed ``[D,H,W]`` volume to ImageNet-normalized RGB."""
-    images = volume.clamp(0, 1).unsqueeze(1).repeat(1, 3, 1, 1)
-    mean = images.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
-    std = images.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
+def _imagenet_normalize(images: torch.Tensor) -> torch.Tensor:
+    """ImageNet-normalize a [3, H, W] or [D, 3, H, W] three-window tensor."""
+    images = images.clamp(0, 1)
+    if images.ndim == 3:
+        if images.shape[0] != len(CT_WINDOWS):
+            raise ValueError(f"Expected [3, H, W], got {tuple(images.shape)}")
+        mean = images.new_tensor(IMAGENET_MEAN).view(3, 1, 1)
+        std = images.new_tensor(IMAGENET_STD).view(3, 1, 1)
+    elif images.ndim == 4:
+        if images.shape[1] != len(CT_WINDOWS):
+            raise ValueError(f"Expected [D, 3, H, W], got {tuple(images.shape)}")
+        mean = images.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+        std = images.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
+    else:
+        raise ValueError(f"Expected a three-window image or volume, got {tuple(images.shape)}")
     return (images - mean) / std
 
 
@@ -365,7 +421,7 @@ class _CQ500BaseDataset(VisionDataset):
         super().__init__(str(root_path), transforms=transforms, transform=transform, target_transform=target_transform)
         self.root_path = root_path
         self.labels = read_cq500_labels(csv_path or DEFAULT_LABELS_CSV) if load_labels else {}
-        records = _discover_volume_records(root_path)
+        records = _discover_volume_records(root_path, patient_ids=patient_ids)
         selected = {_normalize_patient_id(value) for value in patient_ids} if patient_ids is not None else None
         self._records = [
             record for record in records
@@ -485,11 +541,13 @@ class CQ500PairedSliceDataset(_CQ500BaseDataset):
         volume = self._volume_cache.get(record.volume_path)
         images: Any = (_slice_to_pil(volume, z), _slice_to_pil(volume, partner_z))
         if self.transform is not None:
-            return _apply_shared_pair_transform(self.transform, images)
-        if self.transforms is not None:
+            images = _apply_shared_pair_transform(self.transform, images)
+        elif self.transforms is not None:
             transformed = self.transforms(images, None)
-            return transformed[0] if isinstance(transformed, tuple) else transformed
-        return images
+            images = transformed[0] if isinstance(transformed, tuple) else transformed
+        if not (isinstance(images, (tuple, list)) and len(images) == 2):
+            raise ValueError("CQ500 paired-slice transform must return two images")
+        return tuple(images)
 
 
 class CQ500SliceDataset(_CQ500BaseDataset):
@@ -575,11 +633,12 @@ class CQ500SliceDataset(_CQ500BaseDataset):
         image: Any = _slice_to_pil(self._volume_cache.get(record.volume_path), z)
         target: Any = self.get_target(index)
         if self.transforms is not None:
-            return self.transforms(image, target)
-        if self.transform is not None:
-            image = self.transform(image)
-        if self.target_transform is not None:
-            target = self.target_transform(target)
+            image, target = self.transforms(image, target)
+        else:
+            if self.transform is not None:
+                image = self.transform(image)
+            if self.target_transform is not None:
+                target = self.target_transform(target)
         return image, target
 
 
@@ -649,31 +708,35 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, Any]:
         record = self._records[index]
         volume = _load_canonical_volume(record.volume_path)
-        image = _resample_volume(
-            _window_volume_per_slice(volume),
+        # Resample raw HU values before windowing. ``image`` is then [D, 3, H,
+        # W] at the dataset boundary, while MONAI uses [C, D, H, W].
+        resized_volume = _resample_volume(
+            volume,
             self.n_slices,
             self.image_size,
             self.cq500_max_slices,
-        ).unsqueeze(0)
+        )
+        image = torch.from_numpy(_window_volume_per_slice(resized_volume.numpy()))
         target: Any = self.get_target(index)
         if self.transforms is not None:
-            image, target = self.transforms(image, target)
+            transformed = self.transforms(image, target)
+            image, target = transformed
         else:
             if self.transform is not None:
-                image = self.transform(image)
+                image = self.transform(image.permute(1, 0, 2, 3)).permute(1, 0, 2, 3)
             if self.target_transform is not None:
                 target = self.target_transform(target)
         image = torch.as_tensor(image)
-        if image.ndim == 3:
-            image = image.unsqueeze(0)
-        if image.ndim != 4 or image.shape[0] != 1:
-            raise ValueError(f"CQ500 volume transform must return [1,D,H,W], got {tuple(image.shape)}")
-        return _volume_to_rgb(image.squeeze(0)), target
+        if image.ndim != 4 or image.shape[1] != len(CT_WINDOWS):
+            raise ValueError(
+                f"CQ500 volume transform must return [D, {len(CT_WINDOWS)}, H, W], got {tuple(image.shape)}"
+            )
+        return _imagenet_normalize(image), target
 
 
 __all__ = [
     "CQ500MultiSliceDataset", "CQ500PairedSliceDataset", "CQ500SliceDataset", "CQ500TaskSpec",
-    "CQ500_TASK_CHOICES", "CT_WINDOW_CENTER", "CT_WINDOW_WIDTH", "DEFAULT_LABELS_CSV", "DEFAULT_ROOT", "ICH_SUBTYPES",
+    "CQ500_TASK_CHOICES", "CT_WINDOW_CENTER", "CT_WINDOW_WIDTH", "CT_WINDOWS", "DEFAULT_LABELS_CSV", "DEFAULT_ROOT", "ICH_SUBTYPES",
     "build_cq500_transform", "build_cq500_volume_transform", "read_cq500_labels",
     "resolve_cq500_task",
 ]

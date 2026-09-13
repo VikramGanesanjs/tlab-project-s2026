@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -100,34 +100,3 @@ def uwsd_loss(
         denominator = term_den if denominator is None else denominator + term_den
     assert numerator is not None and denominator is not None
     return numerator / denominator.clamp_min(1e-8)
-
-
-def croco_ibot_loss(
-    *,
-    teacher_logits1: Tensor,
-    teacher_logits2: Tensor,
-    decoded_tokens1: Tensor,
-    decoded_tokens2: Tensor,
-    masks1: Tensor,
-    masks2: Tensor,
-    ibot_head: Callable[[Tensor], Tensor],
-    teacher_temp: float,
-    student_temp: float,
-) -> Tensor:
-    """Cross-view masked-patch completion from already decoded patch tokens."""
-    teacher_selected1 = teacher_logits1[masks1]
-    teacher_selected2 = teacher_logits2[masks2]
-    teacher_selected = torch.cat((teacher_selected1, teacher_selected2), dim=0)
-    teacher_probs = _sinkhorn_knopp(teacher_selected, teacher_temp)
-    count1 = teacher_selected1.shape[0]
-    teacher_probs1, teacher_probs2 = teacher_probs.split((count1, teacher_selected2.shape[0]), dim=0)
-
-    student_logits1 = ibot_head(decoded_tokens1)
-    student_logits2 = ibot_head(decoded_tokens2)
-
-    def patch_ce(student_logits: Tensor, target: Tensor) -> Tensor:
-        if student_logits.numel() == 0:
-            return student_logits.sum() * 0.0
-        return -(target.float() * F.log_softmax(student_logits.float() / student_temp, dim=-1)).sum(-1).mean()
-
-    return 0.5 * (patch_ce(student_logits1, teacher_probs1) + patch_ce(student_logits2, teacher_probs2))

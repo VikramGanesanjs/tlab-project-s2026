@@ -14,6 +14,7 @@ from torch import nn
 from classification.model import MultiSliceDinoModel
 from classification.run import parse_args
 from classification.triad import TriadVolumeClassifier
+from classification.neurovfm import NeuroVFMVolumeClassifier
 from classification.train import build_dataset, saved_split_patient_ids, task_config, train
 from utils import load_dinov3
 
@@ -37,6 +38,10 @@ class _ToyTriadEncoder(nn.Module):
         )
 
 
+class _ToyNeuroVFMEncoder(_ToyTriadEncoder):
+    pass
+
+
 class _ToyPatientDataset:
     def __init__(self, patient_ids: list[str]) -> None:
         self.patient_ids = patient_ids
@@ -52,6 +57,26 @@ class _ToyPatientDataset:
 
 
 class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
+    def test_neurovfm_is_a_selectable_classification_encoder(self) -> None:
+        args = parse_args(["--encoder", "neurovfm"])
+
+        self.assertEqual(args.encoder, "neurovfm")
+        self.assertEqual(tuple(args.neurovfm_volume_shape), (128, 192, 192))
+
+    def test_neurovfm_classifier_processes_a_complete_volume(self) -> None:
+        model = NeuroVFMVolumeClassifier(
+            _ToyNeuroVFMEncoder(),
+            input_channels=3,
+            volume_shape=(4, 16, 16),
+            input_normalization="none",
+            hidden_dim=4,
+            num_classes=2,
+        ).eval()
+        with torch.no_grad():
+            output = model(torch.randn(2, 5, 3, 8, 8))
+
+        self.assertEqual(tuple(output.shape), (2, 2))
+
     def test_triad_is_a_selectable_classification_encoder(self) -> None:
         args = parse_args(["--encoder", "triad"])
 
@@ -363,3 +388,20 @@ class TestOrganMNIST3DClassificationIntegration(unittest.TestCase):
 
             self.assertTrue((root / "checkpoints" / "best_triad.pt").is_file())
             self.assertTrue((root / "checkpoints" / "last_triad.pt").is_file())
+
+    def test_training_selects_neurovfm_whole_volume_classifier(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_archive(root)
+            args = parse_args([
+                "--dataset", "organmnist3d", "--data-root", str(root),
+                "--encoder", "neurovfm", "--n-slices", "2", "--image-size", "8",
+                "--neurovfm-volume-shape", "4", "16", "16", "--no-augment",
+                "--batch-size", "11", "--num-workers", "0", "--epochs", "1",
+                "--min-epochs", "0", "--no-early-stopping", "--hidden-dim", "4",
+            ])
+            with patch("classification.train.NeuroVFMEncoder", return_value=_ToyNeuroVFMEncoder()):
+                train(args, torch.device("cpu"), root / "checkpoints")
+
+            self.assertTrue((root / "checkpoints" / "best_neurovfm.pt").is_file())
+            self.assertTrue((root / "checkpoints" / "last_neurovfm.pt").is_file())

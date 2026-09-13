@@ -18,6 +18,8 @@ ibot:
   head_hidden_dim: 2048
 train:
   batch_size_per_gpu: 64
+  # Paired-slice datasets: adni, breastdm, cq500, duke. BreastDM consumes
+  # its supplied train split directly; the fold settings below do not apply.
   dataset: adni
   data_root: /common/ganesanv/tlab/data/ADNI
   adni_task: cn_mci_ad
@@ -112,7 +114,15 @@ checkpointing:
 
 # Volumetric-DINO slice-pair fine-tuning options.
 uwsd_loss_weight: 1.0
-croco_ibot_loss_weight: 1.0
+ibot_loss_weight: 1.0
+cross_slice_gram_penalty_weight: 0.1
+# Keep this penalty at zero for this many (possibly fractional) epochs before
+# enabling ``cross_slice_gram_penalty_weight``. Zero enables it immediately.
+cross_slice_gram_penalty_delay_epochs: 0.0
+# Side length of the local patch neighborhood used by the Gram penalty. Set
+# to 0 to retain the original full Gram matrix; an odd value such as 3 keeps
+# the 3x3 neighborhood around each patch.
+cross_slice_gram_spatial_window_size: 0
 cross_view_global_loss_weight: 1.0
 gamma: 1.0
 lora:
@@ -120,12 +130,3 @@ lora:
   rank: 8
 unfreeze_last_layers: 0
 unfreeze_patch_embeddings: false
-decoder:
-  n_blocks: 2
-  # null uses the encoder embedding dimension.
-  embed_dim: null
-  n_heads: 4
-  mlp_ratio: 4.0
-  rope_base: 100.0
-  # masked = corresponding teacher patches only; full = all teacher patches.
-  context_mode: masked

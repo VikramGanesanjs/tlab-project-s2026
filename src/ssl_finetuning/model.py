@@ -36,9 +36,9 @@ from dinov3.models import build_model_from_cfg
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
 
-from .cvd import CrossViewDecoder, _patch_positions
-from .losses import croco_ibot_loss as compute_croco_ibot_loss
+from .losses import _sinkhorn_knopp
 from .losses import uwsd_loss as compute_uwsd_loss
+from .gram_loss import GramLoss
 
 logger = logging.getLogger("dinov3")
 
@@ -91,7 +91,7 @@ def _set_patch_embeddings_trainable(model: nn.Module, trainable: bool) -> int:
 
 
 class SSLFineTune(nn.Module):
-    """DINOv3 slice-pair fine-tuning with cross-view masked completion."""
+    """DINOv3 slice-pair fine-tuning with iBOT and cross-slice Gram loss."""
 
     def __init__(self, cfg: Any) -> None:
         super().__init__()
@@ -136,7 +136,6 @@ class SSLFineTune(nn.Module):
                 "backbone": student_backbone,
                 "dino_head": dino_head_class(),
                 "ibot_head": ibot_head_class(),
-                "cvd": CrossViewDecoder(cfg, enc_embed_dim=self.embed_dim),
             }
         )
         self.teacher = nn.ModuleDict(
@@ -204,9 +203,16 @@ class SSLFineTune(nn.Module):
 
         self.dino_loss = DINOLoss(self.dino_out_dim)
         self.ibot_patch_loss = iBOTPatchLoss(ibot_out_dim)
+        self.cross_slice_gram_loss = GramLoss(
+            apply_norm=True,
+            img_level=True,
+            remove_neg=True,
+            spatial_window_size=getattr(cfg, "cross_slice_gram_spatial_window_size", 0),
+        )
         self._distributed_prepared = False
         self.uwsd_loss_weight = float(cfg.uwsd_loss_weight)
-        self.croco_ibot_loss_weight = float(cfg.croco_ibot_loss_weight)
+        self.ibot_loss_weight = float(cfg.ibot_loss_weight)
+        self.cross_slice_gram_penalty_weight = float(cfg.cross_slice_gram_penalty_weight)
         self.cross_view_global_loss_weight = float(cfg.cross_view_global_loss_weight)
         self.gamma = float(cfg.gamma)
         self.teacher_temp = float(cfg.teacher.teacher_temp)
@@ -216,17 +222,13 @@ class SSLFineTune(nn.Module):
 
         logger.info(
             "Built slice-pair fine-tuner: embed_dim=%d, dino_prototypes=%d, "
-            "ibot_prototypes=%d, gamma=%.3f, cross_view_global_loss_weight=%.3f",
+            "ibot_prototypes=%d, ibot_loss_weight=%.3f, cross_slice_gram_penalty_weight=%.3f",
             self.embed_dim,
             self.dino_out_dim,
             ibot_out_dim,
-            self.gamma,
-            self.cross_view_global_loss_weight,
+            self.ibot_loss_weight,
+            self.cross_slice_gram_penalty_weight,
         )
-
-    @property
-    def cross_view_decoder(self) -> nn.Module:
-        return self.student["cvd"]
 
     def _copy_student_to_teacher(self) -> None:
         student_state = self.student.state_dict()
@@ -367,7 +369,6 @@ class SSLFineTune(nn.Module):
             init_lora_parameters(self.student.backbone)
         self.student.dino_head.init_weights()
         self.student.ibot_head.init_weights()
-        self.student.cvd.init_weights()
         self.dino_loss.init_weights()
         self.ibot_patch_loss.init_weights()
 
@@ -482,8 +483,9 @@ class SSLFineTune(nn.Module):
     def get_teacher_output(
         self,
         images: Tensor,
+        masks: Tensor,
     ) -> Dict[str, Tensor]:
-        """DINOv3-style teacher forward, extended with full patch logits.
+        """DINOv3-style teacher forward, returning detached loss targets.
 
         ``images`` follows the original script convention: ``[n_crops, B,
         C, H, W]``. Teacher images are always clean; masking is only used to
@@ -493,17 +495,19 @@ class SSLFineTune(nn.Module):
         flat_images = images.flatten(0, 1)
         backbone_out = self.teacher.backbone(flat_images, is_training=True)
         cls = backbone_out["x_norm_clstoken"]
-        reg = backbone_out["x_storage_tokens"]
         patches = backbone_out["x_norm_patchtokens"]
+        if masks.shape != patches.shape[:2]:
+            raise ValueError(
+                "Teacher masks must match flattened global patch tokens: "
+                f"masks={tuple(masks.shape)}, patches={tuple(patches.shape)}"
+            )
         cls_logits = self.teacher.dino_head(cls)
-        ibot_logits = self.teacher.ibot_head(patches)
+        masked_ibot_logits = self.teacher.ibot_head(patches[masks])
 
         return {
-            "cls_pre_head": cls.unflatten(0, (n_crops, batch_size)),
-            "reg_pre_head": reg.unflatten(0, (n_crops, batch_size)),
             "patch_pre_head": patches.unflatten(0, (n_crops, batch_size)),
             "cls_after_head": cls_logits.unflatten(0, (n_crops, batch_size)),
-            "ibot_after_head": ibot_logits.unflatten(0, (n_crops, batch_size)),
+            "masked_ibot_after_head": masked_ibot_logits,
         }
 
     def get_student_output(
@@ -603,46 +607,47 @@ class SSLFineTune(nn.Module):
             masks[0, 0] = True
         return masks
 
-    def _decode_masked_queries(
+    def _within_slice_ibot_loss(
         self,
-        query_tokens: Tensor,
-        context_tokens: Tensor,
+        *,
+        teacher_patch_logits: Tensor,
+        student_patch_features: Tensor,
         masks: Tensor,
-        positions: Tensor,
+        teacher_temp: float,
     ) -> Tensor:
-        """Decode masked queries while preserving each patch's source position.
-
-        Masks can contain different numbers of patches for different samples,
-        so each sample is decoded separately. This avoids padding tokens or
-        allowing attention to mix unrelated samples in the batch.
-        """
-        decoded = []
-        for batch_index in range(query_tokens.shape[0]):
-            sample_mask = masks[batch_index].bool()
-            if not sample_mask.any():
-                continue
-
-            query = query_tokens[batch_index : batch_index + 1, sample_mask]
-            query_pos = positions[batch_index : batch_index + 1, sample_mask]
-            if self.cross_view_decoder.context_mode == "masked":
-                context = context_tokens[batch_index : batch_index + 1, sample_mask]
-                context_pos = positions[batch_index : batch_index + 1, sample_mask]
-            else:
-                context = context_tokens[batch_index : batch_index + 1]
-                context_pos = positions[batch_index : batch_index + 1]
-
-            decoded.append(
-                self.cross_view_decoder(
-                    query,
-                    context.detach(),
-                    query_pos=query_pos,
-                    context_pos=context_pos,
-                ).squeeze(0)
+        """Regular iBOT supervision of masked patches in their own slice."""
+        masks_flat = masks.flatten(0, 1)
+        student_selected = self.student.ibot_head(student_patch_features.flatten(0, 1)[masks_flat])
+        n_masked_patches = teacher_patch_logits.shape[0]
+        if n_masked_patches != int(masks_flat.sum().item()):
+            raise ValueError(
+                "Teacher iBOT targets must contain exactly one logit vector per masked patch: "
+                f"targets={n_masked_patches}, masks={int(masks_flat.sum().item())}"
             )
+        if n_masked_patches == 0:
+            return student_selected.sum() * 0.0
 
-        if not decoded:
-            return query_tokens.new_empty((0, query_tokens.shape[-1]))
-        return torch.cat(decoded, dim=0)
+        # Match DINOv3's distributed iBOT target construction. The local
+        # fallback keeps CPU/unit-test execution valid when no process group
+        # exists.
+        if dist.is_initialized():
+            n_masked_patches_tensor = torch.tensor(
+                n_masked_patches, device=teacher_patch_logits.device, dtype=torch.long
+            )
+            teacher_probs = self.ibot_patch_loss.sinkhorn_knopp_teacher(
+                teacher_patch_logits,
+                teacher_temp=teacher_temp,
+                n_masked_patches_tensor=n_masked_patches_tensor,
+            )
+        else:
+            teacher_probs = _sinkhorn_knopp(teacher_patch_logits, teacher_temp)
+
+        return self.ibot_patch_loss.forward_masked(
+            student_selected,
+            teacher_probs,
+            student_masks_flat=masks_flat,
+            n_masked_patches=n_masked_patches,
+        )
 
     def compute_losses(
         self,
@@ -657,13 +662,9 @@ class SSLFineTune(nn.Module):
 
         teacher1 = {
             "cls_logits": teacher_global["cls_after_head"][0],
-            "patch_pre_head": teacher_global["patch_pre_head"][0],
-            "ibot_logits": teacher_global["ibot_after_head"][0],
         }
         teacher2 = {
             "cls_logits": teacher_global["cls_after_head"][1],
-            "patch_pre_head": teacher_global["patch_pre_head"][1],
-            "ibot_logits": teacher_global["ibot_after_head"][1],
         }
         student1 = {
             "cls_logits": student_global["cls_after_head"][0],
@@ -698,29 +699,29 @@ class SSLFineTune(nn.Module):
         )
         batch_size = student_global["cls_after_head"].shape[1]
         masks = masks.reshape(2, batch_size, -1)
-        _, num_patches, _ = teacher1["patch_pre_head"].shape
-        positions = _patch_positions(batch_size, num_patches, teacher1["patch_pre_head"].device)
-        decoded_tokens1 = self._decode_masked_queries(
-            student1["patch_pre_head"], teacher2["patch_pre_head"], masks[0], positions
-        )
-        decoded_tokens2 = self._decode_masked_queries(
-            student2["patch_pre_head"], teacher1["patch_pre_head"], masks[1], positions
-        )
-        croco_ibot_loss = compute_croco_ibot_loss(
-            teacher_logits1=teacher1["ibot_logits"],
-            teacher_logits2=teacher2["ibot_logits"],
-            decoded_tokens1=decoded_tokens1,
-            decoded_tokens2=decoded_tokens2,
-            masks1=masks[0],
-            masks2=masks[1],
-            ibot_head=self.student.ibot_head,
+        ibot_loss = self._within_slice_ibot_loss(
+            teacher_patch_logits=teacher_global["masked_ibot_after_head"],
+            student_patch_features=student_global["patch_pre_head"],
+            masks=masks,
             teacher_temp=effective_teacher_temp,
-            student_temp=float(getattr(self.ibot_patch_loss, "student_temp", 0.1)),
         )
-        total = self.uwsd_loss_weight * uwsd_loss + self.croco_ibot_loss_weight * croco_ibot_loss
+        gram_penalty = (
+            self.cross_slice_gram_loss(
+                student1["patch_pre_head"], teacher_global["patch_pre_head"][1]
+            )
+            + self.cross_slice_gram_loss(
+                student2["patch_pre_head"], teacher_global["patch_pre_head"][0]
+            )
+        )
+        total = (
+            self.uwsd_loss_weight * uwsd_loss
+            + self.ibot_loss_weight * ibot_loss
+            + self.cross_slice_gram_penalty_weight * gram_penalty
+        )
         return total, {
             "uwsd_loss": uwsd_loss,
-            "croco_ibot_loss": croco_ibot_loss,
+            "ibot_loss": ibot_loss,
+            "cross_slice_gram_penalty": gram_penalty,
         }
 
     def forward_pair(self, data: Any, *, teacher_temp: Optional[float] = None) -> Dict[str, Tensor]:
@@ -730,11 +731,18 @@ class SSLFineTune(nn.Module):
         slices2 = slices2.to(device=device, non_blocking=True)
 
         global_crops = torch.stack((slices1, slices2), dim=0)
-        teacher_global = self.get_teacher_output(global_crops)
-        num_patches = teacher_global["patch_pre_head"].shape[2]
+        patch_size = int(self.cfg.student.patch_size)
+        height, width = slices1.shape[-2:]
+        if height % patch_size or width % patch_size:
+            raise ValueError(
+                "Global crop dimensions must be divisible by the student patch size: "
+                f"crop=({height}, {width}), patch_size={patch_size}"
+            )
+        num_patches = (height // patch_size) * (width // patch_size)
         masks1 = self._prepare_mask(masks1, slices1.shape[0], num_patches, device)
         masks2 = self._prepare_mask(masks2, slices2.shape[0], num_patches, device)
         masks = torch.cat((masks1, masks2), dim=0)
+        teacher_global = self.get_teacher_output(global_crops, masks)
 
         local1_tensor = self._normalize_local_crops(local1)
         local2_tensor = self._normalize_local_crops(local2)
@@ -766,7 +774,8 @@ class SSLFineTune(nn.Module):
         return {
             "loss": total_loss,
             "uwsd_loss": loss_dict["uwsd_loss"],
-            "croco_ibot_loss": loss_dict["croco_ibot_loss"],
+            "ibot_loss": loss_dict["ibot_loss"],
+            "cross_slice_gram_penalty": loss_dict["cross_slice_gram_penalty"],
             "masks1": masks1,
             "masks2": masks2,
         }
@@ -783,7 +792,8 @@ class SSLFineTune(nn.Module):
         metrics = {
             "loss": outputs["loss"].detach(),
             "uwsd_loss": outputs["uwsd_loss"].detach(),
-            "croco_ibot_loss": outputs["croco_ibot_loss"].detach(),
+            "ibot_loss": outputs["ibot_loss"].detach(),
+            "cross_slice_gram_penalty": outputs["cross_slice_gram_penalty"].detach(),
         }
         return outputs["loss"], metrics
 

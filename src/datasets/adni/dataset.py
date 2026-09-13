@@ -8,9 +8,11 @@ conversion or segmentation products are required.
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import random
 import re
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -23,11 +25,14 @@ from PIL import Image
 from torchvision import transforms as tv_transforms
 from torchvision.datasets.vision import VisionDataset
 
+from utils.data_pipeline_timing import DataPipelineTimingProxy
+
 logger = logging.getLogger(__name__)
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ROOT = _REPOSITORY_ROOT / "data" / "ADNI"
 DEFAULT_CSV_NAME = "ADNI1_Complete_3Yr_1.5T_7_21_2026.csv"
+DEFAULT_MANIFEST_NAME = "adni_nii_manifest.json"
 
 DIAGNOSIS_TO_LABEL = {"CN": 0, "MCI": 1, "AD": 2}
 LABEL_TO_DIAGNOSIS = {label: diagnosis for diagnosis, label in DIAGNOSIS_TO_LABEL.items()}
@@ -191,18 +196,57 @@ def _normalize_image_id(value: Any) -> str:
     return image_id
 
 
-def _discover_volumes(root: Path) -> Dict[str, Path]:
+def _manifest_path(root: Path, manifest_path: Optional[Union[str, Path]]) -> Path:
+    return (
+        Path(manifest_path).expanduser().resolve()
+        if manifest_path is not None
+        else root / DEFAULT_MANIFEST_NAME
+    )
+
+
+def _manifest_volumes(
+    root: Path,
+    manifest_path: Path,
+    patient_ids: Optional[Sequence[str]],
+) -> Dict[str, Path]:
+    """Load indexed paths, reading only the requested patient entries."""
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing ADNI NIfTI manifest: {manifest_path}. Create it once before "
+            "training with `python -m datasets.adni.build_manifest --root "
+            f"{root}`."
+        )
+    try:
+        with manifest_path.open(encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        patients = manifest["patients"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(f"Invalid ADNI NIfTI manifest {manifest_path}: {exc}") from exc
+    if not isinstance(patients, dict):
+        raise ValueError(f"Invalid ADNI NIfTI manifest {manifest_path}: patients must be a mapping")
+    requested = {str(patient_id) for patient_id in patient_ids} if patient_ids is not None else set(patients)
+    missing = requested.difference(patients)
+    if missing:
+        raise ValueError(
+            f"ADNI manifest {manifest_path} is missing requested patient IDs: {sorted(missing)[:5]}"
+        )
     volumes: Dict[str, Path] = {}
-    for path in sorted((*root.rglob("*.nii"), *root.rglob("*.nii.gz"))):
-        image_id = _normalize_image_id(path.parent.name)
-        previous = volumes.get(image_id)
-        if previous is not None:
-            raise ValueError(
-                f"Multiple NIfTI files found for image ID {image_id}: {previous} and {path}"
-            )
-        volumes[image_id] = path
+    for patient_id in sorted(requested):
+        entries = patients[patient_id]
+        if not isinstance(entries, list):
+            raise ValueError(f"Invalid entries for ADNI patient {patient_id!r} in {manifest_path}")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("image_id"), str) or not isinstance(entry.get("path"), str):
+                raise ValueError(f"Invalid NIfTI entry for ADNI patient {patient_id!r} in {manifest_path}")
+            image_id = _normalize_image_id(entry["image_id"])
+            volume_path = root / entry["path"]
+            if image_id in volumes:
+                raise ValueError(f"Duplicate image ID {image_id} in ADNI manifest {manifest_path}")
+            if not volume_path.is_file():
+                raise FileNotFoundError(f"ADNI manifest path does not exist: {volume_path}")
+            volumes[image_id] = volume_path
     if not volumes:
-        raise RuntimeError(f"No .nii or .nii.gz files found under {root}")
+        raise RuntimeError(f"No ADNI NIfTI paths selected from {manifest_path}")
     return volumes
 
 
@@ -241,13 +285,20 @@ def _read_metadata(csv_path: Path) -> Tuple[List[str], Dict[str, Dict[str, str]]
     return columns, rows
 
 
-def _build_scan_index(root: Path, csv_path: Path) -> Tuple[List[_ScanRecord], List[str]]:
-    volumes = _discover_volumes(root)
+def _build_scan_index(
+    root: Path,
+    csv_path: Path,
+    *,
+    manifest_path: Optional[Union[str, Path]] = None,
+    patient_ids: Optional[Sequence[str]] = None,
+    include_native_depth: bool = True,
+) -> Tuple[List[_ScanRecord], List[str]]:
+    volumes = _manifest_volumes(root, _manifest_path(root, manifest_path), patient_ids)
     columns, metadata = _read_metadata(csv_path)
 
     file_ids = set(volumes)
     metadata_ids = set(metadata)
-    missing_files = sorted(metadata_ids - file_ids)
+    missing_files = sorted(metadata_ids - file_ids) if patient_ids is None else []
     missing_metadata = sorted(file_ids - metadata_ids)
     if missing_files or missing_metadata:
         details = []
@@ -278,7 +329,7 @@ def _build_scan_index(root: Path, csv_path: Path) -> Tuple[List[_ScanRecord], Li
                 image_id=image_id,
                 patient_id=patient_id,
                 volume_path=path,
-                n_slices=_canonical_depth(path),
+                n_slices=_canonical_depth(path) if include_native_depth else 0,
                 label=DIAGNOSIS_TO_LABEL[phenotype["Group"]],
                 phenotype=phenotype,
             )
@@ -331,27 +382,28 @@ def _slice_to_pil(
     return Image.fromarray(pixels, mode="L").convert("RGB")
 
 
-def _zscore_normalize_volume(volume: np.ndarray) -> np.ndarray:
-    """Normalize a whole canonical volume using its nonzero intensities."""
+def _scale_volume_to_unit_interval(volume: np.ndarray) -> np.ndarray:
+    """Map finite ADNI intensities from the volume's 0th–99th percentile to [0, 1].
+
+    This preserves a single intensity scale for the complete MRI volume.  It is
+    deliberately applied before spatial resampling and ImageNet normalization:
+    per-slice scaling would erase inter-slice intensity relationships, while a
+    z-score would be discarded by the subsequent conversion to image pixels.
+    """
     volume = np.asarray(volume, dtype=np.float32)
     finite = volume[np.isfinite(volume)]
-    nonzero = volume[(volume > 0) & np.isfinite(volume)]
-    if nonzero.size < 10:
-        nonzero = finite
-    if nonzero.size == 0:
+    if finite.size == 0:
         raise ValueError("ADNI volume contains no finite voxel values")
-
-    low, high = np.percentile(nonzero, (1.0, 99.0))
+    low = float(finite.min())
+    high = float(np.percentile(finite, 99.0))
     if high <= low:
         high = low + 1.0
-    volume = np.nan_to_num(volume, nan=0.0, posinf=high, neginf=0.0)
-    volume = np.clip(volume, low, high)
-    nonzero = volume[(volume > 0) & np.isfinite(volume)]
-    if nonzero.size == 0:
-        nonzero = volume.reshape(-1)
-    mean = float(nonzero.mean())
-    std = max(float(nonzero.std()), 1e-6)
-    return ((volume - mean) / std).astype(np.float32, copy=False)
+    return np.nan_to_num(
+        np.clip((volume - low) / (high - low), 0.0, 1.0),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    ).astype(np.float32, copy=False)
 
 
 def _resample_volume(
@@ -386,43 +438,8 @@ def _resample_volume(
     return volume_t.squeeze(0)
 
 
-def _slice_to_imagenet_tensor(image_slice: torch.Tensor) -> torch.Tensor:
-    """Reference single-slice conversion used to validate the batched path."""
-    image_array = np.asarray(image_slice.detach().cpu(), dtype=np.float32)
-    finite = image_array[np.isfinite(image_array)]
-    if finite.size == 0:
-        raise ValueError("ADNI slice contains no finite values")
-
-    low = float(finite.min())
-    high = float(finite.max())
-    if high <= low:
-        scaled = np.zeros_like(image_array, dtype=np.float32)
-    else:
-        scaled = np.clip((image_array - low) / (high - low), 0.0, 1.0)
-    scaled = np.nan_to_num(scaled, nan=0.0, posinf=1.0, neginf=0.0)
-
-    grayscale = Image.fromarray(
-        np.rint(scaled * 255.0).astype(np.uint8), mode="L"
-    )
-    rgb_image = grayscale.convert("RGB")
-    image_tensor = tv_transforms.functional.to_tensor(rgb_image)
-    return tv_transforms.functional.normalize(
-        image_tensor,
-        mean=IMAGENET_MEAN,
-        std=IMAGENET_STD,
-    )
-
-
 def _volume_to_imagenet_tensors(volume: torch.Tensor) -> torch.Tensor:
-    """Convert ``[D, H, W]`` grayscale slices into normalized RGB tensors.
-
-    This is the vectorized equivalent of applying
-    :func:`_slice_to_imagenet_tensor` to every slice.  In particular, it keeps
-    the existing per-slice min/max scaling and uint8 quantization before
-    ImageNet normalization.  Keeping the quantization makes the output match
-    the previous PIL-based preprocessing while avoiding one NumPy/PIL round
-    trip per slice.
-    """
+    """ImageNet-normalize volume-level [0, 1] grayscale slices as RGB."""
     slices = torch.as_tensor(volume, dtype=torch.float32)
     if slices.ndim != 3:
         raise ValueError(
@@ -430,31 +447,8 @@ def _volume_to_imagenet_tensors(volume: torch.Tensor) -> torch.Tensor:
             f"got shape {tuple(slices.shape)}"
         )
 
-    finite = torch.isfinite(slices)
-    if not bool(finite.flatten(1).any(dim=1).all()):
-        raise ValueError("ADNI slice contains no finite values")
-
-    low = torch.where(finite, slices, torch.full_like(slices, float("inf")))
-    low = low.amin(dim=(1, 2), keepdim=True)
-    high = torch.where(finite, slices, torch.full_like(slices, float("-inf")))
-    high = high.amax(dim=(1, 2), keepdim=True)
-    scale = high - low
-    scaled = torch.where(
-        scale > 0,
-        (slices - low) / scale,
-        torch.zeros_like(slices),
-    )
-    scaled = torch.nan_to_num(
-        scaled.clamp(0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0
-    )
-
-    # torchvision's PIL ``to_tensor`` converts uint8 pixels to float / 255.
-    pixels = torch.round(scaled * 255.0).to(torch.uint8)
-    images = (
-        pixels.unsqueeze(1)
-        .repeat(1, 3, 1, 1)
-        .to(torch.float32)
-        .div_(255.0)
+    images = torch.nan_to_num(slices.clamp(0.0, 1.0), nan=0.0).unsqueeze(1).repeat(
+        1, 3, 1, 1
     )
     mean = images.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
     std = images.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
@@ -575,6 +569,7 @@ class _ADNIBaseDataset(VisionDataset):
         csv_path: Optional[Union[str, Path]] = None,
         task: str = DEFAULT_ADNI_TASK,
         patient_ids: Optional[Sequence[str]] = None,
+        manifest_path: Optional[Union[str, Path]] = None,
         z_min: float = 0.0,
         z_max: float = 1.0,
         transforms: Optional[Callable] = None,
@@ -584,6 +579,7 @@ class _ADNIBaseDataset(VisionDataset):
         augment: bool = True,
         image_size: int = 224,
         build_default_transform: bool = True,
+        data_timing: Optional[DataPipelineTimingProxy] = None,
     ) -> None:
         root_path = Path(root).expanduser().resolve()
         metadata_path = (
@@ -600,6 +596,7 @@ class _ADNIBaseDataset(VisionDataset):
             target_transform=target_transform,
         )
         self.root_path = root_path
+        self.data_timing = data_timing
         self.csv_path = metadata_path
         self.task_spec = resolve_adni_task(task)
         self.task = self.task_spec.name
@@ -610,7 +607,13 @@ class _ADNIBaseDataset(VisionDataset):
         self._volume_cache = (
             _VolumeCache(volume_cache_size) if volume_cache_size is not None else None
         )
-        records, self.phenotype_columns = _build_scan_index(root_path, metadata_path)
+        records, self.phenotype_columns = _build_scan_index(
+            root_path,
+            metadata_path,
+            manifest_path=manifest_path,
+            patient_ids=patient_ids,
+            include_native_depth=not isinstance(self, ADNIMultiSliceDataset),
+        )
         allowed = set(self.task_spec.diagnoses)
         self._records = [
             replace(record, label=self.task_spec.label_map[record.phenotype["Group"]])
@@ -659,6 +662,8 @@ class ADNIClassificationDataset(_ADNIBaseDataset):
         *,
         csv_path: Optional[Union[str, Path]] = None,
         task: str = DEFAULT_ADNI_TASK,
+        patient_ids: Optional[Sequence[str]] = None,
+        manifest_path: Optional[Union[str, Path]] = None,
         z_min: float = 0.0,
         z_max: float = 1.0,
         transforms: Optional[Callable] = None,
@@ -667,11 +672,14 @@ class ADNIClassificationDataset(_ADNIBaseDataset):
         volume_cache_size: int = 8,
         augment: bool = True,
         image_size: int = 224,
+        data_timing: Optional[DataPipelineTimingProxy] = None,
     ) -> None:
         super().__init__(
             root=root,
             csv_path=csv_path,
             task=task,
+            patient_ids=patient_ids,
+            manifest_path=manifest_path,
             z_min=z_min,
             z_max=z_max,
             transforms=transforms,
@@ -741,16 +749,20 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
         csv_path: Optional[Union[str, Path]] = None,
         task: str = DEFAULT_ADNI_TASK,
         patient_ids: Optional[Sequence[str]] = None,
+        manifest_path: Optional[Union[str, Path]] = None,
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         augment: bool = True,
         image_size: int = 224,
+        return_imagenet_tensors: bool = True,
+        data_timing: Optional[DataPipelineTimingProxy] = None,
     ) -> None:
         if n_slices <= 0:
             raise ValueError(f"n_slices must be positive, got {n_slices}")
         self.n_slices = int(n_slices)
         self.image_size = int(image_size)
+        self.return_imagenet_tensors = bool(return_imagenet_tensors)
         if self.image_size <= 0:
             raise ValueError(f"image_size must be positive, got {image_size}")
         if transforms is None and transform is None and augment:
@@ -760,6 +772,7 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
             csv_path=csv_path,
             task=task,
             patient_ids=patient_ids,
+            manifest_path=manifest_path,
             transforms=transforms,
             transform=transform,
             target_transform=target_transform,
@@ -769,6 +782,7 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
             augment=augment,
             image_size=image_size,
             build_default_transform=False,
+            data_timing=data_timing,
         )
         self._entries = list(self._records)
 
@@ -789,12 +803,17 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         record = self._entries[index]
+        read_start = time.perf_counter()
         volume = _load_canonical_volume(record.volume_path)
+        read_seconds = time.perf_counter() - read_start
+        preprocessing_start = time.perf_counter()
         volume_t = _resample_volume(
-            _zscore_normalize_volume(volume), self.n_slices, self.image_size
+            _scale_volume_to_unit_interval(volume), self.n_slices, self.image_size
         ).unsqueeze(0)
+        preprocessing_seconds = time.perf_counter() - preprocessing_start
         target: Any = record.label
 
+        augmentation_start = time.perf_counter()
         if self.transforms is not None:
             volume_t, target = self.transforms(volume_t, target)
         else:
@@ -803,6 +822,12 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
             if self.target_transform is not None:
                 target = self.target_transform(target)
 
+        augmentation_seconds = (
+            time.perf_counter() - augmentation_start
+            if self.transform is not None or self.transforms is not None
+            else 0.0
+        )
+        conversion_start = time.perf_counter()
         volume_t = torch.as_tensor(volume_t)
         if volume_t.ndim == 3:
             volume_t = volume_t.unsqueeze(0)
@@ -811,7 +836,18 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
                 "ADNI multi-slice transforms must return [1, depth, height, width], "
                 f"got shape {tuple(volume_t.shape)}"
             )
-        images = _volume_to_imagenet_tensors(volume_t.squeeze(0))
+        images = (
+            _volume_to_imagenet_tensors(volume_t.squeeze(0))
+            if getattr(self, "return_imagenet_tensors", True)
+            else volume_t
+        )
+        preprocessing_seconds += time.perf_counter() - conversion_start
+        if self.data_timing is not None:
+            self.data_timing.add(
+                volume_read_s=read_seconds,
+                volume_preprocessing_s=preprocessing_seconds,
+                volume_augmentation_s=augmentation_seconds,
+            )
         return images, target
 
 
@@ -844,6 +880,7 @@ class ADNIPairedSliceDataset(ADNIClassificationDataset):
 
     The phenotype helpers are retained for callers that need metadata, but the
     paired SSL path does not return a target from ``__getitem__``.
+    ``patient_ids``, when provided, restricts the dataset to those patients.
     """
 
     def __init__(
@@ -851,7 +888,7 @@ class ADNIPairedSliceDataset(ADNIClassificationDataset):
         root: Union[str, Path] = DEFAULT_ROOT,
         *,
         max_distance: int = 3,
-        n_patients: Optional[int] = None,
+        patient_ids: Optional[Sequence[str]] = None,
         phenotype_columns: Optional[Sequence[str]] = None,
         seed: Optional[int] = None,
         **kwargs: Any,
@@ -863,23 +900,7 @@ class ADNIPairedSliceDataset(ADNIClassificationDataset):
             phenotype_columns or DEFAULT_PHENOTYPE_COLUMNS
         )
         self._seed = seed
-        super().__init__(root=root, **kwargs)
-        patient_ids = list(dict.fromkeys(record.patient_id for record, _ in self._entries))
-        if n_patients is None:
-            n_patients = len(patient_ids)
-        if n_patients <= 0:
-            raise ValueError(f"n_patients must be positive, got {n_patients}")
-        if n_patients > len(patient_ids):
-            raise ValueError(
-                f"Requested n_patients={n_patients}, but only {len(patient_ids)} patients are available"
-            )
-        selected_patients = set(patient_ids[:n_patients])
-        self._entries = [
-            (record, z)
-            for record, z in self._entries
-            if record.patient_id in selected_patients
-        ]
-        self.n_patients = n_patients
+        super().__init__(root=root, patient_ids=patient_ids, **kwargs)
         unknown_columns = set(self.selected_phenotype_columns).difference(
             self.phenotype_columns
         )
@@ -931,6 +952,7 @@ __all__ = [
     "ADNI_TASK_CHOICES",
     "DEFAULT_ADNI_TASK",
     "DEFAULT_CSV_NAME",
+    "DEFAULT_MANIFEST_NAME",
     "DEFAULT_PHENOTYPE_COLUMNS",
     "DEFAULT_ROOT",
     "DIAGNOSIS_TO_LABEL",

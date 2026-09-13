@@ -20,6 +20,54 @@ is the peak host-memory RSS for the process (and is therefore cumulative).
 python -m classification.run --dataset adni --benchmark ...
 ```
 
+#### Multi-slice data-loading performance
+
+The multi-slice datasets do materially more CPU work per item than the
+single-slice datasets: they decode an entire source volume, normalize/window
+it, resample depth and in-plane resolution, optionally run MONAI 3-D
+augmentation, and finally expand every slice to ImageNet-normalized RGB.  For
+ADNI and CQ500, each multi-slice item intentionally reloads its NIfTI volume
+rather than retaining full volumes in a worker cache.  This protects worker
+RSS, but makes compressed NIfTI decode and storage latency a recurring cost on
+every epoch.
+
+Use `--benchmark` for a short representative run first. If `data_loading_s`
+is comparable to or larger than `dino_forward_s`, tune this path before making
+model changes. The most useful order of operations is:
+
+1. Sweep `--num-workers` on the target machine (for example `0, 2, 4, 8`),
+   keeping batch size and augmentation fixed. More workers can hurt when all
+   workers contend for a network filesystem or host RAM; choose the smallest
+   setting that removes GPU starvation.
+2. Run once with `--no-augment` to separate MONAI's 3-D affine/smoothing cost
+   from I/O and preprocessing. If it is the limiting step, use a lighter
+   volume transform or move stochastic augmentation to a later, smaller
+   representation after validating its effect on accuracy.
+3. Keep the dataset on node-local SSD during training when possible. This is
+   especially important for `.nii.gz`, whose decompression is repeated by the
+   ADNI and CQ500 multi-slice loaders.
+4. For repeated experiments, build a versioned cache of the deterministic
+   preprocessing keyed by dataset, split, `n_slices`, `image_size`, and
+   preprocessing version. A practical cache stores target-resolution,
+   single-channel float16 volumes in sharded files; apply random 3-D
+   augmentation after reading the cached volume, then perform RGB/ImageNet
+   conversion. Do not cache augmented tensors.
+5. Do not assume a per-worker full-volume cache will help. The current ADNI
+   and CQ500 multi-slice loaders deliberately disable it, and CQ500 has shown
+   a major data-processing speedup with that cache removed. With shuffled,
+   one-pass volume sampling, cached arrays can create host-memory pressure and
+   worse filesystem/page-cache locality without providing useful hits. Treat
+   full-volume caching as an experiment to benchmark only on the exact target
+   machine and split; merely increasing `num_workers` will not preserve
+   decoded volumes across epochs.
+
+Native-depth CQ500 (`--n-slices null`) has a separate quadratic-cost hazard:
+the slice transformer processes a padded sequence up to the deepest volume in
+each batch. Bucket scans by depth (or use a fixed `--n-slices`) to reduce both
+CPU padding/collation and transformer work. When diagnosing throughput, also
+account for validation: it re-executes the full input pipeline every epoch and
+is reported separately as `validation_s`.
+
 ### Patch-feature PCA visualization
 
 `src/utils/pca_dino_backbones.py` constructs the selected repository single-slice

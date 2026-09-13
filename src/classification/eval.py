@@ -16,6 +16,12 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from classification.model import MultiSliceDinoModel  # noqa: E402
+from classification.neurovfm import (  # noqa: E402
+    DEFAULT_NEUROVFM_REPO,
+    DEFAULT_NEUROVFM_WEIGHTS,
+    NeuroVFMEncoder,
+    NeuroVFMVolumeClassifier,
+)
 from classification.train import (  # noqa: E402
     _assert_loader_patient_disjoint,
     _cq500_patient_stratum,
@@ -61,6 +67,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--csv-path", type=Path, default=None)
+    parser.add_argument(
+        "--adni-manifest-path",
+        type=Path,
+        default=None,
+        help="Override the ADNI patient-to-NIfTI JSON manifest path",
+    )
     parser.add_argument(
         "--splits-file",
         type=Path,
@@ -114,6 +126,7 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         output=cli_args.output,
         data_root=data_root,
         csv_path=cli_args.csv_path,
+        adni_manifest_path=cli_args.adni_manifest_path,
         scan=cli_args.scan,
         batch_size=cli_args.batch_size,
         num_workers=cli_args.num_workers,
@@ -145,6 +158,11 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         mst_ffn_dim=int(_value(checkpoint, "mst_ffn_dim")),
         mst_dropout=float(_value(checkpoint, "mst_dropout")),
         hidden_dim=int(_value(checkpoint, "hidden_dim")),
+        neurovfm_repo=Path(checkpoint.get("neurovfm_repo") or DEFAULT_NEUROVFM_REPO),
+        neurovfm_input_channels=int(checkpoint.get("neurovfm_input_channels") or 1),
+        neurovfm_volume_shape=tuple(checkpoint.get("neurovfm_volume_shape") or (128, 192, 192)),
+        neurovfm_input_normalization=checkpoint.get("neurovfm_input_normalization") or "none",
+        neurovfm_modality=checkpoint.get("neurovfm_modality") or "auto",
         weight_ce_loss=bool(checkpoint.get("weight_ce_loss", False)),
         n_folds=int(checkpoint.get("n_folds", 5)),
         fold=int(checkpoint.get("fold", 0)),
@@ -179,7 +197,30 @@ def _split_patient_ids(args: argparse.Namespace) -> tuple[list[str], list[str], 
     )
 
 
-def _load_model(args: argparse.Namespace, checkpoint: dict[str, Any], device: torch.device) -> MultiSliceDinoModel:
+def _load_model(args: argparse.Namespace, checkpoint: dict[str, Any], device: torch.device):
+    num_classes, _, _ = task_config(
+        args.dataset, adni_task=args.adni_task, cq500_task=args.cq500_task
+    )
+    if args.encoder == "neurovfm":
+        modality = args.neurovfm_modality
+        if modality == "auto":
+            modality = "ct" if args.dataset == "cq500" else "mri"
+        encoder = NeuroVFMEncoder(
+            repo=args.neurovfm_repo,
+            weights=args.weights or DEFAULT_NEUROVFM_WEIGHTS,
+            device=device,
+            modality=modality,
+        )
+        model = NeuroVFMVolumeClassifier(
+            encoder,
+            input_channels=args.neurovfm_input_channels,
+            volume_shape=args.neurovfm_volume_shape,
+            input_normalization=args.neurovfm_input_normalization,
+            hidden_dim=args.hidden_dim or None,
+            num_classes=num_classes,
+        ).to(device)
+        model.load_trainable_state_dict(checkpoint["model"])
+        return model
     if args.weights is not None and args.encoder == "dinov3":
         encoder = load_custom_dinov3_encoder(
             checkpoint=args.weights,
@@ -199,9 +240,6 @@ def _load_model(args: argparse.Namespace, checkpoint: dict[str, Any], device: to
         if args.encoder_training == "lora":
             add_lora_to_vit(encoder, r=args.lora_r)
             freeze_non_lora_parameters(encoder)
-    num_classes, _, _ = task_config(
-        args.dataset, adni_task=args.adni_task, cq500_task=args.cq500_task
-    )
     model = MultiSliceDinoModel(
         encoder,
         n_slices=args.n_slices,
