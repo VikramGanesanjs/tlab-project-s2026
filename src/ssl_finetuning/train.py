@@ -55,6 +55,10 @@ from datasets.breastdm import (
 )
 from datasets.duke import DukeBreastMRIDataset, PairToDinoGlobalCrops
 from datasets.duke.dataset import _DEFAULT_OUT_ROOT as DUKE_DEFAULT_ROOT
+from datasets.organmnist3d import (
+    DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT,
+    OrganMNIST3DPairedSliceDataset,
+)
 
 from utils.fold_cv import dataset_subset_for_patients, make_dataset_patient_folds
 
@@ -514,14 +518,25 @@ def build_data_loader_from_cfg(
             image_size=cfg.crops.global_crops_size,
             seed=cfg.train.seed,
         )
+    elif dataset_name == "organmnist3d":
+        # OrganMNIST3D provides an official train/validation/test split.  Use
+        # its training volumes directly, rather than deriving patient folds.
+        dataset = OrganMNIST3DPairedSliceDataset(
+            root=data_root or ORGANMNIST3D_DEFAULT_ROOT,
+            split="train",
+            max_distance=cfg.train.max_distance,
+            transform=identity_transform,
+            image_size=cfg.crops.global_crops_size,
+            seed=cfg.train.seed,
+        )
     else:
         raise ValueError(
             "Unknown paired dataset="
-            f"{dataset_name!r}; expected 'adni', 'breastdm', 'cq500', or 'duke'"
+            f"{dataset_name!r}; expected 'adni', 'breastdm', 'cq500', 'duke', or 'organmnist3d'"
         )
 
     train_patient_ids = None
-    if dataset_name != "breastdm":
+    if dataset_name not in {"breastdm", "organmnist3d"}:
         train_patient_ids = _select_train_patient_ids(cfg, dataset, dataset_name)
     if dataset_name == "adni":
         dataset = ADNIPairedSliceDataset(

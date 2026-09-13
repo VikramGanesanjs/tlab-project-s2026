@@ -756,13 +756,18 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
         augment: bool = True,
         image_size: int = 224,
         return_imagenet_tensors: bool = True,
+        three_d_encoder: bool = False,
         data_timing: Optional[DataPipelineTimingProxy] = None,
     ) -> None:
         if n_slices <= 0:
             raise ValueError(f"n_slices must be positive, got {n_slices}")
         self.n_slices = int(n_slices)
         self.image_size = int(image_size)
+        # ``return_imagenet_tensors`` is retained for direct callers of the
+        # earlier NeuroVFM integration.  ``three_d_encoder`` is the public,
+        # consistent option shared by all multi-slice datasets.
         self.return_imagenet_tensors = bool(return_imagenet_tensors)
+        self.three_d_encoder = bool(three_d_encoder)
         if self.image_size <= 0:
             raise ValueError(f"image_size must be positive, got {image_size}")
         if transforms is None and transform is None and augment:
@@ -836,11 +841,14 @@ class ADNIMultiSliceDataset(_ADNIBaseDataset):
                 "ADNI multi-slice transforms must return [1, depth, height, width], "
                 f"got shape {tuple(volume_t.shape)}"
             )
-        images = (
-            _volume_to_imagenet_tensors(volume_t.squeeze(0))
-            if getattr(self, "return_imagenet_tensors", True)
-            else volume_t
-        )
+        if getattr(self, "three_d_encoder", False):
+            # Dataset boundary for volume encoders: [D, 1, H, W].  Values
+            # retain the single robust volume scaling applied before resampling.
+            images = volume_t.permute(1, 0, 2, 3)
+        elif getattr(self, "return_imagenet_tensors", True):
+            images = _volume_to_imagenet_tensors(volume_t.squeeze(0))
+        else:
+            images = volume_t
         preprocessing_seconds += time.perf_counter() - conversion_start
         if self.data_timing is not None:
             self.data_timing.add(

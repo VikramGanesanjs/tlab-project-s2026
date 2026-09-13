@@ -667,6 +667,7 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
         target_transform: Optional[Callable] = None,
         augment: bool = True,
         csv_path: Optional[Union[str, Path]] = None,
+        three_d_encoder: bool = False,
     ) -> None:
         if n_slices is not None and n_slices <= 0:
             raise ValueError("n_slices must be positive when provided")
@@ -679,6 +680,7 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
         self.n_slices = int(n_slices) if n_slices is not None else None
         self.cq500_max_slices = int(cq500_max_slices)
         self.image_size = int(image_size)
+        self.three_d_encoder = bool(three_d_encoder)
         if transforms is None and transform is None and augment:
             transform = build_cq500_volume_transform(augment=True)
         # A multi-slice item uses every voxel of its source volume exactly once.
@@ -716,17 +718,33 @@ class CQ500MultiSliceDataset(_CQ500BaseDataset):
             self.image_size,
             self.cq500_max_slices,
         )
-        image = torch.from_numpy(_window_volume_per_slice(resized_volume.numpy()))
+        if self.three_d_encoder:
+            # Keep the resampled CT volume one-channel and avoid CT-window
+            # expansion and ImageNet normalization for a 3-D encoder.
+            image = torch.from_numpy(resized_volume.numpy()).permute(2, 0, 1).unsqueeze(0)
+        else:
+            image = torch.from_numpy(_window_volume_per_slice(resized_volume.numpy()))
         target: Any = self.get_target(index)
         if self.transforms is not None:
             transformed = self.transforms(image, target)
             image, target = transformed
         else:
             if self.transform is not None:
-                image = self.transform(image.permute(1, 0, 2, 3)).permute(1, 0, 2, 3)
+                image = (
+                    self.transform(image)
+                    if self.three_d_encoder
+                    else self.transform(image.permute(1, 0, 2, 3)).permute(1, 0, 2, 3)
+                )
             if self.target_transform is not None:
                 target = self.target_transform(target)
         image = torch.as_tensor(image)
+        if self.three_d_encoder:
+            if image.ndim != 4 or image.shape[0] != 1:
+                raise ValueError(
+                    "CQ500 3-D encoder transforms must return [1, D, H, W], got "
+                    f"{tuple(image.shape)}"
+                )
+            return image.permute(1, 0, 2, 3), target
         if image.ndim != 4 or image.shape[1] != len(CT_WINDOWS):
             raise ValueError(
                 f"CQ500 volume transform must return [D, {len(CT_WINDOWS)}, H, W], got {tuple(image.shape)}"

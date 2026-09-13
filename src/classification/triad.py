@@ -22,10 +22,6 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TRIAD_CHECKPOINT = (
     _REPOSITORY_ROOT / "opt" / "triad" / "Triad-SwinB-SimMIM.pth"
 )
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
 def _triad_swin_transformer(
     *, feature_size: int, drop_path_rate: float, use_checkpoint: bool
 ) -> nn.Module:
@@ -121,33 +117,36 @@ class TriadVolumeClassifier(nn.Module):
     """Classify complete volumes with a Triad encoder and MST-equivalent head.
 
     The input is the existing classification dataset layout ``[B, D, C, H, W]``.
-    It is converted to ``[B, C, D, H, W]``, optionally de-normalized from the
-    ImageNet convention used by the current volume datasets, resized to the
-    Triad input cube, and projected to Triad's single MRI channel.
+    It is converted from the dataset layout ``[B, D, 1, H, W]`` to
+    ``[B, 1, D, H, W]`` and resized to Triad's input cube. Triad is an MRI
+    encoder and therefore only accepts native one-channel volumes.
     """
 
     def __init__(
         self,
         encoder: nn.Module,
         *,
-        input_channels: int = 3,
+        input_channels: int = 1,
         volume_size: int = 96,
-        input_normalization: str = "imagenet",
+        input_normalization: str = "none",
         hidden_dim: Optional[int] = None,
         num_classes: int = 1,
         encoder_training: str = "frozen",
     ) -> None:
         super().__init__()
-        if input_channels <= 0:
-            raise ValueError(f"input_channels must be positive, got {input_channels}")
+        if input_channels != 1:
+            raise ValueError(
+                "Triad consumes native one-channel volumes; "
+                f"got input_channels={input_channels}"
+            )
         if volume_size <= 0 or volume_size % 32:
             raise ValueError(
                 "volume_size must be a positive multiple of 32 for Triad Swin, "
                 f"got {volume_size}"
             )
-        if input_normalization not in {"imagenet", "none"}:
+        if input_normalization != "none":
             raise ValueError(
-                "input_normalization must be 'imagenet' or 'none', got "
+                "Triad consumes native volumes without ImageNet normalization; got "
                 f"{input_normalization!r}"
             )
         if encoder_training not in {"frozen", "finetune"}:
@@ -166,13 +165,7 @@ class TriadVolumeClassifier(nn.Module):
         self.input_normalization = input_normalization
         self.encoder_training = encoder_training
         self.num_classes = int(num_classes)
-        self.input_projection: nn.Module
-        if self.input_channels == 1:
-            self.input_projection = nn.Identity()
-        else:
-            projection = nn.Conv3d(self.input_channels, 1, kernel_size=1, bias=False)
-            nn.init.constant_(projection.weight, 1.0 / self.input_channels)
-            self.input_projection = projection
+        self.input_projection: nn.Module = nn.Identity()
         if self.encoder_training == "frozen":
             for parameter in self.encoder.parameters():
                 parameter.requires_grad = False
@@ -188,16 +181,6 @@ class TriadVolumeClassifier(nn.Module):
             nn.GELU(),
             nn.Linear(classifier_hidden, self.num_classes),
         )
-
-    def _denormalize_imagenet(self, volume: torch.Tensor) -> torch.Tensor:
-        channels = volume.shape[1]
-        mean = volume.new_tensor(
-            tuple(IMAGENET_MEAN[index % 3] for index in range(channels))
-        ).view(1, channels, 1, 1, 1)
-        std = volume.new_tensor(
-            tuple(IMAGENET_STD[index % 3] for index in range(channels))
-        ).view(1, channels, 1, 1, 1)
-        return volume * std + mean
 
     def _resize_volumes(
         self, volumes: torch.Tensor, slice_mask: Optional[torch.Tensor]
@@ -241,8 +224,6 @@ class TriadVolumeClassifier(nn.Module):
                 f"Expected {self.input_channels} input channels, got {images.shape[2]}"
             )
         volume = images.permute(0, 2, 1, 3, 4).to(torch.float32)
-        if self.input_normalization == "imagenet":
-            volume = self._denormalize_imagenet(volume)
         volume = self._resize_volumes(volume, slice_mask)
         return self.input_projection(volume)
 
@@ -254,16 +235,9 @@ class TriadVolumeClassifier(nn.Module):
         profiler: Optional[Any] = None,
     ) -> torch.Tensor:
         volume = self._prepare_volume(images, slice_mask)
-        # A frozen encoder normally runs without gradients.  The optional
-        # multi-channel input projection sits before it, however, so retain
-        # autograd in training when that projection needs to learn how to map
-        # DINO-style channels to Triad's single MRI input.
-        projection_trainable = any(
-            parameter.requires_grad for parameter in self.input_projection.parameters()
-        )
         context = (
             torch.enable_grad()
-            if self.training and (self.encoder_training == "finetune" or projection_trainable)
+            if self.training and self.encoder_training == "finetune"
             else torch.no_grad()
         )
         with context, (

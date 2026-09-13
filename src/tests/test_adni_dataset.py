@@ -97,3 +97,26 @@ class TestADNIVolumeToImageNetTensors(unittest.TestCase):
             dataset[0]
 
         self.assertEqual(load_volume.call_count, 2)
+
+    def test_three_d_encoder_returns_one_channel_resampled_volume(self) -> None:
+        dataset = object.__new__(ADNIMultiSliceDataset)
+        dataset._entries = [
+            _ScanRecord(
+                image_id="I1", patient_id="patient-1", volume_path=Path("/unused/volume.nii"),
+                n_slices=2, label=0, phenotype={},
+            )
+        ]
+        dataset.n_slices = 2
+        dataset.image_size = 2
+        dataset.transforms = None
+        dataset.transform = None
+        dataset.target_transform = None
+        dataset.three_d_encoder = True
+        volume = np.arange(8, dtype=np.float32).reshape(2, 2, 2)
+
+        with patch("datasets.adni.dataset._load_canonical_volume", return_value=volume):
+            image, target = dataset[0]
+
+        self.assertEqual(tuple(image.shape), (2, 1, 2, 2))
+        self.assertEqual(target, 0)
+        self.assertTrue(torch.all((image >= 0.0) & (image <= 1.0)))

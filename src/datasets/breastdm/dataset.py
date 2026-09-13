@@ -480,6 +480,7 @@ class BreastDMMultiSliceDataset(_BreastDMBaseDataset):
         n_slices: int = 17,
         image_size: int = 224,
         augment: bool = True,
+        three_d_encoder: bool = False,
         **kwargs: Any,
     ) -> None:
         if n_slices <= 0:
@@ -488,6 +489,7 @@ class BreastDMMultiSliceDataset(_BreastDMBaseDataset):
             raise ValueError(f"image_size must be positive, got {image_size}")
         self.n_slices = int(n_slices)
         self.image_size = int(image_size)
+        self.three_d_encoder = bool(three_d_encoder)
         if "transforms" not in kwargs and "transform" not in kwargs and augment:
             kwargs["transform"] = build_breastdm_volume_transform(augment=True)
         super().__init__(root=root, split=split, **kwargs)
@@ -530,6 +532,8 @@ class BreastDMMultiSliceDataset(_BreastDMBaseDataset):
                 "BreastDM multi-slice transforms must return [1, depth, height, width], "
                 f"got {tuple(image.shape)}"
             )
+        if self.three_d_encoder:
+            return image.permute(1, 0, 2, 3), target
         return _volume_to_imagenet_tensors(image.squeeze(0)), target
 
 

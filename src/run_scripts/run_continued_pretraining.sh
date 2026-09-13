@@ -8,16 +8,20 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab
 
+n_gpus=1
+mem=$((n_gpus * 64))
+
+
 PYTHONPATH=${PWD}/opt/dinov3:${PWD}/src \
 python -m dinov3.run.submit \
   ${PWD}/src/continued_pretraining/train.py \
   --nodes 1 \
-  --ngpus 4 \
+  --ngpus $n_gpus \
   --timeout 2880 \
-  --mem-gb 256 \
+  --mem-gb $mem \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \
-  --config-file ${PWD}/src/continued_pretraining/config.yaml \
-  --output-dir ${PWD}/runs/continued_pretraining/adni-r-16-norms \
-  train.dataset_path=ADNI:root=${PWD}/data/ADNI \
+  --config-file /common/ganesanv/tlab/runs/continued_pretraining_fixed/organmnist3d.yaml \
+  --output-dir /common/ganesanv/tlab/runs/continued_pretraining_fixed/organmnist3d/4 \
+  train.seed=4
