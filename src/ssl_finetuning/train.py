@@ -59,6 +59,10 @@ from datasets.organmnist3d import (
     DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT,
     OrganMNIST3DPairedSliceDataset,
 )
+from datasets.lld_mmri import (
+    DEFAULT_ROOT as LLD_MMRI_DEFAULT_ROOT,
+    LLDMMRIPairedSliceDataset,
+)
 
 from utils.fold_cv import dataset_subset_for_patients, make_dataset_patient_folds
 
@@ -435,11 +439,17 @@ def _cq500_patient_split_stratum(dataset, index):
     return int(target)
 
 
+def _lld_mmri_patient_split_stratum(dataset, index):
+    """Stratify LLD-MMRI patients by their diagnosis category."""
+    return int(dataset.get_target(index))
+
+
 def _select_train_patient_ids(cfg, dataset, dataset_name):
     stratum_fn = {
         "adni": _adni_patient_split_stratum,
         "cq500": _cq500_patient_split_stratum,
         "duke": _duke_patient_split_stratum,
+        "lld_mmri": _lld_mmri_patient_split_stratum,
     }[dataset_name]
     folds = make_dataset_patient_folds(
         dataset,
@@ -480,6 +490,15 @@ def build_data_loader_from_cfg(
         dataset = ADNIPairedSliceDataset(
             root=data_root or ADNI_DEFAULT_ROOT,
             task=cfg.train.adni_task,
+            max_distance=cfg.train.max_distance,
+            transform=identity_transform,
+            image_size=cfg.crops.global_crops_size,
+            seed=cfg.train.seed,
+        )
+    elif dataset_name == "lld_mmri":
+        dataset = LLDMMRIPairedSliceDataset(
+            root=data_root or LLD_MMRI_DEFAULT_ROOT,
+            scan_type=getattr(cfg.train, "scan", None) or "pre",
             max_distance=cfg.train.max_distance,
             transform=identity_transform,
             image_size=cfg.crops.global_crops_size,
@@ -532,7 +551,7 @@ def build_data_loader_from_cfg(
     else:
         raise ValueError(
             "Unknown paired dataset="
-            f"{dataset_name!r}; expected 'adni', 'breastdm', 'cq500', 'duke', or 'organmnist3d'"
+            f"{dataset_name!r}; expected 'adni', 'breastdm', 'cq500', 'duke', 'lld_mmri', or 'organmnist3d'"
         )
 
     train_patient_ids = None
@@ -542,6 +561,16 @@ def build_data_loader_from_cfg(
         dataset = ADNIPairedSliceDataset(
             root=data_root or ADNI_DEFAULT_ROOT,
             task=cfg.train.adni_task,
+            patient_ids=train_patient_ids,
+            max_distance=cfg.train.max_distance,
+            transform=identity_transform,
+            image_size=cfg.crops.global_crops_size,
+            seed=cfg.train.seed,
+        )
+    elif dataset_name == "lld_mmri":
+        dataset = LLDMMRIPairedSliceDataset(
+            root=data_root or LLD_MMRI_DEFAULT_ROOT,
+            scan_type=getattr(cfg.train, "scan", None) or "pre",
             patient_ids=train_patient_ids,
             max_distance=cfg.train.max_distance,
             transform=identity_transform,

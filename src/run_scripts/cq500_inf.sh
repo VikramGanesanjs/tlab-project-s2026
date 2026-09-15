@@ -13,22 +13,22 @@
 #SBATCH --mail-type=ALL
 
 
-encs=("explora")
+encs=("")
 folds=("0" "1" "2" "3" "4")
 
-enc="explora"
+enc="ssl_finetune"
 fold=${folds[$(((SLURM_ARRAY_TASK_ID) % 5))]}
 task="ich"
 
 
-weights=/common/ganesanv/tlab/runs/continued_pretraining_fixed/cq500/$fold/ckpt/6499
+weights=/common/ganesanv/tlab/runs/ssl_finetune_cq500/better/$fold/ckpt/2999
 
 
 module load miniconda3 
 . ~/conda_init
 conda activate dinov3
 
-classification_dir=/common/ganesanv/tlab/classification/cq500_fixed/$task/$enc/$fold
+classification_dir=/common/ganesanv/tlab/classification/cq500_fixed/$task/ssl_finetune_fixed/$fold
 
 cd /common/ganesanv/tlab/src
 
@@ -39,20 +39,10 @@ if [[ -f "$classification_dir/best_mst.pt" ]]; then
     exit 0
 fi
 
-if [[ "$enc" == "explora" ]]; then 
-    python -m classification.run \
-        --params-file /common/ganesanv/tlab/classification/cq500/classification.yaml \
-        --encoder dinov3 \
-        --fold "$fold" \
-        --checkpoint-dir "$classification_dir" \
-        --cq500-task $task \
-        --weights $weights
-else
-    python -m classification.run \
-        --params-file /common/ganesanv/tlab/classification/cq500/classification.yaml \
-        --encoder $enc \
-        --fold "$fold" \
-        --checkpoint-dir "$classification_dir" \
-        --cq500-task $task
-
-fi
+python -m classification.run \
+    --params-file /common/ganesanv/tlab/classification/cq500/classification.yaml \
+    --encoder dinov3 \
+    --fold "$fold" \
+    --checkpoint-dir "$classification_dir" \
+    --cq500-task $task \
+    --weights $weights

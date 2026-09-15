@@ -9,6 +9,8 @@ train:
   dataset: adni
   data_root: /common/ganesanv/tlab/data/ADNI
   task: cn_mci_ad
+  # Used by LLD-MMRI; accepts one phase, a YAML list, or "all".
+  scan: pre
   csv_path: null
   dataset_path: ADNI:root=/common/ganesanv/tlab/data/ADNI
   output_dir: /common/ganesanv/tlab/runs/continued_pretraining/adni

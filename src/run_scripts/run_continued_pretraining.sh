@@ -8,7 +8,7 @@ conda activate dinov3
 
 cd /common/ganesanv/tlab
 
-n_gpus=1
+n_gpus=2
 mem=$((n_gpus * 64))
 
 
@@ -22,6 +22,6 @@ python -m dinov3.run.submit \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \
-  --config-file /common/ganesanv/tlab/runs/continued_pretraining_fixed/organmnist3d.yaml \
-  --output-dir /common/ganesanv/tlab/runs/continued_pretraining_fixed/organmnist3d/4 \
+  --config-file /common/ganesanv/tlab/runs/continued_pretraining_fixed/breastdm.yaml \
+  --output-dir /common/ganesanv/tlab/runs/continued_pretraining_fixed/breastdm/4 \
   train.seed=4

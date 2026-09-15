@@ -9,5 +9,6 @@ __all__ = [
     "breastdm",
     "cq500",
     "duke",
+    "lld_mmri",
     "organmnist3d",
 ]

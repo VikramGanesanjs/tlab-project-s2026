@@ -32,12 +32,13 @@ from datasets.cq500 import (  # noqa: E402
 )
 from datasets.organmnist3d import DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT  # noqa: E402
 from datasets.breastdm import DEFAULT_ROOT as BREASTDM_DEFAULT_ROOT  # noqa: E402
+from datasets.lld_mmri import DEFAULT_ROOT as LLD_MMRI_DEFAULT_ROOT  # noqa: E402
 from classification.train import train  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
-DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d", "breastdm")
+DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d", "breastdm", "lld_mmri")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 CLASSIFICATION_ENCODER_CHOICES = (*ENCODER_CHOICES, "triad", "neurovfm")
@@ -51,6 +52,17 @@ def _optional_n_slices(value: object) -> Optional[int]:
     if isinstance(value, str) and value.strip().lower() in {"null", "none"}:
         return None
     return int(value)
+
+
+def _scan_selection(value: object) -> object:
+    """Preserve one scan, a YAML list of scans, or the ``all`` sentinel."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise argparse.ArgumentTypeError(
+        "scan must be a string, comma-separated string, or list of strings"
+    )
 
 def _yaml_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict[str, object]:
     """Load and type-check parser defaults from a YAML mapping."""
@@ -125,7 +137,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "duke: binary breast cancer; adni: diagnosis task selected by "
             "--adni-task; cq500: task selected by --cq500-task; "
             "organmnist3d: official 11-class volume splits; breastdm: "
-            "official Benign/Malignant img17Se volume splits"
+            "official Benign/Malignant img17Se volume splits; lld_mmri: "
+            "seven-class liver-lesion MRI selected by --scan"
         ),
     )
     parser.add_argument(
@@ -165,7 +178,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "<data-root>/adni_nii_manifest.json and is created when absent"
         ),
     )
-    parser.add_argument("--scan", type=str, default="pre")
+    parser.add_argument(
+        "--scan",
+        type=_scan_selection,
+        default="pre",
+        help="MRI phase, comma-separated phases, YAML list of phases, or 'all'",
+    )
     parser.add_argument(
         "--n-slices",
         type=_optional_n_slices,
@@ -525,6 +543,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "cq500": CQ500_DEFAULT_ROOT,
             "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
             "breastdm": BREASTDM_DEFAULT_ROOT,
+            "lld_mmri": LLD_MMRI_DEFAULT_ROOT,
         }[args.dataset]
     if args.n_slices is not None and args.n_slices <= 0:
         parser.error("--n-slices must be positive")

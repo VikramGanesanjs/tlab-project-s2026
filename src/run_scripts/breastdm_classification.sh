@@ -37,29 +37,28 @@ fi
 
 
 if [[ $enc == "explora" ]]; then
-    ckpt_num=$(find /common/ganesanv/tlab/runs/continued_pretraining_fixed/breastdm/$fold/ckpt -maxdepth 1 -mindepth 1 -type d -printf "%f\n" | sort -n | tail -1)
-    weights=/common/ganesanv/tlab/runs/continued_pretraining_fixed/breastdm/$fold/ckpt/$ckpt_num
+    weights=/common/ganesanv/tlab/runs/continued_pretraining_fixed/breastdm/$fold/ckpt/3999
     python -m classification.run \
     --params-file /common/ganesanv/tlab/classification/breastdm/classification.yaml \
     --encoder dinov3 \
-    --fold "$fold" \
+    --seed "$fold" \
     --checkpoint-dir "$classification_dir" \
     --weights $weights
 
 
 elif [[ $enc == "ssl_finetune" ]]; then
-    weights=/common/ganesanv/tlab/runs/ssl_breastdm/fixed_data/$fold/ckpt/999
+    weights=/common/ganesanv/tlab/runs/ssl_breastdm/better/$fold/ckpt/1999
     python -m classification.run \
     --params-file /common/ganesanv/tlab/classification/breastdm/classification.yaml \
     --encoder dinov3 \
-    --fold "$fold" \
+    --seed "$fold" \
     --checkpoint-dir "$classification_dir" \
     --weights $weights
 else
     python -m classification.run \
     --params-file /common/ganesanv/tlab/classification/breastdm/classification.yaml \
     --encoder $enc \
-    --fold "$fold" \
+    --seed "$fold" \
     --checkpoint-dir "$classification_dir"
 fi
 

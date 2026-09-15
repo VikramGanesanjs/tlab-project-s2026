@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import logging
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -32,11 +32,15 @@ from datasets.organmnist3d import (
     DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT,
     OrganMNIST3DClassificationDataset,
 )
+from datasets.lld_mmri import (
+    DEFAULT_ROOT as LLD_MMRI_DEFAULT_ROOT,
+    LLDMMRIClassificationDataset,
+)
 from utils.fold_cv import dataset_subset_for_patients, make_dataset_patient_folds
 
 logger = logging.getLogger("dinov3")
 
-DATASET_CHOICES = ("adni", "amos", "breastdm", "cq500", "duke", "organmnist3d")
+DATASET_CHOICES = ("adni", "amos", "breastdm", "cq500", "duke", "lld_mmri", "organmnist3d")
 
 
 def _identity_pair(image: Any, target: Any) -> tuple[Any, Any]:
@@ -132,6 +136,7 @@ def build_base_dataset(
     task: Optional[str] = None,
     split: str = "train",
     csv_path: Optional[str | Path] = None,
+    scan: Optional[Union[str, Sequence[str]]] = None,
 ) -> Dataset:
     """Build an untransformed single-slice dataset using :mod:`datasets`."""
     name = str(dataset_name).lower()
@@ -139,6 +144,13 @@ def build_base_dataset(
         return ADNIClassificationDataset(
             root=root or ADNI_DEFAULT_ROOT, csv_path=csv_path, task=task or "cn_mci_ad",
             transforms=_identity_pair, augment=False,
+        )
+    if name == "lld_mmri":
+        return LLDMMRIClassificationDataset(
+            root=root or LLD_MMRI_DEFAULT_ROOT,
+            scan_type="pre" if scan is None else scan,
+            transforms=_identity_pair,
+            augment=False,
         )
     if name == "cq500":
         return CQ500SliceDataset(
@@ -185,6 +197,7 @@ def build_dataset_from_cfg(cfg: Any, *, transform: Callable, target_transform: C
     root = getattr(train_cfg, "data_root", None)
     task = getattr(train_cfg, "task", None)
     csv_path = getattr(train_cfg, "csv_path", None)
+    scan = getattr(train_cfg, "scan", None)
     split = getattr(train_cfg, "split", "train")
     base = build_base_dataset(
         dataset_name,
@@ -192,6 +205,7 @@ def build_dataset_from_cfg(cfg: Any, *, transform: Callable, target_transform: C
         task=task,
         split=split,
         csv_path=csv_path,
+        scan=scan,
     )
     wrapped = TlabExtendedVisionDataset(
         base, root=root or getattr(base, "root_path", getattr(base, "root", ".")),

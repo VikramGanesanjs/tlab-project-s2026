@@ -18,12 +18,14 @@ ibot:
   head_hidden_dim: 2048
 train:
   batch_size_per_gpu: 64
-  # Paired-slice datasets: adni, breastdm, cq500, duke, organmnist3d.
+  # Paired-slice datasets: adni, breastdm, cq500, duke, lld_mmri, organmnist3d.
   # BreastDM and OrganMNIST3D consume their supplied train split directly;
   # the fold settings below do not apply to those datasets.
   dataset: adni
   data_root: /common/ganesanv/tlab/data/ADNI
   adni_task: cn_mci_ad
+  # Used by LLD-MMRI; accepts one phase, a YAML list, or "all".
+  scan: pre
   duke_scan: pre
   max_distance: 2
   # Fold assignment is patient-level. ``fold`` is zero-based; the next fold

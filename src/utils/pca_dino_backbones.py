@@ -32,7 +32,15 @@ DUKE_DEFAULT_ROOT = Path("/common/ganesanv/tlab/data/tcia/duke_breast_cancer_pro
 DINOV3_DEFAULT_REPO = Path("/common/ganesanv/tlab/opt/dinov3")
 DEFAULT_IMAGE_SIZE = 224
 DEFAULT_ADNI_TASK = "cn_mci_ad"
-PCA_DATASET_CHOICES = ("adni", "duke", "cq500", "breastdm", "amos", "brats_men")
+PCA_DATASET_CHOICES = (
+    "adni",
+    "duke",
+    "cq500",
+    "breastdm",
+    "amos",
+    "brats_men",
+    "lld_mmri",
+)
 
 
 class _PCASingleSliceDataset:
@@ -123,6 +131,10 @@ def _default_data_root(dataset: str) -> Path:
         from datasets.brats_men import DEFAULT_ROOT
 
         return DEFAULT_ROOT
+    if dataset == "lld_mmri":
+        from datasets.lld_mmri import DEFAULT_ROOT
+
+        return DEFAULT_ROOT
     raise ValueError(f"Unknown PCA dataset={dataset!r}")
 
 
@@ -144,6 +156,19 @@ def build_pca_dataset(args: argparse.Namespace) -> _PCASingleSliceDataset:
             z_min=args.z_min,
             z_max=args.z_max,
             transform=build_adni_transform(args.image_size, augment=False),
+        )
+    elif args.dataset == "lld_mmri":
+        from datasets.lld_mmri import (
+            LLDMMRIClassificationDataset,
+            build_lld_mmri_transform,
+        )
+
+        dataset = LLDMMRIClassificationDataset(
+            root=root,
+            scan_type=args.scan,
+            z_min=args.z_min,
+            z_max=args.z_max,
+            transform=build_lld_mmri_transform(args.image_size, augment=False),
         )
     elif args.dataset == "duke":
         from datasets.duke import DukeClassificationDataset, build_duke_transform
@@ -481,7 +506,11 @@ def parse_evolution_args(argv=None):
         default="train",
         help="BreastDM split (ignored by the other PCA datasets)",
     )
-    parser.add_argument("--scan", default="pre")
+    parser.add_argument(
+        "--scan",
+        default="pre",
+        help="Duke scan or LLD-MMRI phase(s), including comma-separated values or 'all'",
+    )
     parser.add_argument("--include-bilateral", action="store_true")
     parser.add_argument("--z-min", type=float, default=0.25)
     parser.add_argument("--z-max", type=float, default=0.75)
@@ -520,7 +549,11 @@ def parse_args(argv: Optional[list[str]] = None):
         default="train",
         help="BreastDM split (ignored by the other datasets)",
     )
-    parser.add_argument("--scan", default="pre")
+    parser.add_argument(
+        "--scan",
+        default="pre",
+        help="Duke scan or LLD-MMRI phase(s), including comma-separated values or 'all'",
+    )
     parser.add_argument("--include-bilateral", action="store_true")
     parser.add_argument("--z-min", type=float, default=0.25)
     parser.add_argument("--z-max", type=float, default=0.75)

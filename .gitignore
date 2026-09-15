@@ -2,7 +2,7 @@ data/*
 opt/*
 *.out
 *.err
-
+ablations/
 runs/*
 
 src/__pycache__/*

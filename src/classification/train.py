@@ -75,6 +75,11 @@ from datasets.breastdm import (  # noqa: E402
     DEFAULT_ROOT as BREASTDM_DEFAULT_ROOT,
     build_breastdm_volume_transform,
 )
+from datasets.lld_mmri import (  # noqa: E402
+    LLDMMRIMultiSliceDataset,
+    LLD_MMRI_CLASS_NAMES,
+    build_lld_mmri_volume_transform,
+)
 from utils.fold_cv import make_dataset_patient_folds  # noqa: E402
 from utils.splits import patient_level_stratified_split  # noqa: E402
 from utils.merge_dcp_lora import load_custom_dinov3_encoder  # noqa: E402
@@ -96,7 +101,7 @@ from classification.neurovfm import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "tcia" / "duke_breast_cancer_processed"
-DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d", "breastdm")
+DATASET_CHOICES = ("duke", "adni", "cq500", "organmnist3d", "breastdm", "lld_mmri")
 AGGREGATOR_CHOICES = ("transformer", "mean")
 ENCODER_TRAINING_CHOICES = ("frozen", "lora")
 EARLY_STOPPING_METRIC_CHOICES = ("bce_loss", "f1", "auroc")
@@ -107,6 +112,7 @@ MultiSliceDataset = Union[
     CQ500MultiSliceDataset,
     OrganMNIST3DMultiSliceDataset,
     BreastDMMultiSliceDataset,
+    LLDMMRIMultiSliceDataset,
 ]
 ClassificationModel = Union[MultiSliceDinoModel, TriadVolumeClassifier, NeuroVFMVolumeClassifier]
 LORA_PARAMETER_NAMES = ("w_a_q", "w_b_q", "w_a_k", "w_b_k", "w_a_v", "w_b_v")
@@ -223,6 +229,8 @@ def task_config(
         return len(ORGANMNIST3D_CLASS_NAMES), ORGANMNIST3D_CLASS_NAMES, "CrossEntropyLoss"
     if dataset_name == "breastdm":
         return 1, BREASTDM_CLASS_NAMES, "BCEWithLogitsLoss"
+    if dataset_name == "lld_mmri":
+        return len(LLD_MMRI_CLASS_NAMES), LLD_MMRI_CLASS_NAMES, "CrossEntropyLoss"
     raise ValueError(f"Unknown dataset={dataset_name!r}")
 
 
@@ -595,6 +603,10 @@ def _adni_patient_stratum(dataset: ADNIMultiSliceDataset, index: int) -> int:
     return int(dataset.get_target(index))
 
 
+def _lld_mmri_patient_stratum(dataset: LLDMMRIMultiSliceDataset, index: int) -> int:
+    return int(dataset.get_target(index))
+
+
 def _cq500_patient_stratum(dataset: CQ500MultiSliceDataset, index: int) -> Union[int, Tuple[int, ...]]:
     """Return a hashable CQ500 label for patient-level fold stratification."""
     target = dataset.get_target(index)
@@ -618,6 +630,8 @@ def saved_split_patient_ids(
         if args.dataset == "cq500"
         else _adni_patient_stratum
         if args.dataset == "adni"
+        else _lld_mmri_patient_stratum
+        if args.dataset == "lld_mmri"
         else _duke_patient_stratum
     )
     _, metadata = patient_level_stratified_split(
@@ -835,6 +849,7 @@ def _checkpoint_payload(
         "epoch": epoch,
         "model": model.trainable_state_dict(),
         "dataset": args.dataset,
+        "scan": args.scan,
         "adni_task": args.adni_task if args.dataset == "adni" else None,
         "cq500_task": args.cq500_task if args.dataset == "cq500" else None,
         "encoder": args.encoder,
@@ -977,6 +992,18 @@ def build_dataset(
             transform=build_breastdm_volume_transform(augment=use_augment),
             three_d_encoder=getattr(args, "three_d_encoder", False),
         )
+    if args.dataset == "lld_mmri":
+        return LLDMMRIMultiSliceDataset(
+            root=args.data_root,
+            scan_type=args.scan,
+            n_slices=args.n_slices,
+            patient_ids=patient_ids,
+            augment=use_augment,
+            image_size=args.image_size,
+            transform=build_lld_mmri_volume_transform(augment=use_augment),
+            three_d_encoder=getattr(args, "three_d_encoder", False),
+            data_timing=data_timing,
+        )
     raise ValueError(f"Unknown dataset={args.dataset!r}")
 
 
@@ -998,6 +1025,7 @@ def train(args: argparse.Namespace, device: torch.device, checkpoint_dir: Path) 
         "cq500": "volumes",
         "organmnist3d": "volumes",
         "breastdm": "volumes",
+        "lld_mmri": "scans",
     }[args.dataset]
     if args.dataset in {"organmnist3d", "breastdm"}:
         train_dataset = build_dataset(args, augment=args.augment, split="train")

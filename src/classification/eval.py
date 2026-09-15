@@ -42,6 +42,7 @@ from datasets.adni import DEFAULT_ROOT as ADNI_DEFAULT_ROOT  # noqa: E402
 from datasets.cq500 import DEFAULT_ROOT as CQ500_DEFAULT_ROOT  # noqa: E402
 from datasets.organmnist3d import DEFAULT_ROOT as ORGANMNIST3D_DEFAULT_ROOT  # noqa: E402
 from datasets.breastdm import DEFAULT_ROOT as BREASTDM_DEFAULT_ROOT  # noqa: E402
+from datasets.lld_mmri import DEFAULT_ROOT as LLD_MMRI_DEFAULT_ROOT  # noqa: E402
 from utils.load_dinov3 import (  # noqa: E402
     DINOV3_REPO,
     REPO_ROOT,
@@ -111,6 +112,7 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         "cq500": CQ500_DEFAULT_ROOT,
         "organmnist3d": ORGANMNIST3D_DEFAULT_ROOT,
         "breastdm": BREASTDM_DEFAULT_ROOT,
+        "lld_mmri": LLD_MMRI_DEFAULT_ROOT,
     }.get(dataset)
     if data_root is None:
         raise ValueError(f"Unsupported dataset in checkpoint: {dataset!r}")
@@ -127,7 +129,7 @@ def _evaluation_args(cli_args: argparse.Namespace, checkpoint: dict[str, Any]) -
         data_root=data_root,
         csv_path=cli_args.csv_path,
         adni_manifest_path=cli_args.adni_manifest_path,
-        scan=cli_args.scan,
+        scan=checkpoint.get("scan") or cli_args.scan,
         batch_size=cli_args.batch_size,
         num_workers=cli_args.num_workers,
         dinov3_repo=cli_args.dinov3_repo,
