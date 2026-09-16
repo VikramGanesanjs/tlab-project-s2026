@@ -1,0 +1,56 @@
+# Pass this file with:
+#   python dino_mst.py --params-file example_mstparams.yaml
+#
+# Parameter names may use underscores (as below) or CLI-style hyphens.
+# Explicit command-line arguments override values in this file.
+
+# Data and preprocessing
+dataset: adni
+adni_task: cn_ad
+n_slices: 128
+image_size: 224
+augment: true
+
+# Training
+batch_size: 16
+num_workers: 2
+epochs: 40
+min_epochs: 10
+early_stopping_patience: 4
+early_stopping_metric: auroc
+lr: 0.0001
+weight_decay: 0.0001
+seed: 512387
+
+n_folds: 5
+fold: 0
+data_seed: 0
+
+
+# Optional cosine learning-rate annealing
+cosine_lr: true
+min_lr: 1e-6
+
+# Volume aggregation: transformer | mean (mean ignores the mst_* options below)
+slice_aggregator: transformer
+
+# Multi-slice transformer
+d_model: 768
+mst_depth: 1
+mst_heads: 4
+mst_ffn_dim: 1024
+mst_dropout: 0.1
+hidden_dim: 256
+
+# Frozen image encoder
+encoder: dinov3
+features: cls
+model_name: dinov3_vitb16
+# weights: /common/ganesanv/tlab/runs/ssl_gram_penalty/spatial_window/0/ckpt/9999
+# dinov3_repo: /path/to/local/dinov3  # Omit to use the project default.
+
+
+benchmark: true
+# Output/runtime
+run_name: ssl_finetune_full_context
+checkpoint_dir: /common/ganesanv/tlab/runs/ssl_gram_penalty/spatial_window/0/classification/9999

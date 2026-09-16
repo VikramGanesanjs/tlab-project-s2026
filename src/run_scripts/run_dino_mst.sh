@@ -18,8 +18,8 @@ conda activate dinov3
 cd /common/ganesanv/tlab/src
 
 python -m classification.run --params-file /common/ganesanv/tlab/classification/cq500/classification.yaml \
-    --weights /common/ganesanv/tlab/runs/ssl_finetune_cq500/better/0/ckpt/6499 \
+    --weights /common/ganesanv/tlab/runs/ssl_finetune_cq500/better/4/ckpt/2999 \
     --encoder dinov3 \
-    --checkpoint-dir /common/ganesanv/tlab/classification/cq500_fixed/ich/ssl_finetune_fixed/ckpt_test/6499 \
-    --fold 0\
+    --checkpoint-dir /common/ganesanv/tlab/classification/cq500_fixed/ich/ssl_finetune_fixed/4 \
+    --fold 4\
 

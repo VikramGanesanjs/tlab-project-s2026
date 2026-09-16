@@ -22,6 +22,6 @@ python -m dinov3.run.submit \
   --cpus-per-task 4 \
   --slurm-partition gpu \
   --slurm-qos "" \
-  --config-file /common/ganesanv/tlab/runs/continued_pretraining_fixed/breastdm.yaml \
-  --output-dir /common/ganesanv/tlab/runs/continued_pretraining_fixed/breastdm/4 \
-  train.seed=4
+  --config-file /common/ganesanv/tlab/runs/continued_pretraining_fixed/lldmmri.yaml \
+  --output-dir /common/ganesanv/tlab/runs/continued_pretraining_fixed/lldmmri/4 \
+  train.fold=4

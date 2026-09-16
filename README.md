@@ -1,198 +1,81 @@
 # TLab Summer 2026 Project - Vikram Ganesan
 
-## Adapter Learning of DINO Vision Foundation Models for Medical Images
+## 3DAPT: Adapting VFMs to understand 3-D Medical Images
+## [Slide Deck](https://docs.google.com/presentation/d/18PJwfVF5cvbKKnwOClTv-HdnZAa4KZG5_w2PB-fB1DE/edit?slide=id.g3f99e3cc3d0_0_168#slide=id.g3f99e3cc3d0_0_168)
 
-### Classification performance benchmarking
+### Setup
+To run code in this repo, just git clone the repository, as well as a copy of the dinov3 repository in a separate directory. You can install dependencies by running
 
-Pass `--benchmark` to `python -m classification.run` to record a breakdown for
-every completed epoch. The console reports DataLoader wait time, host-to-device
-transfer, DINO encoder forward passes, the multi-slice transformer/classifier
-forward pass, backward/optimizer work, validation wall time, and total epoch
-wall time. Results are saved incrementally to `epoch_benchmarks.json` and are
-also included in `run_summary.json`.
+`conda create -f environment.yml`
 
-On CUDA, the compute sections use CUDA events, so their values remain accurate
-despite asynchronous kernel launches. Each record additionally includes the
-CUDA allocator's end and peak allocated/reserved memory; `process_peak_rss_mb`
-is the peak host-memory RSS for the process (and is therefore cumulative).
 
-```bash
-python -m classification.run --dataset adni --benchmark ...
-```
+### 3-D Aware Post Training Method (3DAPT):
 
-#### Multi-slice data-loading performance
+#### Overview: 
+The code for the 3-D Aware Post Training Method is contained in the ssl_finetuning module. This code is adapted
+from the original DINOv3 training code. Instead of processing 1 image per forward pass (with corresponding global and local crops), it processes 2 adjacent 2-D slices (1 global crop for each slice, and then local crops for each). It then adds an extra term to the DINO loss for the CLS tokens between the two global crops (termed UWSD loss). This UWSD loss is weighted by the entropy of the teacher distribution, in order to encourage more uncertain teacher outputs (inspired by VESSA paper). Then, we also utilize the gram loss from dinov3, however we add spatial windowing, to restrict it to terms of the matrix within a certain window. We apply the gram loss on the teacher gram matrix of slice 1 and a student gram matrix of slice 2, and vice versa. The cross_slice_gram_loss is implemented on a delay, by default 1.0 epochs, because applying it immediately degrades features. The training loop occurs on a model initialized with LoRA, and you may specify the rank in the configuration. A default configuration is given in /common/ganesanv/tlab/src/ssl_finetuning/config.yaml. 
 
-The multi-slice datasets do materially more CPU work per item than the
-single-slice datasets: they decode an entire source volume, normalize/window
-it, resample depth and in-plane resolution, optionally run MONAI 3-D
-augmentation, and finally expand every slice to ImageNet-normalized RGB.  For
-ADNI and CQ500, each multi-slice item intentionally reloads its NIfTI volume
-rather than retaining full volumes in a worker cache.  This protects worker
-RSS, but makes compressed NIfTI decode and storage latency a recurring cost on
-every epoch.
+#### How to Run: 
+In order to run 3DAPT, first set up a configuration similar to /common/ganesanv/tlab/src/ssl_finetuning/config.yaml, as well as an output directory. You can run 3DAPT on a slurm cluster using an adapted version of the DINOv3 submitit script. Add your config path and write path to src/run_scripts/run_ssl_finetuning.sh, then run: 
 
-Use `--benchmark` for a short representative run first. If `data_loading_s`
-is comparable to or larger than `dino_forward_s`, tune this path before making
-model changes. The most useful order of operations is:
+`bash src/run_scripts/run_ssl_finetuning.sh` on your login node. 
 
-1. Sweep `--num-workers` on the target machine (for example `0, 2, 4, 8`),
-   keeping batch size and augmentation fixed. More workers can hurt when all
-   workers contend for a network filesystem or host RAM; choose the smallest
-   setting that removes GPU starvation.
-2. Run once with `--no-augment` to separate MONAI's 3-D affine/smoothing cost
-   from I/O and preprocessing. If it is the limiting step, use a lighter
-   volume transform or move stochastic augmentation to a later, smaller
-   representation after validating its effect on accuracy.
-3. Keep the dataset on node-local SSD during training when possible. This is
-   especially important for `.nii.gz`, whose decompression is repeated by the
-   ADNI and CQ500 multi-slice loaders.
-4. For repeated experiments, build a versioned cache of the deterministic
-   preprocessing keyed by dataset, split, `n_slices`, `image_size`, and
-   preprocessing version. A practical cache stores target-resolution,
-   single-channel float16 volumes in sharded files; apply random 3-D
-   augmentation after reading the cached volume, then perform RGB/ImageNet
-   conversion. Do not cache augmented tensors.
-5. Do not assume a per-worker full-volume cache will help. The current ADNI
-   and CQ500 multi-slice loaders deliberately disable it, and CQ500 has shown
-   a major data-processing speedup with that cache removed. With shuffled,
-   one-pass volume sampling, cached arrays can create host-memory pressure and
-   worse filesystem/page-cache locality without providing useful hits. Treat
-   full-volume caching as an experiment to benchmark only on the exact target
-   machine and split; merely increasing `num_workers` will not preserve
-   decoded volumes across epochs.
+### ExPLoRA (continued_pretraining)
+#### Overview: 
+The code for the ExPLoRA extended pretraining is contained in the continued_pretraining module. This code contains the dinov3 pre-training code, except edited to accept the datasets that we have created here as well as to freeze the teacher and student backbones, and add LoRA adapters to both. 
 
-Native-depth CQ500 (`--n-slices null`) has a separate quadratic-cost hazard:
-the slice transformer processes a padded sequence up to the deepest volume in
-each batch. Bucket scans by depth (or use a fixed `--n-slices`) to reduce both
-CPU padding/collation and transformer work. When diagnosing throughput, also
-account for validation: it re-executes the full input pipeline every epoch and
-is reported separately as `validation_s`.
+#### How to Run: 
+In order to run ExPLoRA, first set up a configuration similar to /common/ganesanv/tlab/src/continued_pretraining/config.yaml, as well as an output directory. You can run ExPloRA on a slurm cluster using an adapted version of the DINOv3 submitit script. Add your config path and write path to src/run_scripts/run_ssl_finetuning.sh, as well as how many GPUs you want to run it on, then run: 
 
-### Patch-feature PCA visualization
+`bash src/run_scripts/run_continued_pretraining.sh` on your login node. 
 
-`src/utils/pca_dino_backbones.py` constructs the selected repository single-slice
-dataset, samples one slice, and compares DINOv3, BrainDINO, and a
-multi-slice-classification checkpoint. The custom checkpoint may be a distributed
-checkpoint directory, a plain merged teacher `.pth`, or a
-`--hub-compatible` merged teacher `.pth`. The PCA uses `whiten=True`, matching
-the DINOv3 reference notebook. Patch features remain in CPU memory while the
-next model is loaded.
+### Classification
+The classification is designed to use a 2-D VFM backbone as well as a small classfication head to classify 3-D medical images. Given a 3-D volume as input, the classification module separates this into 2-D slices, and passes the 2-D slices through the 2-D VFM, to obtain global and local features. By default, we will select the CLS token from each of these slices and have n_slices CLS tokens. (Could also be attention-pooled patch features). These n_slices CLS tokens will be fed into an aggregator module (either just meanpooling, or a TransformerEncoderBlock), and then a small classification head to produce the final logits. An example configuration file for this is in
 
-```bash
-python -m utils.pca_dino_backbones \
-  --dataset amos \
-  --dinov3-checkpoint /path/to/dinov3_vitb16.pth \
-  --braindino-checkpoint /path/to/brain_dino_weights.pth \
-  --custom-checkpoint /path/to/distributed/checkpoint-or-merged-backbone.pth \
-  --dinov3-repo /path/to/dinov3 \
-  --image-size 512 \
-  --output pca_slice.png
-```
+### Segmentation
+The segmentation part of this module is unfinished, but it uses the nnUNet framework for segmentation. nnUNet automatically preprocesses the dataset and configures hyperparameters. For evaluation of the 2-D backbones, we extract local features from multiple layers using the frozen 2-D VFM encoder, and then pass these local features into a Primus segmentation head. Here would be an example command to run segmentation using MedDINOv3 encoder. 
 
-`--dataset` selects the standard data root and matching single-slice dataset.
-Available values are `adni`, `duke`, `cq500`, `breastdm`, `amos`, and
-`brats_men`; use `--data-root` only for a nonstandard data location. BraTSMen's
-four MRI modalities are deterministically projected to DINO RGB as T1c, T1n,
-and mean(T2f, T2w).
+`nnUNetv2_train dataset_id 2d 0 -tr meddinov3_base_primus_multiscale_Trainer`. 
+Note that you must setup the dataset in nnUNet as well as environment variables before running this. 
 
-### Classification visualization
+### Utils
+Utils has a whole bunch of quick scripts that I made to test things out, but there are a couple of useful ones
+- fold_cv.py: This script is used in the classification pipeline to split datasets into n_folds, stratified by label
+- pca_dino_backbones.py: This script is used to visualize the pca of patch features created by the DINO backbone, either the default or a fine-tuned version. If you have run ExPLoRA or 3DAPT and want to visualize how features change over training, you can run: 
+`python src/utils/pca_dino_backbones.py evolution --checkpoint-parent [your ckpt directory] --output [where you want image to go] --dataset [dataset to use] --image-size [image size (multiple of 16)] --n-images [number of images (default 5)]`
 
-`src/utils/classification_visualization.py` samples labeled ADNI slices by default,
-extracts CLS tokens from a regular or distributed checkpoint, embeds them with
-2-D cosine UMAP, and plots one diagnosis-colored dot per slice.
-Sampling prefers one slice per patient; additional slices are only reused when
-the requested count exceeds the number of available patients.
 
-```bash
-python -m utils.classification_visualization \
-  --checkpoint /path/to/checkpoint \
-  --dinov3-repo /path/to/dinov3 \
-  --data-root /path/to/data/ADNI \
-  --n-slices 100 \
-  --output classification_umap.png
-```
 
-Use `--dataset duke` for Duke data. The default `--encoder auto` detects
-BrainDINO and DINOv3 `.pth` files; use `--encoder custom` for a regular custom
-checkpoint or `--encoder dinov3` / `--encoder braindino` to force a format.
-Use `--seed` for reproducible sampling.
+### Datasets
+#### Overview: 
+In datasets, we have several classification datasets as well as a couple segmentation datasets, which are used for 3DAPT fine-tuning, ExPLoRA fine-tuning, as well as classification. Each of these dataset modules exports three different PyTorch dataset objects: 
+- Single Slice Dataset (samples single slices from the 3-D volumes contained in the dataset)
+- Paired Slice Dataset (samples pairs of slices that are within max_dist of each other from the 3-D volumes in the dataset)
+- Multi-Slice Dataset (samples full 3-D volumes - resized to n_slices, 3, image_size, image_size)
 
-### Four-backbone feature comparison
+The single slice dataset is used for ExPLoRA fine-tuning, the paired slice dataset is used for the 3DAPT fine-tuning, and then the multi-slice dataset is used for the downstream classification. The specifics of how these are implemented may differ slightly across different datasets. 
 
-`src/utils/features_comparison.py` samples the same patient-diverse ADNI slices for
-DINOv3, BrainDINO, extended pretraining, and 3-D-aware fine tuning. The
-DINOv3 and BrainDINO paths are fixed to the repository defaults; supply only
-the two adapted checkpoints. Both adapted-checkpoint arguments accept a
-distributed checkpoint directory or a merged teacher `.pth` export.
+#### ADNI
+Alzheimer's Disease Neuroimaging Initiative, NiFTI files downloaded directly from their data repository. Has three different tasks: cn_ad, cn_mci, and cn_mci_ad. These tasks will exclude scans from patients with the excluded condition (ex. cn_ad only has control and alzheimer's scans). 
 
-```bash
-python -m utils.features_comparison \
-  --data-root /path/to/data/ADNI \
-  --extended-pretraining-checkpoint /path/to/extended-pretraining-checkpoint \
-  --three-d-aware-finetuning-checkpoint /path/to/3d-aware-finetuning-checkpoint \
-  --n-images 5 \
-  --image-size 512 \
-  --output features_comparison.png
-```
+#### CQ500
+CQ500 dataset has around 500 CT scans of the head area, and labels for intracranial hemorrhage. There are two tasks: ich, and subtype. ICH task contains all scans, and it involves classifying whether a scan has a ICH or not. Subtype task is restricted to only tasks with ICH, and it involves classifying the specific ICH subtype (IPH, IVH, SDH, EDH, SAH). The data came as DICOM files, so had to use dicom2nifti python package to convert it (cq500/convert.py)
 
-To compare a parent folder of distributed checkpoints, use the `evolution`
-subcommand. It defaults to five sampled images and lays out images as rows and
-checkpoints as columns, with the original image in the leftmost column:
+#### OrganMNIST3D
+OrganMNIST3D dataset has 3-D CT scans of 11 different organs, and labels for this organ classification. Data came as a .npz, and this .npz
 
-```bash
-python -m utils.pca_dino_backbones evolution \
-  --checkpoint-parent /path/to/checkpoint_parent \
-  --dataset cq500 \
-  --n-images 5 \
-  --checkpoint-stride 3 \
-  --image-size 512 \
-  --output pca_checkpoint_evolution.png
-```
+#### LLDMMRI
+LLDMMRI has around 500 MRI scans of liver lesions, with 7 different weightings/modalities per scan. Only one task, classifying which type of liver lesion it is. You can specify the type of scan to use with the `scan` argument, or you can pass `scan: all` to use all types of scans.
 
-`--checkpoint-stride N` keeps every Nth checkpoint in discovery order,
-starting with the first; `--checkpoint-stride 3` therefore retains entries 0,
-3, 6, and so on. The final partial stride is valid.
+#### AMOS
+AMOS is a segmentation dataset, and the base data comes from the nnUNet preprocessed data. It has abdominal CT scans, and the task is to segment out all of the different organs. To reproduce this, you would have to download dataset, preprocess with nnUNet, and then point this dataset to the path of the processed data. Because it is for segmentation, it only exposes the single slice and paired slice dataset. 
 
-### Token metrics
+#### BraTS-MEN
+BraTS-MEN is a segmentation dataset, and the base data also comes from the nnUNet preprocessed data. It has MRIs of patients with brain tumors (meningioma), and the task is to segment these tumors. Again, because it is for segmentation, it only exposes the single slice and paired slice dataset. 
 
-`src/utils/token_metrics.py metrics` computes CLS-token effective rank, patch-token
-effective rank, mean off-diagonal patch-Gram similarity, and spatial
-specificity for the selected distributed checkpoints. It writes a tidy CSV and
-a five-panel PNG; spatial specificity plots patch-token similarity against
-Euclidean patch-grid distance for each checkpoint. Background patches are
-excluded by default; pass `--no-mask-background` to retain them.
-The fifth panel plots the per-checkpoint Pearson correlation between patch-pair
-distance and similarity against training iteration.
+#### The Rest
+Any other datasets in the datasets module (BreastDM, Duke, etc. ) weren't really too heavily experimented with, kinda just played around with them.
 
-```bash
-python -m utils.token_metrics metrics \
-  --checkpoint-parent /path/to/checkpoint_parent \
-  --data-root /path/to/data/ADNI \
-  --checkpoint-stride 3 \
-  --n-images 5 \
-  --image-size 224 \
-  --output token_metrics.csv \
-  --plot token_metrics.png
-```
 
-Use `comparison` instead to calculate only patch-Gram distance against
-`--reference-encoder dinov3` (default) or `--reference-encoder braindino`.
-
-### Training curves
-
-`src/utils/plot_training_logs.py` parses DINOv3 training records and plots losses,
-learning rates, gradient norms, and timing against global iteration. Each loss
-and gradient norm gets its own subplot, while loss fields are discovered from
-the log so custom loss terms are included automatically.
-
-The script accepts the newline-delimited JSON metrics produced by training:
-
-```bash
-MPLBACKEND=Agg python -m utils.plot_training_logs \
-  runs/continued_pretraining/adni-fixed/training_metrics.json \
-  --output runs/training_curves.png --smooth 5 --no-show
-```
-
-Use `--value current` for the per-iteration values (the default). The JSONL
-metrics contain per-iteration values; `--value average` remains available for
-the legacy text logs that include running averages in parentheses.
+#### Run Scripts
+In run scripts there are a lot of bash scripts to run the classification or 3DAPT/ExPLoRA on SLURM clusters. You do not have to run it on slurm cluster, and you could just extract the python commands to replicate this performance. 
