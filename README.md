@@ -79,3 +79,17 @@ Any other datasets in the datasets module (BreastDM, Duke, etc. ) weren't really
 
 #### Run Scripts
 In run scripts there are a lot of bash scripts to run the classification or 3DAPT/ExPLoRA on SLURM clusters. You do not have to run it on slurm cluster, and you could just extract the python commands to replicate this performance. 
+
+
+
+
+#### Citations
+[1]	O. Siméoni et al., “DINOv3,” 2025, arXiv. doi: 10.48550/ARXIV.2508.10104. 
+[2]	Y. Li, Y. Wu, Y. Lai, M. Hu, and X. Yang, “MedDINOv3: How to adapt vision foundation models for medical image segmentation?,” Oct. 15, 2025, arXiv: arXiv:2509.02379. doi: 10.48550/arXiv.2509.02379. 
+[3]	Y. Wu et al., “BrainDINO: A Brain MRI Foundation Model for Generalizable Clinical Representation Learning,” Jun. 11, 2026, arXiv: arXiv:2604.27277. doi: 10.48550/arXiv.2604.27277. 
+[4]	S. Khanna, M. Irgau, D. B. Lobell, and S. Ermon, “ExPLoRA: Parameter-Efficient Extended Pre-Training to Adapt Vision Transformers under Domain Shifts,” Dec. 30, 2025, arXiv: arXiv:2406.10973. doi: 10.48550/arXiv.2406.10973. 
+[5]	R. C. Petersen et al., “Alzheimer’s Disease Neuroimaging Initiative (ADNI): Clinical characterization,” Neurology, vol. 74, no. 3, pp. 201–209, Jan. 2010, doi: 10.1212/WNL.0b013e3181cb3e25. 
+[6] Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021).
+nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation.
+Nature Methods, 18(2), 203-211.`
+
